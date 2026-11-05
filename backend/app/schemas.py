@@ -99,5 +99,10 @@ class ProviderUpdate(BaseModel):
     enabled: bool = True
 
 
+class GenerationSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reasoning_effort: Literal["auto", "none", "low", "high", "max"]
+
+
 class RetryRequest(BaseModel):
     page_task_ids: list[str] | None = None

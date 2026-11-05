@@ -15,7 +15,7 @@ os.environ.pop("DS_API_KEY", None)
 from backend.app import main, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
-from backend.app.db import engine, LlmCall, session_scope  # noqa: E402
+from backend.app.db import engine, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -48,9 +48,11 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "save_secret", lambda key, value: secrets.__setitem__(key, value))
     monkeypatch.setattr(main, "read_secret", lambda key: secrets.get(key))
     monkeypatch.setattr(runtime, "read_secret", lambda key: secrets.get(key))
+    main.app.state.reasoning_efforts = []
 
     async def fake_stream(**kwargs):
         assert "max_output_tokens" not in kwargs
+        main.app.state.reasoning_efforts.append(kwargs.get("reasoning_effort"))
         text = json.dumps(document()) if kwargs.get("json_schema") else valid_html()
         yield ProviderEvent("text_delta", text)
         yield ProviderEvent("completed", {"text": text, "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}})
@@ -58,12 +60,15 @@ def client(monkeypatch):
     monkeypatch.setattr(runtime, "stream_responses", fake_stream)
     async def fake_connection_stream(**kwargs):
         assert kwargs["max_output_tokens"] == 32
+        assert kwargs["reasoning_effort"] == "none"
         yield ProviderEvent("completed", {"text": "OK", "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}})
     monkeypatch.setattr(main, "stream_responses", fake_connection_stream)
     with TestClient(main.app) as c:
         response = c.put("/api/v1/settings/llm/default", json={"name": "Test", "base_url": "https://example.com", "model": "fake", "api_key": "secret", "enabled": True})
         assert response.status_code == 200
         assert "secret" not in response.text
+        assert c.put("/api/v1/settings/generation", json={"reasoning_effort": "high"}).status_code == 200
+        main.app.state.reasoning_efforts.clear()
         yield c
 
 
@@ -77,6 +82,7 @@ def wait_status(client, pid, statuses):
 
 
 def test_end_to_end_and_idempotency(client):
+    assert client.put("/api/v1/settings/generation", json={"reasoning_effort": "low"}).status_code == 200
     body = {"user_request": "Create a one-page test deck"}
     headers = {"Idempotency-Key": "test-create"}
     first = client.post("/api/v1/presentations", json=body, headers=headers)
@@ -85,6 +91,10 @@ def test_end_to_end_and_idempotency(client):
     assert first.json() == duplicate.json()
     assert client.post("/api/v1/presentations", json={"user_request": "Different"}, headers=headers).status_code == 409
     pid = first.json()["presentation_id"]
+    assert client.put("/api/v1/settings/generation", json={"reasoning_effort": "max"}).status_code == 200
+    with session_scope() as db:
+        presentation = db.get(Presentation, pid)
+        assert loads(presentation.config_snapshot_json)["reasoning_effort"] == "low"
     snapshot = wait_status(client, pid, {"WAITING_CONFIRMATION", "FAILED"})
     assert snapshot["presentation"]["status"] == "WAITING_CONFIRMATION", snapshot
     outline = snapshot["latest_outline"]
@@ -96,6 +106,7 @@ def test_end_to_end_and_idempotency(client):
     assert client.post(f"/api/v1/presentations/{pid}/confirm", json=confirmation).json()["run_id"] == result.json()["run_id"]
     snapshot = wait_status(client, pid, {"READY", "PARTIAL_FAILED"})
     assert snapshot["presentation"]["status"] == "READY", snapshot
+    assert main.app.state.reasoning_efforts == ["low", "low", "low"]
     assert [p["page_number"] for p in snapshot["pages"]] == [1, 2]
     assert all(p["status"] == "SUCCEEDED" for p in snapshot["pages"])
     usage = client.get(f"/api/v1/presentations/{pid}/usage").json()
@@ -135,6 +146,22 @@ def test_create_rejects_explicit_page_count(client, body):
 
 def test_usage_not_found(client):
     assert client.get("/api/v1/presentations/missing/usage").status_code == 404
+
+
+def test_generation_settings_default_validation_and_persistence(client):
+    assert client.get("/api/v1/settings/generation").json()["reasoning_effort"] == "high"
+    for effort in ("auto", "none", "low", "high", "max"):
+        response = client.put("/api/v1/settings/generation", json={"reasoning_effort": effort})
+        assert response.status_code == 200
+        assert response.json()["reasoning_effort"] == effort
+    assert client.put("/api/v1/settings/generation", json={"reasoning_effort": "medium"}).status_code == 422
+    assert client.put("/api/v1/settings/generation", json={"reasoning_effort": "high", "extra": True}).status_code == 422
+
+
+def test_legacy_reasoning_snapshot_defaults_to_none():
+    assert runtime.request_reasoning_effort({}) == "none"
+    assert runtime.request_reasoning_effort({"reasoning_effort": "high"}) == "high"
+    assert runtime.request_reasoning_effort({"reasoning_effort": "auto"}) is None
 
 
 def test_connection_test_does_not_expose_or_record_tokens(client):

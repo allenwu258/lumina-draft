@@ -52,3 +52,25 @@ async def test_responses_omits_unset_output_limit(monkeypatch, token_limit):
         assert "max_output_tokens" not in requests[0]
     else:
         assert requests[0]["max_output_tokens"] == token_limit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "none", "low", "high", "max"])
+async def test_responses_reasoning_effort(monkeypatch, effort):
+    requests = []
+    event = {"type": "response.completed", "response": {"status": "completed", "usage": {}}}
+    wire = f"event: response.completed\ndata: {json.dumps(event)}\n\n".encode()
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=wire, headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(respond)
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=transport, **kwargs))
+    async for _ in providers.stream_responses(base_url="https://example.com", api_key="secret", model="model", instructions="system", prompt="hello", reasoning_effort=effort):
+        pass
+    if effort is None:
+        assert "reasoning" not in requests[0]
+    else:
+        assert requests[0]["reasoning"] == {"effort": effort}

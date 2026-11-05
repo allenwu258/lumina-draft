@@ -25,6 +25,11 @@ def canonical_hash(value: object) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def request_reasoning_effort(snapshot: dict[str, Any]) -> str | None:
+    effort = snapshot.get("reasoning_effort", "none")
+    return None if effort == "auto" else effort
+
+
 class DirectorState(TypedDict, total=False):
     presentation_id: str
     run_id: str
@@ -117,7 +122,7 @@ class ProviderGateway:
         status = "FAILED"
         error: str | None = None
         try:
-            async for event in stream_responses(base_url=base_url, api_key=key, model=model, instructions=DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT, prompt=prompt, json_schema=schema):
+            async for event in stream_responses(base_url=base_url, api_key=key, model=model, instructions=DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT, prompt=prompt, json_schema=schema, reasoning_effort=request_reasoning_effort(snapshot)):
                 if event.kind == "text_delta":
                     output.append(event.data)
                     total_bytes += len(event.data.encode("utf-8"))

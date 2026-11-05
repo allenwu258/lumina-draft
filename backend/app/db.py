@@ -86,6 +86,13 @@ class BusinessRoute(Base):
     revision: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class GenerationSettingsRecord(Base):
+    __tablename__ = "generation_settings"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default="default")
+    reasoning_effort: Mapped[str] = mapped_column(String(20), default="high")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class Presentation(Base):
     __tablename__ = "presentations"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -201,6 +208,9 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False
 def init_db() -> None:
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
+        if db.get(GenerationSettingsRecord, "default") is None:
+            db.add(GenerationSettingsRecord(id="default", reasoning_effort="high"))
+            db.commit()
         provider = db.scalar(select(Provider).where(Provider.code == "default"))
         if provider is None:
             key = os.getenv("DS_API_KEY") or _read_key_file().get("api_key", "")

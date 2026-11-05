@@ -25,6 +25,8 @@ npm --prefix frontend run dev -- --port 5173
 
 通过工作台右上角“模型设置”配置 Responses Base URL、远程模型 ID 和 API Key。Base URL 为 API 根路径，适配器追加 `/responses`。仅支持 HTTPS，回环地址例外。Key 写入系统凭据存储，不返回前端，也不写入 SQLite。第一次启动时如存在 `~/Downloads/ds-api.txt`，可从该文件读取 `base_url`、`model`、`api_key` 初始化；也可通过 `DS_API_FILE` 指定路径或使用 `DS_API_BASE_URL`、`DS_API_MODEL`、`DS_API_KEY` 环境变量。初始化后修改请使用设置页面。
 
+同一设置面板中的“推理力度”全局应用于大纲和页面生成，默认 `high`。修改并保存后仅影响新建作品；`自动` 会在请求中省略 `reasoning.effort`。
+
 点击“测试连接”会发起一次真实模型请求，产生供应商费用。作品开始生成时会冻结当前模型地址、模型 ID 和凭据引用。两个 Agent 共用 `default` 路由。已发请求的供应商计费无法撤回。
 
 正式生成请求不设置输入或输出 token 预算；供应商或模型自身的上下文和输出限制仍然适用。作品会话中展示供应商返回的输入、输出及总 token 用量，包含失败和重试中有返回用量的调用；`≥` 表示部分调用未返回对应数据，实际用量可能更高。连接测试不计入会话统计。现有的请求字符数、输出字节数及 HTML 安全准入限制仍然生效，它们不是 token 计数限制。

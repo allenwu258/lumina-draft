@@ -14,11 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import func, select
 
-from .db import Event, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, loads, resolve_default, session_scope
+from .db import Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, loads, resolve_default, session_scope
 from .providers import ProviderError, stream_responses, validate_endpoint
 from .rendering import html_hash
 from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, scheduler
-from .schemas import ConfirmRequest, CreatePresentationRequest, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
+from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettingsUpdate, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
 from .secrets import read_secret, save_secret
 
 
@@ -89,6 +89,23 @@ def get_provider():
         return provider_dict(*resolve_default(db))
 
 
+@app.get(f"{API}/settings/generation")
+def get_generation_settings():
+    with session_scope() as db:
+        setting = db.get(GenerationSettingsRecord, "default")
+        return {"reasoning_effort": setting.reasoning_effort, "revision": setting.revision}
+
+
+@app.put(f"{API}/settings/generation")
+def update_generation_settings(body: GenerationSettingsUpdate):
+    with session_scope() as db:
+        setting = db.get(GenerationSettingsRecord, "default")
+        setting.reasoning_effort = body.reasoning_effort
+        setting.revision += 1
+        db.flush()
+        return {"reasoning_effort": setting.reasoning_effort, "revision": setting.revision}
+
+
 @app.put(f"{API}/settings/llm/default")
 def update_provider(body: ProviderUpdate):
     try:
@@ -125,7 +142,7 @@ async def test_provider():
         call_id = call.id
     outcome, message = "FAILED", "连接未完成"
     try:
-        async for ev in stream_responses(base_url=base_url, api_key=key, model=model, instructions="Reply briefly.", prompt="Reply with OK.", max_output_tokens=32):
+        async for ev in stream_responses(base_url=base_url, api_key=key, model=model, instructions="Reply briefly.", prompt="Reply with OK.", max_output_tokens=32, reasoning_effort="none"):
             if ev.kind == "completed":
                 outcome, message = "SUCCEEDED", "连接成功"
             elif ev.kind in {"incomplete", "failed"}:
@@ -164,7 +181,8 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         route, model, binding, endpoint, owner = resolve_default(db)
         if not endpoint or not owner.enabled or not endpoint.enabled or not model.enabled or not binding.enabled or not endpoint.credential_ref or not read_secret(endpoint.credential_ref):
             fail("CONFIG_NOT_READY", "请先配置并启用默认模型")
-        snapshot = {"business_code": route.code, "route_revision": route.revision, "model_id": model.id, "model_revision": model.revision, "binding_id": binding.id, "binding_revision": binding.revision, "endpoint_id": endpoint.id, "endpoint_revision": endpoint.revision, "provider_id": owner.id, "base_url": endpoint.base_url, "model": binding.remote_model_id, "credential_ref": endpoint.credential_ref, "protocol": endpoint.protocol}
+        generation_settings = db.get(GenerationSettingsRecord, "default")
+        snapshot = {"business_code": route.code, "route_revision": route.revision, "model_id": model.id, "model_revision": model.revision, "binding_id": binding.id, "binding_revision": binding.revision, "endpoint_id": endpoint.id, "endpoint_revision": endpoint.revision, "provider_id": owner.id, "base_url": endpoint.base_url, "model": binding.remote_model_id, "credential_ref": endpoint.credential_ref, "protocol": endpoint.protocol, "reasoning_effort": generation_settings.reasoning_effort}
         presentation = Presentation(user_request=body.user_request, options_json=dumps(body.options.model_dump(exclude_none=True)), status="PLANNING", config_snapshot_json=dumps(snapshot))
         db.add(presentation)
         db.flush()

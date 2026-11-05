@@ -37,6 +37,7 @@ def validate_endpoint(base_url: str) -> str:
 async def stream_responses(
     *, base_url: str, api_key: str, model: str, instructions: str, prompt: str,
     max_output_tokens: int | None = None, json_schema: dict | None = None,
+    reasoning_effort: str | None = None,
 ) -> AsyncIterator[ProviderEvent]:
     base_url = validate_endpoint(base_url)
     if not api_key:
@@ -47,8 +48,9 @@ async def stream_responses(
         "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
         "stream": True,
         "store": False,
-        "reasoning": {"effort": "none"},
     }
+    if reasoning_effort is not None:
+        body["reasoning"] = {"effort": reasoning_effort}
     if max_output_tokens is not None:
         body["max_output_tokens"] = max_output_tokens
     if json_schema is not None:
