@@ -1,0 +1,12 @@
+fastapi==0.115.14
+uvicorn[standard]==0.34.3
+sqlalchemy==2.0.41
+pydantic==2.11.7
+httpx==0.28.1
+langgraph==0.4.8
+keyring==25.6.0
+beautifulsoup4==4.13.4
+tinycss2==1.4.0
+pytest==8.4.1
+pytest-asyncio==1.0.0
+
