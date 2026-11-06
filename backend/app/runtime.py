@@ -12,9 +12,10 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
 from .config import settings
-from .db import ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, Run, dumps, loads, resolve_default, session_scope, utcnow
+from .db import ApiCredential, ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, Run, dumps, loads, session_scope, utcnow
 from .prompts import COMPOSER_PROMPT, DIRECTOR_PROMPT
-from .providers import ProviderError, ProviderEvent, stream_responses
+from .providers import ProviderError, stream_responses
+from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
 from .rendering import html_hash, validate_html
 from .schemas import OutlineDocument
 from .secrets import read_secret
@@ -53,7 +54,7 @@ async def run_graph(graph, state):
 def build_director_graph():
     async def generate(state: DirectorState):
         prompt = f"用户需求：\n{state['user_request']}\n\n附加选项：{json.dumps(state.get('options', {}), ensure_ascii=False)}\n请严格按系统要求输出结构化说明书。"
-        output = await ProviderGateway().complete_json(prompt, state["presentation_id"], "director", state["run_id"])
+        output = await ProviderGateway().complete_json(prompt, state["presentation_id"], "director", state["run_id"], "ppt_outline")
         return {"result": output}
     graph = StateGraph(DirectorState)
     graph.add_node("generate", generate)
@@ -85,7 +86,7 @@ def build_page_graph():
             ])
         if state.get("error"):
             prompt += "\n上一次输出未通过校验：" + state["error"] + "。请完整重写并确保符合所有输出合同。"
-        html = await ProviderGateway().complete_html(prompt, task.presentation_id, task.id)
+        html = await ProviderGateway().complete_html(prompt, task.presentation_id, task.id, "ppt_html")
         return {"result": html}
     graph = StateGraph(PageState)
     graph.add_node("compose", compose)
@@ -95,24 +96,85 @@ def build_page_graph():
 
 
 class ProviderGateway:
-    async def _stream(self, prompt: str, presentation_id: str, purpose: str, schema: dict | None = None, page_task_id: str | None = None, run_id: str | None = None) -> str:
+    async def _stream(
+        self,
+        prompt: str,
+        presentation_id: str | None,
+        purpose: str,
+        schema: dict | None = None,
+        page_task_id: str | None = None,
+        run_id: str | None = None,
+        business_code: str = "default",
+        resolved_config: dict[str, Any] | None = None,
+        instructions: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
         with session_scope() as db:
-            presentation = db.get(Presentation, presentation_id)
+            presentation = db.get(Presentation, presentation_id) if presentation_id else None
             snapshot = loads(presentation.config_snapshot_json) if presentation else {}
-            route, logical_model, binding, endpoint, owner = resolve_default(db)
-            if snapshot.get("endpoint_id"):
-                endpoint = db.get(ApiEndpoint, snapshot["endpoint_id"])
-                owner = db.get(ApiProvider, snapshot.get("provider_id"))
-                binding = db.get(ModelBinding, snapshot.get("binding_id"))
-                logical_model = db.get(LogicalModel, snapshot.get("model_id"))
-            call = LlmCall(presentation_id=presentation_id, purpose=purpose, model=snapshot.get("model", binding.remote_model_id if binding else settings.api_model), status="RUNNING")
+            config = resolved_config or (snapshot.get("resolved_routes") or {}).get(business_code)
+            if not config and snapshot.get("model_id"):
+                try:
+                    config = resolve_model_config(db, snapshot["model_id"], "off", business_code)
+                except ConfigurationError as exc:
+                    raise ProviderError("CONFIG_NOT_READY", "该作品的历史模型配置已不可用") from exc
+                if config:
+                    config = dict(config)
+                    config.update({
+                        "base_url": snapshot.get("base_url", config["base_url"]),
+                        "remote_model_id": snapshot.get("model", config["remote_model_id"]),
+                        "credential_ref": snapshot.get("credential_ref", config.get("credential_ref")),
+                        "protocol": snapshot.get("protocol", config["protocol"]),
+                        "reasoning_effort": request_reasoning_effort(snapshot),
+                    })
+                    legacy_credential = db.scalar(select(ApiCredential).where(
+                        ApiCredential.endpoint_id == config["endpoint_id"],
+                        ApiCredential.secret_ref == config.get("credential_ref"),
+                    )) if config.get("credential_ref") else None
+                    config["credential_id"] = legacy_credential.id if legacy_credential else None
+                    config["credential_version"] = legacy_credential.version if legacy_credential else None
+                    config["config_hash"] = configuration_hash({key: value for key, value in config.items() if key != "config_hash"})
+            if not config:
+                try:
+                    config = resolve_business_route(db, business_code)
+                except ConfigurationError as exc:
+                    raise ProviderError(exc.code, str(exc)) from exc
+            owner = db.get(ApiProvider, config.get("provider_id"))
+            endpoint = db.get(ApiEndpoint, config.get("endpoint_id"))
+            binding = db.get(ModelBinding, config.get("binding_id"))
+            model_record = db.get(LogicalModel, config.get("model_id"))
+            if not owner or not endpoint or not binding or not model_record:
+                raise ProviderError("CONFIG_NOT_READY", "模型配置不存在")
+            if not owner.enabled or owner.archived_at or not endpoint.enabled or not binding.enabled or not model_record.enabled or model_record.archived_at:
+                raise ProviderError("CONFIG_NOT_READY", "Provider 或模型已停用")
+            credential_id = config.get("credential_id")
+            if credential_id:
+                credential = db.get(ApiCredential, credential_id)
+                if not credential or credential.status == "revoked":
+                    raise ProviderError("CREDENTIAL_REVOKED", "该作品使用的 API 凭据已撤销")
+            base_url = config.get("base_url", endpoint.base_url)
+            model = config.get("remote_model_id", config.get("model", binding.remote_model_id))
+            credential_ref = config.get("credential_ref", endpoint.credential_ref) or ""
+            protocol = config.get("protocol", endpoint.protocol)
+            if protocol != "openai_responses":
+                raise ProviderError("UNSUPPORTED_PROTOCOL", "当前仅支持 OpenAI Responses 协议")
+            call = LlmCall(
+                presentation_id=presentation_id,
+                purpose=purpose,
+                model=model,
+                status="RUNNING",
+                provider_id=owner.id,
+                model_id=model_record.id,
+                business_code=business_code if purpose != "provider_test" else None,
+                config_snapshot_json=dumps({key: value for key, value in config.items() if key != "api_key"}),
+            )
             db.add(call)
             db.flush()
             call_id = call.id
-            if not endpoint or not owner or not binding or not logical_model or not all([owner.enabled, endpoint.enabled, binding.enabled, logical_model.enabled]):
-                raise ProviderError("CONFIG_NOT_READY", "default 模型未配置或已停用")
-            base_url, model = snapshot.get("base_url", endpoint.base_url), snapshot.get("model", binding.remote_model_id)
-            key = read_secret(snapshot.get("credential_ref") or endpoint.credential_ref or "") or ""
+            provider_id, provider_limit = owner.id, owner.max_concurrency
+            model_id, model_limit = model_record.id, model_record.max_concurrency
+            auth_mode = config.get("auth_mode", endpoint.auth_mode)
+            allow_private_http = config.get("allow_private_http", endpoint.allow_private_http)
         output: list[str] = []
         buffer: list[str] = []
         director_stream_buffer: list[tuple[str, str]] = []
@@ -124,6 +186,11 @@ class ProviderGateway:
         usage: dict[str, Any] = {}
         status = "FAILED"
         error: str | None = None
+        error_code: str | None = None
+        response_id: str | None = None
+        final_text: str | None = None
+        started_at = time.monotonic()
+        first_token_at: float | None = None
 
         async def flush_director_stream() -> None:
             nonlocal last_director_flush
@@ -140,50 +207,104 @@ class ProviderGateway:
                 await emit_event(presentation_id, "director.stream.delta", {"run_id": run_id, "channel": channel, "delta": delta}, run_id)
             last_director_flush = time.monotonic()
 
+        queue_duration_ms = 0
         try:
-            async for event in stream_responses(base_url=base_url, api_key=key, model=model, instructions=DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT, prompt=prompt, json_schema=schema, reasoning_effort=request_reasoning_effort(snapshot)):
-                if event.kind == "text_delta":
-                    output.append(event.data)
-                    total_bytes += len(event.data.encode("utf-8"))
-                    if total_bytes > 256 * 1024:
-                        raise ProviderError("OUTPUT_TOO_LARGE", "模型输出超过大小限制")
-                    if purpose == "director":
-                        director_stream_buffer.append(("output", event.data))
+            queued_at = time.monotonic()
+            async with MODEL_LIMITER.acquire(provider_id, provider_limit, model_id, model_limit):
+                queue_duration_ms = int((time.monotonic() - queued_at) * 1000)
+                # Configuration can be revoked or disabled while waiting for a slot.
+                with session_scope() as db:
+                    current_owner = db.get(ApiProvider, provider_id)
+                    current_endpoint = db.get(ApiEndpoint, endpoint.id)
+                    current_model = db.get(LogicalModel, model_id)
+                    current_binding = db.get(ModelBinding, binding.id)
+                    if not current_owner or not current_endpoint or not current_model or not current_binding or not all((
+                        current_owner.enabled, current_endpoint.enabled, current_model.enabled, current_binding.enabled,
+                    )) or current_owner.archived_at or current_model.archived_at:
+                        raise ProviderError("CONFIG_NOT_READY", "Provider 或模型已停用")
+                    if auth_mode == "bearer":
+                        credential = db.get(ApiCredential, credential_id) if credential_id else None
+                        if not credential or credential.status not in {"active", "retired"}:
+                            raise ProviderError("CREDENTIAL_REVOKED", "该作品使用的 API 凭据已撤销")
+                try:
+                    key = read_secret(credential_ref) if auth_mode == "bearer" else ""
+                except Exception as exc:
+                    raise ProviderError("CREDENTIAL_STORE_UNAVAILABLE", "系统凭据存储暂不可用") from exc
+                if auth_mode == "bearer" and not key:
+                    raise ProviderError("CREDENTIAL_NOT_CONFIGURED", "请先配置 API 凭据")
+                request_options = {
+                    "base_url": base_url,
+                    "api_key": key or "",
+                    "model": model,
+                    "instructions": instructions or (DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT),
+                    "prompt": prompt,
+                    "json_schema": schema,
+                    "reasoning_effort": config.get("reasoning_effort"),
+                    "auth_mode": auth_mode,
+                    "allow_private_http": allow_private_http,
+                }
+                if max_output_tokens is not None:
+                    request_options["max_output_tokens"] = max_output_tokens
+                async for event in stream_responses(
+                    **request_options,
+                ):
+                    if event.kind == "text_delta":
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                        output.append(event.data)
+                        total_bytes += len(event.data.encode("utf-8"))
+                        if total_bytes > 256 * 1024:
+                            raise ProviderError("OUTPUT_TOO_LARGE", "模型输出超过大小限制")
+                        if purpose == "director":
+                            director_stream_buffer.append(("output", event.data))
+                            if time.monotonic() - last_director_flush >= 0.12 or sum(len(value) for _, value in director_stream_buffer) >= 2048:
+                                await flush_director_stream()
+                        if page_task_id and presentation_id:
+                            buffer.append(event.data)
+                            if time.monotonic() - last_flush >= 0.15 or sum(map(len, buffer)) >= 16384:
+                                await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
+                                buffer.clear()
+                                last_flush = time.monotonic()
+                    elif event.kind == "reasoning_delta" and purpose == "director":
+                        reasoning_bytes += len(event.data.encode("utf-8"))
+                        if reasoning_bytes > 256 * 1024:
+                            raise ProviderError("REASONING_TOO_LARGE", "模型 reasoning 输出超过大小限制")
+                        director_stream_buffer.append(("reasoning", event.data))
                         if time.monotonic() - last_director_flush >= 0.12 or sum(len(value) for _, value in director_stream_buffer) >= 2048:
                             await flush_director_stream()
-                    if page_task_id:
-                        buffer.append(event.data)
-                        if time.monotonic() - last_flush >= 0.15 or sum(map(len, buffer)) >= 16384:
-                            await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
-                            buffer.clear()
-                            last_flush = time.monotonic()
-                elif event.kind == "reasoning_delta" and purpose == "director":
-                    reasoning_bytes += len(event.data.encode("utf-8"))
-                    if reasoning_bytes > 256 * 1024:
-                        raise ProviderError("REASONING_TOO_LARGE", "模型 reasoning 输出超过大小限制")
-                    director_stream_buffer.append(("reasoning", event.data))
-                    if time.monotonic() - last_director_flush >= 0.12 or sum(len(value) for _, value in director_stream_buffer) >= 2048:
-                        await flush_director_stream()
-                elif event.kind == "refusal_delta":
-                    refused = True
-                    status, error = "REFUSED", "模型拒绝了该请求"
-                elif event.kind == "completed":
-                    status, usage = ("REFUSED" if refused else "SUCCEEDED"), event.data.get("usage", {})
-                elif event.kind in {"incomplete", "refused", "failed"}:
-                    status, error, usage = event.kind.upper(), "模型未生成完整结果", event.data.get("usage", {}) if isinstance(event.data, dict) else {}
-                    if event.kind == "incomplete" and isinstance(event.data, dict):
-                        reason = event.data.get("reason")
-                        if reason == "max_output_tokens":
-                            error = "供应商因输出 token 上限截断了结果"
-                        elif reason == "content_filter":
-                            error = "供应商的内容过滤中断了生成"
+                    elif event.kind == "refusal_delta":
+                        refused = True
+                        status, error, error_code = "REFUSED", "模型拒绝了该请求", "MODEL_REFUSED"
+                    elif event.kind == "completed":
+                        status = "REFUSED" if refused else "SUCCEEDED"
+                        usage = event.data.get("usage", {}) if isinstance(event.data, dict) else {}
+                        response_id = event.data.get("response_id") if isinstance(event.data, dict) else None
+                        final_text = event.data.get("text") if isinstance(event.data, dict) else None
+                    elif event.kind in {"incomplete", "refused", "failed"}:
+                        status = event.kind.upper()
+                        error_code = "MODEL_" + event.kind.upper()
+                        error = "模型未生成完整结果"
+                        usage = event.data.get("usage", {}) if isinstance(event.data, dict) else {}
+                        if event.kind == "incomplete" and isinstance(event.data, dict):
+                            reason = event.data.get("reason")
+                            if reason == "max_output_tokens":
+                                error = "供应商因输出 token 上限截断了结果"
+                            elif reason == "content_filter":
+                                error = "供应商的内容过滤中断了生成"
+        except asyncio.CancelledError:
+            status, error_code, error = "CANCELLED", "CALL_CANCELLED", "调用已取消"
+            raise
         except ProviderError as exc:
             error = str(exc)
-            status = "FAILED"
+            error_code = exc.code
+            status = "REFUSED" if exc.code == "MODEL_REFUSED" else "FAILED"
             raise
+        except Exception as exc:
+            status, error_code, error = "FAILED", "PROVIDER_CALL_FAILED", "模型调用失败"
+            raise ProviderError(error_code, error) from exc
         finally:
             await flush_director_stream()
-            if page_task_id and buffer:
+            if page_task_id and presentation_id and buffer:
                 await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
             with session_scope() as db:
                 call = db.get(LlmCall, call_id)
@@ -193,22 +314,28 @@ class ProviderGateway:
                     call.output_tokens = usage.get("output_tokens")
                     call.total_tokens = usage.get("total_tokens")
                     call.error = error
+                    call.error_code = error_code
+                    call.provider_response_id = response_id
+                    call.queue_duration_ms = queue_duration_ms
+                    call.time_to_first_token_ms = int((first_token_at - started_at) * 1000) if first_token_at else None
+                    call.total_duration_ms = int((time.monotonic() - started_at) * 1000)
                     call.finished_at = utcnow()
-            await emit_event(presentation_id, "llm.usage.updated", {"call_id": call_id, "purpose": purpose})
+            if presentation_id:
+                await emit_event(presentation_id, "llm.usage.updated", {"call_id": call_id, "purpose": purpose})
         if status != "SUCCEEDED":
-            raise ProviderError("MODEL_INCOMPLETE", error or "模型未完成输出")
-        return "".join(output)
+            raise ProviderError(error_code or "MODEL_INCOMPLETE", error or "模型未完成输出")
+        return final_text if final_text is not None else "".join(output)
 
-    async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None) -> dict[str, Any]:
+    async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None, business_code: str = "ppt_outline") -> dict[str, Any]:
         schema = OutlineDocument.model_json_schema()
-        text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id)
+        text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id, business_code=business_code)
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise ProviderError("INVALID_MODEL_JSON", "Director 返回的 JSON 无法解析") from exc
 
-    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str) -> str:
-        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id)
+    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str, business_code: str = "ppt_html") -> str:
+        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, business_code=business_code)
 
 
 async def emit_event(presentation_id: str, event_type: str, payload: dict[str, Any], run_id: str | None = None) -> None:

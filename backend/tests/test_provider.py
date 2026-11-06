@@ -110,3 +110,57 @@ async def test_responses_reasoning_effort(monkeypatch, effort):
         assert "reasoning" not in requests[0]
     else:
         assert requests[0]["reasoning"] == {"effort": effort}
+
+
+@pytest.mark.asyncio
+async def test_responses_no_auth_and_strict_nested_schema(monkeypatch):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, content=b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n')
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs))
+    schema = {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string", "default": "x"}}}}}}
+    result = [event async for event in providers.stream_responses(base_url="https://example.com/v1", api_key="", model="m", instructions="i", prompt="p", auth_mode="none", json_schema=schema)]
+    assert result[-1].kind == "completed"
+    assert "authorization" not in requests[0].headers
+    payload = json.loads(requests[0].content)
+    strict = payload["text"]["format"]["schema"]
+    assert payload["text"]["format"]["strict"] is True
+    assert strict["required"] == ["items"] and strict["additionalProperties"] is False
+    assert strict["properties"]["items"]["items"]["required"] == ["name"]
+    assert "default" not in strict["properties"]["items"]["items"]["properties"]["name"]
+    assert "required" not in schema
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events", [
+    [{"type": "response.refusal.done", "refusal": "No"}, {"type": "response.completed", "response": {"status": "completed"}}],
+    [{"type": "response.completed", "response": {"status": "completed", "output": [{"content": [{"type": "refusal", "refusal": "No"}]}]}}],
+])
+async def test_refusal_is_not_a_success(monkeypatch, events):
+    wire = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)), **kwargs))
+    result = [event async for event in providers.stream_responses(base_url="https://example.com", api_key="k", model="m", instructions="i", prompt="p")]
+    assert result[-1].kind == "refused"
+
+
+@pytest.mark.asyncio
+async def test_sse_line_size_is_bounded(monkeypatch):
+    wire = b"data: " + b"a" * (providers.MAX_EVENT_BYTES + 1)
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)), **kwargs))
+    with pytest.raises(providers.ProviderError) as error:
+        async for _ in providers.stream_responses(base_url="https://example.com", api_key="k", model="m", instructions="i", prompt="p"):
+            pass
+    assert error.value.code == "PROVIDER_EVENT_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+async def test_final_event_without_blank_line_preserves_refusal(monkeypatch):
+    event = {"type": "response.completed", "response": {"status": "completed", "output": [{"content": [{"type": "refusal", "refusal": "No"}]}]}}
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=("data: " + json.dumps(event)).encode())), **kwargs))
+    result = [event async for event in providers.stream_responses(base_url="https://example.com", api_key="k", model="m", instructions="i", prompt="p")]
+    assert result[-1].kind == "refused"

@@ -11,3 +11,11 @@ def save_secret(ref: str, value: str) -> None:
 
 def read_secret(ref: str) -> str | None:
     return keyring.get_password(SERVICE, ref)
+
+
+def delete_secret(ref: str) -> bool:
+    try:
+        keyring.delete_password(SERVICE, ref)
+        return True
+    except keyring.errors.KeyringError:
+        return False

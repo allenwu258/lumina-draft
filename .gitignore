@@ -6,10 +6,13 @@ node_modules/
 dist/
 *.tsbuildinfo
 data/
-docs/
+docs/*
+!docs/PROVIDER_MANAGEMENT_PLAN.md
 .env
 .env.*
 !.env.example
 *.db
 *.db-*
+test-results/
+playwright-report/
 

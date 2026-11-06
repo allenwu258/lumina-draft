@@ -4,22 +4,23 @@ import asyncio
 import json
 import secrets
 import time
-import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.orm.exc import StaleDataError
 
-from .db import Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, loads, resolve_default, session_scope
-from .providers import ProviderError, stream_responses, validate_endpoint
+from .db import BusinessRoute, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
+from .provider_management import ConfigurationError, resolve_all_routes, resolve_business_route, route_issues
+from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
 from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, scheduler
 from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettingsUpdate, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
-from .secrets import read_secret, save_secret
+from .secrets import read_secret
 
 
 @asynccontextmanager
@@ -37,9 +38,25 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Lumina Draft API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
 API = "/api/v1"
 TICKETS: dict[str, tuple[str, float]] = {}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    # Pydantic's default error includes submitted values, including write-only keys.
+    return JSONResponse(status_code=422, content={"detail": [
+        {"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]}
+        for item in exc.errors()
+    ]})
+
+
+@app.exception_handler(StaleDataError)
+async def stale_configuration(request: Request, exc: StaleDataError):
+    return JSONResponse(status_code=409, content={"detail": {
+        "code": "CONFIG_REVISION_CONFLICT", "message": "配置已被其他操作更新，请刷新后重试",
+    }})
 
 
 @app.middleware("http")
@@ -102,65 +119,57 @@ def update_generation_settings(body: GenerationSettingsUpdate):
         setting = db.get(GenerationSettingsRecord, "default")
         setting.reasoning_effort = body.reasoning_effort
         setting.revision += 1
+        route = db.get(BusinessRoute, "default")
+        if route:
+            route.reasoning_tier = legacy_reasoning_tier(db, route.model_id, body.reasoning_effort)
+            route.revision += 1
+            db.flush()
+            for code in ("default", "ppt_outline", "ppt_html"):
+                try:
+                    resolve_business_route(db, code)
+                except ConfigurationError as exc:
+                    fail(exc.code, str(exc), exc.status_code)
         db.flush()
         return {"reasoning_effort": setting.reasoning_effort, "revision": setting.revision}
 
 
-@app.put(f"{API}/settings/llm/default")
+@app.put(f"{API}/settings/llm/default", deprecated=True)
 def update_provider(body: ProviderUpdate):
-    try:
-        url = validate_endpoint(body.base_url)
-    except ProviderError as exc:
-        fail(exc.code, str(exc), 422)
+    """Compatibility facade; all writes use the versioned management commands."""
     with session_scope() as db:
-        route, model, binding, endpoint, owner = resolve_default(db)
-        if body.api_key:
-            ref = str(uuid.uuid4())
-            save_secret(ref, body.api_key)
-            endpoint.credential_ref = ref
-        owner.name, endpoint.name, model.name = body.name.strip(), body.name.strip(), body.name.strip()
-        endpoint.base_url, binding.remote_model_id = url, body.model.strip()
-        owner.enabled = endpoint.enabled = model.enabled = binding.enabled = body.enabled
-        owner.revision += 1
-        endpoint.revision += 1
-        binding.revision += 1
-        model.revision += 1
-        db.flush()
-        return provider_dict(route, model, binding, endpoint, owner)
+        _, model, _, endpoint, owner = resolve_default(db)
+        owner_id, model_id, revision = owner.id, model.id, owner.revision
+        fields = ModelPatch(
+            expected_revision=model.revision, remote_model_id=body.model,
+            display_name=body.name, context_window_tokens=model.context_window_tokens,
+            max_output_tokens=model.max_output_tokens, max_concurrency=model.max_concurrency,
+            enabled=body.enabled,
+        )
+        provider_fields = ProviderPatch(
+            expected_revision=revision, name=body.name, protocol="openai_responses",
+            base_url=body.base_url, auth_mode="bearer" if body.api_key else endpoint.auth_mode,
+            allow_private_http=endpoint.allow_private_http,
+            max_concurrency=owner.max_concurrency, enabled=body.enabled,
+        )
+    updated = patch_provider(owner_id, provider_fields)
+    if body.api_key:
+        replace_credential(owner_id, CredentialPut(
+            expected_revision=updated["revision"], api_key=body.api_key,
+        ))
+    patch_model(model_id, fields)
+    with session_scope() as db:
+        return provider_dict(*resolve_default(db))
 
 
-@app.post(f"{API}/settings/llm/default/test")
+@app.post(f"{API}/settings/llm/default/test", deprecated=True)
 async def test_provider():
     with session_scope() as db:
-        route, logical_model, binding, endpoint, owner = resolve_default(db)
-        if not endpoint or not owner.enabled or not endpoint.enabled or not endpoint.credential_ref:
-            fail("CONFIG_NOT_READY", "请先配置并启用模型")
-        base_url, model, key = endpoint.base_url, binding.remote_model_id, read_secret(endpoint.credential_ref) or ""
-        call = LlmCall(purpose="provider_test", model=model, status="RUNNING")
-        db.add(call)
-        db.flush()
-        call_id = call.id
-    outcome, message = "FAILED", "连接未完成"
-    try:
-        async for ev in stream_responses(base_url=base_url, api_key=key, model=model, instructions="Reply briefly.", prompt="Reply with OK.", max_output_tokens=32, reasoning_effort="none"):
-            if ev.kind == "completed":
-                outcome, message = "SUCCEEDED", "连接成功"
-            elif ev.kind in {"incomplete", "failed"}:
-                message = "模型未完成响应"
-    except ProviderError as exc:
-        message = str(exc)
-    with session_scope() as db:
-        call = db.get(LlmCall, call_id)
-        call.status, call.error = outcome, None if outcome == "SUCCEEDED" else message
-        call.finished_at = datetime.now(timezone.utc)
-    return {"status": outcome, "message": message}
-
-
-@app.get(f"{API}/settings/llm/calls")
-def list_calls():
-    with session_scope() as db:
-        calls = db.scalars(select(LlmCall).order_by(LlmCall.started_at.desc()).limit(100)).all()
-        return {"items": [{"id": c.id, "purpose": c.purpose, "model": c.model, "status": c.status, "error": c.error, "started_at": c.started_at.isoformat()} for c in calls]}
+        _, model, _, _, _ = resolve_default(db)
+        model_id = model.id
+    result = await test_model(model_id)
+    passed = result["status"] == "passed"
+    return {"status": "SUCCEEDED" if passed else "FAILED",
+            "message": "连接成功" if passed else "模型未通过文本流或结构化输出检查"}
 
 
 @app.get(f"{API}/presentations")
@@ -178,11 +187,41 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             if prior:
                 if prior.request_hash != request_hash: fail("IDEMPOTENCY_CONFLICT", "幂等键已用于其他请求")
                 return loads(prior.response_json)
+        try:
+            resolved_routes = resolve_all_routes(db)
+        except ConfigurationError as exc:
+            fail(exc.code, str(exc), exc.status_code)
         route, model, binding, endpoint, owner = resolve_default(db)
-        if not endpoint or not owner.enabled or not endpoint.enabled or not model.enabled or not binding.enabled or not endpoint.credential_ref or not read_secret(endpoint.credential_ref):
-            fail("CONFIG_NOT_READY", "请先配置并启用默认模型")
+        for config in resolved_routes.values():
+            issues = route_issues(db, config)
+            if issues:
+                fail("CONFIG_NOT_READY", config["business_code"] + "：" + "；".join(issues))
+            if config["auth_mode"] == "bearer":
+                try:
+                    if not read_secret(config["credential_ref"]):
+                        fail("CONFIG_NOT_READY", "请先配置业务 Provider 的 API Key")
+                except HTTPException:
+                    raise
+                except Exception:
+                    fail("CREDENTIAL_STORE_UNAVAILABLE", "系统凭据存储暂不可用", 503)
         generation_settings = db.get(GenerationSettingsRecord, "default")
-        snapshot = {"business_code": route.code, "route_revision": route.revision, "model_id": model.id, "model_revision": model.revision, "binding_id": binding.id, "binding_revision": binding.revision, "endpoint_id": endpoint.id, "endpoint_revision": endpoint.revision, "provider_id": owner.id, "base_url": endpoint.base_url, "model": binding.remote_model_id, "credential_ref": endpoint.credential_ref, "protocol": endpoint.protocol, "reasoning_effort": generation_settings.reasoning_effort}
+        snapshot = {
+            "business_code": route.code,
+            "route_revision": route.revision,
+            "model_id": model.id,
+            "model_revision": model.revision,
+            "binding_id": binding.id,
+            "binding_revision": binding.revision,
+            "endpoint_id": endpoint.id,
+            "endpoint_revision": endpoint.revision,
+            "provider_id": owner.id,
+            "base_url": endpoint.base_url,
+            "model": binding.remote_model_id,
+            "credential_ref": endpoint.credential_ref,
+            "protocol": endpoint.protocol,
+            "reasoning_effort": generation_settings.reasoning_effort,
+            "resolved_routes": resolved_routes,
+        }
         presentation = Presentation(user_request=body.user_request, options_json=dumps(body.options.model_dump(exclude_none=True)), status="PLANNING", config_snapshot_json=dumps(snapshot))
         db.add(presentation)
         db.flush()
@@ -412,3 +451,6 @@ async def events(presentation_id: str, request: Request, after: int = 0, last_ev
                 try: await asyncio.wait_for(condition.wait(), timeout=3)
                 except asyncio.TimeoutError: pass
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+app.include_router(provider_management_router)

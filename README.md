@@ -12,13 +12,13 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 - **页面并行生成**：结合全局规范、当前页任务与相邻页摘要生成独立 HTML，单个页面生成任务最多并行 3 页。
 - **页面查看**：展示各页状态，提供 HTML 源码与通过校验的页面预览；保留原始 HTML，不转换成可编辑的结构化画布。
 - **恢复与重试**：作品、任务和 SSE 事件落库，支持浏览器刷新、断线回放、取消生成与失败重试。
-- **模型配置与统计**：两个 Agent 共用 `default` 路由，支持推理力度设置、连接测试、最近调用记录和作品会话 token 用量统计。
+- **模型配置与统计**：独立 Provider 管理页，支持多连接、多模型、主动发现、思考档位、两级并发、业务 Override、模型测试与调用详情；作品按冻结配置生成。
 
 初版仅提供文字内容与 HTML/CSS、安全内联 SVG 排版，尚未实现配图、生图、附件、PPTX 导出、Tauri 客户端或多用户服务。
 
 ## 使用流程
 
-1. 在“模型与 API”中保存 Responses 接入地址、远程模型 ID 和 API Key，按需设置推理力度。
+1. 在“模型与 API”的 Provider 管理页创建连接，获取或手动添加模型并运行测试；再到业务路由设置全局默认模型及思考预算，按需覆盖大纲和 HTML 模型。
 2. 输入主题、受众、目标和内容要求，点击“生成说明书”，也可使用 `Ctrl/Cmd + Enter`。
 3. 查看 Director 的 reasoning 与 JSON 正文流。流文本仅供查看，尚未完成的大纲不能确认。
 4. 等待完整说明书校验通过，检查并编辑逐页内容，再点击“确认并生成”。
@@ -66,36 +66,37 @@ npm --prefix frontend run dev -- --port 5173
 
 ## 模型与 API 配置
 
-### 接入协议与路由
+### Provider 与模型目录
 
-在工作台右上角的“模型设置”或侧栏“模型与 API”中配置：
+工作台右上角“模型设置”或侧栏“模型与 API”进入独立页面：
 
-| 字段 | 说明 |
+- `/settings/providers`：管理连接、API Key、模型目录与模型测试。
+- `/settings/routing`：配置全局默认与两个 PPT 业务 Override。
+- `/settings/calls`：按游标查看调用记录，检查实际模型、预算、耗时、用量和错误。
+
+每个 Provider 配置显示名称、API 根地址、认证方式、协议、启用状态与总并发。当前仅执行 **OpenAI Responses**；其他协议在 UI 中为不可选的扩展项。API 根地址不要包含 `/responses` 或 `/models`，后端自动追加。默认使用 HTTPS；本机回环地址允许 HTTP，可信局域网私有 IP 需显式启用 HTTP 开关。拒绝 URL 用户信息、查询参数、片段和重定向。
+
+API Key 可以留空：无认证服务选择“无认证”；Bearer 模式未配置 Key 时可保存，但不能测试或用于业务。Key 只写入系统凭据库，不向前端回传、不写 SQLite 或浏览器存储。编辑时输入框为空表示保留现有 Key；替换会生成新版本，旧作品继续使用历史版本。显式“撤销全部凭据”或切换无认证会使该 Provider 的当前及历史 Key 失效。
+
+“获取可用模型”仅在点击时发送一次 `GET /models`，展示候选供勾选导入，不自动覆盖已有配置。模型目录不支持发现时可手动添加；接口未提供的上下文和输出长度保持为空，不按名称猜测。模型可编辑远程 ID、显示名、上下文、最大输出元数据、并发和思考档位。新模型默认声明多模态与工具支持，来源为 `assumed`；当前生成仍仅使用文本。
+
+Provider 和模型并发均允许配置 1–32，实际请求还受系统总上限 **3** 约束。模型发现、模型测试、Director 和各作品的 Composer 请求共享限流器；模型调用同时受模型级限制。此协调器只支持单 Uvicorn worker。
+
+### 模型测试与业务路由
+
+先保存连接和模型，再点击模型行的“测试”。测试通过正式生成使用的 Gateway/Responses 适配器，依次检查文本流和严格 JSON Schema，发送两次低输出上限请求（每次 `max_output_tokens=64`，省略 reasoning）。界面会提示真实测试可能产生费用。测试不验证具体推理档位、多模态或工具能力。测试结果绑定连接、凭据、远程 ID 和档位映射；相关配置变更后需重新测试。
+
+路由按 Provider 分组选择模型，思考预算与模型独立继承：
+
+| 业务 | 模型与预算 |
 | --- | --- |
-| 名称 | 本地展示名称 |
-| Base URL | Responses API 根地址，适配器追加 `/responses`；不要填写完整的 Responses 请求地址 |
-| 模型 ID | 接入方实际支持的远程模型标识 |
-| API Key | 保存到操作系统凭据存储；SQLite 仅保存凭据引用，不向前端返回 Key |
+| 全局默认 `default` | 必须明确选择模型和档位 |
+| PPT 大纲 `ppt_outline` | 可分别继承或覆盖默认模型和预算，需通过文本流与结构化检查 |
+| PPT HTML `ppt_html` | 可分别继承或覆盖，需通过文本流检查 |
 
-目前仅实现 **OpenAI Responses 格式**的适配器。数据模型保留“业务路由 → 逻辑模型 → 模型绑定 → 接入点/供应商”的关系，初版界面管理一套 `default` 配置，Director 与 Page Composer 共用该路由。配置接口支持启用/停用，当前界面仅展示启用状态。Chat Completions、Anthropic Messages、Gemini 和生图协议尚未接入。
+默认档位是 `off / low / medium / high`，可新增模型专属档位并设置 API effort 映射；`off` 表示省略整个 `reasoning`。继承预算在目标模型中不可用时，保存明确报错，不静默改档。新作品创建前验证三个路由就绪，并冻结解析后的 Provider、模型、凭据版本与预算；后续配置修改不改变已有作品。停用/归档连接或模型、撤销凭据会阻止其后续调用，包括排队中的请求。
 
-接入地址使用 HTTPS；本机 `localhost` 和 `127.0.0.1` 允许 HTTP。目标接口需支持流式 Responses，Director 请求还会携带 JSON Schema 输出格式。
-
-先保存配置，再点击“测试连接”。测试会发起一次真实请求，固定使用 `reasoning.effort=none` 和 `max_output_tokens=32`；它仅验证基本调用是否成功，不能替代完整的大纲与页面生成验证。
-
-### 推理力度
-
-同一面板的“生成设置”支持：
-
-| 选项 | 请求行为 |
-| --- | --- |
-| 自动 | 省略 `reasoning` 参数，由供应商决定 |
-| None | `reasoning.effort=none` |
-| Low | `reasoning.effort=low` |
-| High | `reasoning.effort=high`，首次初始化默认值 |
-| Max | `reasoning.effort=max` |
-
-推理力度同时应用于大纲和页面生成。新作品会保存模型地址、模型 ID、协议、凭据引用及推理力度的配置快照；修改生成设置仅影响之后新建的作品，已有作品的重试继续使用其快照。具体选项是否可用取决于接入的供应商与模型。
+归档保留历史数据，被路由引用时返回 409，需先切换路由。模型归档后可使用相同远程 ID 重新添加为新目录项。编辑命令校验 `expected_revision`，配置冲突返回 409。
 
 ### 首次初始化
 
@@ -159,6 +160,8 @@ backend/
   app/
     main.py        # FastAPI 接口、配置、作品快照、SSE 与预览
     runtime.py     # LangGraph 任务、模型网关、持久化队列与事件
+    provider_api.py # Provider/Model CRUD、发现、测试、路由与调用记录
+    provider_management.py # 配置解析、测试指纹和共享并发协调
     providers.py   # Responses 流式适配与供应商错误归一化
     db.py          # SQLAlchemy 数据模型、SQLite 初始化与路由配置
     schemas.py     # 请求、说明书和生成设置的结构契约
@@ -170,7 +173,11 @@ backend/
   requirements.txt
 frontend/
   src/
-    main.tsx       # 工作台、模型设置、SSE 消费和页面预览
+    main.tsx       # 工作台、设置页导航、SSE 消费和页面预览
+    ProviderSettings.tsx # Provider 管理工作区
+    ProviderEditor.tsx / ModelEditor.tsx # 连接和模型编辑
+    RoutingSettings.tsx / CallHistory.tsx # 业务路由与调用记录
+    provider-api.ts / provider-settings.css # 类型、请求与设置样式
     styles.css
     generation-settings.css
   vite.config.ts   # React 插件与 /api 开发代理
@@ -182,7 +189,7 @@ data/              # 默认 SQLite 数据目录，运行时创建，不纳入版
 
 SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、持久化任务队列、SSE 事件、模型调用用量、供应商路由和生成设置。默认路径相对于后端启动时的工作目录，因此应始终从仓库根目录启动后端。
 
-可通过 `DATABASE_URL` 指定其他 SQLAlchemy 连接串，但目前仅验证 SQLite。在线数据库还需补充驱动、版本迁移、并发与事务验证；现有初始化使用 `create_all`，不承担完整的数据库版本迁移。SQLite 请使用本机磁盘和单进程写入。
+可通过 `DATABASE_URL` 指定其他 SQLAlchemy 连接串，但目前仅验证 SQLite。在线数据库还需补充驱动、版本迁移、并发与事务验证；启动时为现有 SQLite 执行可重入的增量 Schema 升级，并在 `schema_migrations` 记录 Provider 管理数据迁移。旧配置的 ID、凭据引用和作品快照保留；旧 `auto` 对应 off（省略 reasoning），`none` 与 `max` 保留为模型专属兼容档位。迁移中断后可重启续做，不重复导入。当前保留规范化的 Provider/Endpoint/LogicalModel/Binding 存储关系，未引入 Alembic，也未验证其他数据库迁移。升级前应停止服务并备份 SQLite 与系统凭据。SQLite 请使用本机磁盘和单进程写入。
 
 ## 主要接口
 
@@ -190,10 +197,19 @@ SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET / PUT | `/settings/llm/default` | 查询、保存默认模型配置 |
-| POST | `/settings/llm/default/test` | 测试已保存的模型连接 |
-| GET / PUT | `/settings/generation` | 查询、保存推理力度 |
-| GET | `/settings/llm/calls` | 最近调用记录 |
+| GET / POST | `/settings/llm/providers` | 查询、创建 Provider |
+| GET / PATCH / DELETE | `/settings/llm/providers/{id}` | 详情、更新、归档 |
+| PUT / DELETE | `/settings/llm/providers/{id}/credential` | 版本化替换 / 撤销全部凭据 |
+| POST | `/settings/llm/providers/{id}/discover-models` | 主动发现候选，需 `expected_revision` |
+| GET / POST | `/settings/llm/providers/{id}/models` | 模型目录、添加模型 |
+| PATCH / DELETE | `/settings/llm/models/{id}` | 更新 / 归档模型 |
+| PUT | `/settings/llm/models/{id}/reasoning-tiers` | 保存思考档位 |
+| POST | `/settings/llm/models/{id}/test` | 文本流与 JSON Schema 检查 |
+| GET | `/settings/llm/business-routes` | 路由及生效配置 |
+| PUT | `/settings/llm/business-routes/{code}` | 保存默认 / 业务 Override |
+| GET | `/settings/llm/calls`、`/settings/llm/calls/{id}` | 游标列表 / 脱敏详情 |
+| GET / PUT | `/settings/llm/default`、`/settings/generation` | 旧客户端兼容接口，界面已使用新接口 |
+| POST | `/settings/llm/default/test` | 兼容接口，内部执行同一模型双项测试 |
 | GET / POST | `/presentations` | 作品列表、创建并排队生成说明书 |
 | GET | `/presentations/{id}` | 作品状态、大纲、页面与流文本快照 |
 | PUT | `/presentations/{id}/outline` | 保存大纲新版本 |
@@ -215,10 +231,15 @@ SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、�
 ```powershell
 .venv/Scripts/python.exe -m pytest backend/tests -q
 npm --prefix frontend run build
+npm --prefix frontend exec -- playwright install chromium
+npm --prefix frontend run test:e2e
+npm --prefix frontend run format:providers:check
 git diff --check
 ```
 
-常规后端测试使用临时 SQLite、模拟凭据存储与假模型，不调用收费 API；覆盖生成与确认闭环、幂等性、过期大纲、用量、推理力度、reasoning/正文分离、SSE 游标回放及 HTML 安全契约。前端构建执行 TypeScript 检查和 Vite 打包；构建产物不会由当前后端自动托管。
+常规后端测试使用临时 SQLite、模拟凭据存储与假模型，不调用收费 API；覆盖生成与确认闭环、幂等性、过期大纲、用量、推理力度、reasoning/正文分离、SSE 游标回放及 HTML 安全契约。新增 Provider 测试覆盖 CRUD、版本冲突、凭据轮换/撤销、路由继承与冻结、并发取消、排队期间撤销、发现失败和旧库迁移。Playwright 自动启动独立临时数据库与假模型后端，覆盖配置→发现→测试→路由→作品生成，以及 Key 清空、390px 窄屏与键盘焦点；运行前需确保 8000/5173 端口空闲。不会访问真实 Provider 或系统凭据库。前端构建执行 TypeScript 检查和 Vite 打包；构建产物不会由当前后端自动托管。
+
+Provider 新模块格式化使用 `npm --prefix frontend run format:providers`；后端新模块使用 `black`，可通过 `.venv/Scripts/python.exe -m pip install -r backend/requirements-dev.txt` 安装开发依赖。
 
 ## 常见问题
 

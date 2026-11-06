@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings, _read_key_file
@@ -20,6 +20,15 @@ def utcnow() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+class SchemaMigration(Base):
+    __tablename__ = "schema_migrations"
+    version: Mapped[str] = mapped_column(String(80), primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+PROVIDER_MIGRATION = "20261106_provider_management_v1"
 
 
 class Provider(Base):
@@ -45,6 +54,11 @@ class ApiProvider(Base):
     name: Mapped[str] = mapped_column(String(160))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=3)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __mapper_args__ = {"version_id_col": revision, "version_id_generator": False}
 
 
 class ApiEndpoint(Base):
@@ -54,18 +68,28 @@ class ApiEndpoint(Base):
     name: Mapped[str] = mapped_column(String(160))
     protocol: Mapped[str] = mapped_column(String(80), default="openai_responses")
     base_url: Mapped[str] = mapped_column(String(500))
-    credential_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    credential_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    auth_mode: Mapped[str] = mapped_column(String(20), default="bearer")
+    allow_private_http: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class LogicalModel(Base):
     __tablename__ = "logical_models"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     code: Mapped[str] = mapped_column(String(80), unique=True)
-    name: Mapped[str] = mapped_column(String(160))
+    name: Mapped[str] = mapped_column(String(200))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    context_window_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=3)
+    capabilities_json: Mapped[str] = mapped_column(Text, default='{"text_input":true,"multimodal_input":true,"tool_calling":true}')
+    capability_source: Mapped[str] = mapped_column(String(20), default="assumed")
+    metadata_source: Mapped[str] = mapped_column(String(30), default="unknown")
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __mapper_args__ = {"version_id_col": revision, "version_id_generator": False}
 
 
 class ModelBinding(Base):
@@ -73,7 +97,7 @@ class ModelBinding(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     model_id: Mapped[str] = mapped_column(ForeignKey("logical_models.id"), unique=True)
     endpoint_id: Mapped[str] = mapped_column(ForeignKey("api_endpoints.id"))
-    remote_model_id: Mapped[str] = mapped_column(String(160))
+    remote_model_id: Mapped[str] = mapped_column(String(200))
     structured_output_mode: Mapped[str] = mapped_column(String(40), default="native_json_schema")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
@@ -84,6 +108,56 @@ class BusinessRoute(Base):
     code: Mapped[str] = mapped_column(String(80), primary_key=True)
     model_id: Mapped[str] = mapped_column(ForeignKey("logical_models.id"))
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    reasoning_tier: Mapped[str] = mapped_column(String(40), default="high")
+    __mapper_args__ = {"version_id_col": revision, "version_id_generator": False}
+
+
+class BusinessRouteOverride(Base):
+    __tablename__ = "business_route_overrides"
+    code: Mapped[str] = mapped_column(String(80), primary_key=True)
+    model_id: Mapped[str | None] = mapped_column(ForeignKey("logical_models.id"), nullable=True)
+    reasoning_tier: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __mapper_args__ = {"version_id_col": revision, "version_id_generator": False}
+
+
+class ModelReasoningTier(Base):
+    __tablename__ = "model_reasoning_tiers"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_id: Mapped[str] = mapped_column(ForeignKey("logical_models.id"), index=True)
+    code: Mapped[str] = mapped_column(String(40))
+    label: Mapped[str] = mapped_column(String(80))
+    api_value: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    __table_args__ = (UniqueConstraint("model_id", "code", name="uq_model_reasoning_tier"),)
+
+
+class ApiCredential(Base):
+    __tablename__ = "api_credentials"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    endpoint_id: Mapped[str] = mapped_column(ForeignKey("api_endpoints.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    secret_ref: Mapped[str] = mapped_column(String(120), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("endpoint_id", "version", name="uq_endpoint_credential_version"),)
+
+
+class ProviderTest(Base):
+    __tablename__ = "provider_tests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider_id: Mapped[str] = mapped_column(ForeignKey("api_providers.id"), index=True)
+    model_id: Mapped[str] = mapped_column(ForeignKey("logical_models.id"), index=True)
+    config_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20))
+    checks_json: Mapped[str] = mapped_column(Text, default="[]")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class GenerationSettingsRecord(Base):
@@ -188,6 +262,15 @@ class LlmCall(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    business_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    provider_response_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    config_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queue_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    time_to_first_token_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -205,14 +288,33 @@ if settings.db_url.startswith("sqlite"):
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
 
 
+DEFAULT_REASONING_TIERS = (("off", None), ("low", "low"), ("medium", "medium"), ("high", "high"))
+
+
+def legacy_reasoning_tier(db, model_id: str, effort: str) -> str:
+    """Preserve existing wire values; only auto means omission of reasoning."""
+    code = "off" if effort == "auto" else effort
+    if not db.scalar(select(ModelReasoningTier.id).where(
+        ModelReasoningTier.model_id == model_id, ModelReasoningTier.code == code,
+    )):
+        db.add(ModelReasoningTier(
+            model_id=model_id, code=code, label=code.title(),
+            api_value=None if code == "off" else effort, sort_order=10,
+        ))
+        db.flush()
+    return code
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    migrated_reasoning = _upgrade_existing_schema()
     with SessionLocal() as db:
         if db.get(GenerationSettingsRecord, "default") is None:
             db.add(GenerationSettingsRecord(id="default", reasoning_effort="high"))
             db.commit()
+        default_route = db.get(BusinessRoute, "default")
         provider = db.scalar(select(Provider).where(Provider.code == "default"))
-        if provider is None:
+        if provider is None and default_route is None:
             key = os.getenv("DS_API_KEY") or _read_key_file().get("api_key", "")
             ref = str(uuid.uuid4()) if key else None
             if ref:
@@ -220,7 +322,8 @@ def init_db() -> None:
             db.add(Provider(code="default", name="Default DeepSeek", protocol="openai_responses", base_url=settings.api_base_url, model=settings.api_model, api_key_configured=bool(key), credential_ref=ref))
             db.commit()
             provider = db.scalar(select(Provider).where(Provider.code == "default"))
-        if not db.get(BusinessRoute, "default"):
+        imported_default = default_route is None
+        if imported_default:
             # Import the initial one-row configuration into the normalized routing model.
             owner = ApiProvider(code="default-provider", name=provider.name, enabled=provider.enabled)
             model = LogicalModel(code="default-model", name=provider.name, enabled=provider.enabled)
@@ -231,6 +334,90 @@ def init_db() -> None:
             db.flush()
             db.add_all([ModelBinding(model_id=model.id, endpoint_id=endpoint.id, remote_model_id=provider.model, enabled=provider.enabled), BusinessRoute(code="default", model_id=model.id)])
             db.commit()
+        default_route = db.get(BusinessRoute, "default")
+        generation = db.get(GenerationSettingsRecord, "default")
+        for route_code in ("ppt_outline", "ppt_html"):
+            if db.get(BusinessRouteOverride, route_code) is None:
+                db.add(BusinessRouteOverride(code=route_code))
+        for model in db.scalars(select(LogicalModel)).all():
+            if not db.scalar(select(ModelReasoningTier.id).where(ModelReasoningTier.model_id == model.id).limit(1)):
+                for order, (code, value) in enumerate(DEFAULT_REASONING_TIERS):
+                    db.add(ModelReasoningTier(model_id=model.id, code=code, label=code.title(), api_value=value, sort_order=order))
+        db.flush()
+        if (migrated_reasoning or imported_default) and default_route and generation:
+            default_route.reasoning_tier = legacy_reasoning_tier(db, default_route.model_id, generation.reasoning_effort)
+        for endpoint in db.scalars(select(ApiEndpoint).where(ApiEndpoint.credential_ref.is_not(None))).all():
+            if not db.scalar(select(ApiCredential.id).where(ApiCredential.endpoint_id == endpoint.id).limit(1)):
+                db.add(ApiCredential(endpoint_id=endpoint.id, version=1, secret_ref=endpoint.credential_ref, status="active"))
+        db.flush()
+        if migrated_reasoning:
+            # Previous releases rotated keys without credential history. Preserve refs
+            # frozen by existing works without reading the secret values themselves.
+            for presentation in db.scalars(select(Presentation)).all():
+                snapshot = loads(presentation.config_snapshot_json)
+                endpoint_id, ref = snapshot.get("endpoint_id"), snapshot.get("credential_ref")
+                if not endpoint_id or not ref or not db.get(ApiEndpoint, endpoint_id):
+                    continue
+                if db.scalar(select(ApiCredential.id).where(ApiCredential.secret_ref == ref)):
+                    continue
+                version = (db.scalar(select(ApiCredential.version).where(
+                    ApiCredential.endpoint_id == endpoint_id,
+                ).order_by(ApiCredential.version.desc()).limit(1)) or 0) + 1
+                db.add(ApiCredential(endpoint_id=endpoint_id, version=version, secret_ref=ref, status="retired"))
+                db.flush()
+        if not db.get(SchemaMigration, PROVIDER_MIGRATION):
+            db.add(SchemaMigration(version=PROVIDER_MIGRATION))
+        db.commit()
+
+
+def _upgrade_existing_schema() -> bool:
+    if not settings.db_url.startswith("sqlite"):
+        return False
+    additions = {
+        "api_providers": {
+            "max_concurrency": "INTEGER NOT NULL DEFAULT 3",
+            "archived_at": "DATETIME NULL",
+            "created_at": "DATETIME NULL",
+            "updated_at": "DATETIME NULL",
+        },
+        "api_endpoints": {
+            "auth_mode": "VARCHAR(20) NOT NULL DEFAULT 'bearer'",
+            "allow_private_http": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "logical_models": {
+            "context_window_tokens": "INTEGER NULL",
+            "max_output_tokens": "INTEGER NULL",
+            "max_concurrency": "INTEGER NOT NULL DEFAULT 3",
+            "capabilities_json": "TEXT NOT NULL DEFAULT '{\"text_input\":true,\"multimodal_input\":true,\"tool_calling\":true}'",
+            "capability_source": "VARCHAR(20) NOT NULL DEFAULT 'assumed'",
+            "metadata_source": "VARCHAR(30) NOT NULL DEFAULT 'unknown'",
+            "archived_at": "DATETIME NULL",
+        },
+        "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
+        "llm_calls": {
+            "error_code": "VARCHAR(80) NULL",
+            "provider_id": "VARCHAR(36) NULL",
+            "model_id": "VARCHAR(36) NULL",
+            "business_code": "VARCHAR(40) NULL",
+            "provider_response_id": "VARCHAR(200) NULL",
+            "config_snapshot_json": "TEXT NULL",
+            "queue_duration_ms": "INTEGER NULL",
+            "time_to_first_token_ms": "INTEGER NULL",
+            "total_duration_ms": "INTEGER NULL",
+        },
+    }
+    with SessionLocal() as db:
+        needs_data_migration = db.get(SchemaMigration, PROVIDER_MIGRATION) is None
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspect(connection).get_columns(table)}
+            for name, definition in columns.items():
+                if name not in existing:
+                    # Static DDL contains JSON colons, which text() treats as bind parameters.
+                    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        connection.execute(text("UPDATE api_providers SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+        connection.execute(text("UPDATE api_providers SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
+    return needs_data_migration
 
 
 def resolve_default(db):

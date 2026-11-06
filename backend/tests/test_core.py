@@ -12,7 +12,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + (Path(_tmp.name) / "test.db").as_pos
 os.environ["DS_API_FILE"] = str(Path(_tmp.name) / "missing.txt")
 os.environ.pop("DS_API_KEY", None)
 
-from backend.app import main, runtime  # noqa: E402
+from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
 from backend.app.db import engine, LlmCall, Presentation, loads, session_scope  # noqa: E402
@@ -45,13 +45,20 @@ def document():
 @pytest.fixture
 def client(monkeypatch):
     secrets = {}
-    monkeypatch.setattr(main, "save_secret", lambda key, value: secrets.__setitem__(key, value))
+    monkeypatch.setattr(provider_api, "save_secret", lambda key, value: secrets.__setitem__(key, value))
+    monkeypatch.setattr(provider_api, "read_secret", lambda key: secrets.get(key))
     monkeypatch.setattr(main, "read_secret", lambda key: secrets.get(key))
     monkeypatch.setattr(runtime, "read_secret", lambda key: secrets.get(key))
     main.app.state.reasoning_efforts = []
 
     async def fake_stream(**kwargs):
-        assert "max_output_tokens" not in kwargs
+        if kwargs.get("max_output_tokens"):
+            assert kwargs["max_output_tokens"] == 64
+            assert kwargs["reasoning_effort"] is None
+            text = '{"ok":true}' if kwargs.get("json_schema") else "OK"
+            yield ProviderEvent("text_delta", text)
+            yield ProviderEvent("completed", {"text": text, "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}})
+            return
         main.app.state.reasoning_efforts.append(kwargs.get("reasoning_effort"))
         text = json.dumps(document()) if kwargs.get("json_schema") else valid_html()
         if kwargs.get("json_schema"):
@@ -60,16 +67,12 @@ def client(monkeypatch):
         yield ProviderEvent("completed", {"text": text, "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}})
 
     monkeypatch.setattr(runtime, "stream_responses", fake_stream)
-    async def fake_connection_stream(**kwargs):
-        assert kwargs["max_output_tokens"] == 32
-        assert kwargs["reasoning_effort"] == "none"
-        yield ProviderEvent("completed", {"text": "OK", "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}})
-    monkeypatch.setattr(main, "stream_responses", fake_connection_stream)
     with TestClient(main.app) as c:
         response = c.put("/api/v1/settings/llm/default", json={"name": "Test", "base_url": "https://example.com", "model": "fake", "api_key": "secret", "enabled": True})
         assert response.status_code == 200
         assert "secret" not in response.text
         assert c.put("/api/v1/settings/generation", json={"reasoning_effort": "high"}).status_code == 200
+        assert c.post("/api/v1/settings/llm/default/test").json()["status"] == "SUCCEEDED"
         main.app.state.reasoning_efforts.clear()
         yield c
 
@@ -202,10 +205,11 @@ def test_legacy_reasoning_snapshot_defaults_to_none():
     assert runtime.request_reasoning_effort({"reasoning_effort": "auto"}) is None
 
 
-def test_connection_test_does_not_expose_or_record_tokens(client):
+def test_legacy_connection_test_uses_shared_gateway_and_records_usage(client):
     response = client.post("/api/v1/settings/llm/default/test")
     assert response.json() == {"status": "SUCCEEDED", "message": "连接成功"}
     with session_scope() as db:
         call = db.query(LlmCall).filter_by(purpose="provider_test").order_by(LlmCall.started_at.desc()).first()
-        assert call.input_tokens is None and call.output_tokens is None and call.total_tokens is None
+        assert (call.input_tokens, call.output_tokens, call.total_tokens) == (2, 1, 3)
+        assert call.provider_id and call.config_snapshot_json
     assert all("total_tokens" not in item for item in client.get("/api/v1/settings/llm/calls").json()["items"])
