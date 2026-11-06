@@ -54,6 +54,8 @@ def client(monkeypatch):
         assert "max_output_tokens" not in kwargs
         main.app.state.reasoning_efforts.append(kwargs.get("reasoning_effort"))
         text = json.dumps(document()) if kwargs.get("json_schema") else valid_html()
+        if kwargs.get("json_schema"):
+            yield ProviderEvent("reasoning_delta", "梳理叙事主线。")
         yield ProviderEvent("text_delta", text)
         yield ProviderEvent("completed", {"text": text, "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}})
 
@@ -107,6 +109,13 @@ def test_end_to_end_and_idempotency(client):
     snapshot = wait_status(client, pid, {"READY", "PARTIAL_FAILED"})
     assert snapshot["presentation"]["status"] == "READY", snapshot
     assert main.app.state.reasoning_efforts == ["low", "low", "low"]
+    streamed_snapshot = client.get(f"/api/v1/presentations/{pid}").json()
+    assert streamed_snapshot["director_stream"]["reasoning"] == "梳理叙事主线。"
+    assert "schema_version" in streamed_snapshot["director_stream"]["output"]
+    with session_scope() as db:
+        director_stream = [loads(event.payload_json) for event in db.query(main.Event).filter_by(presentation_id=pid, type="director.stream.delta").all()]
+    assert any(event["channel"] == "reasoning" and event["delta"] == "梳理叙事主线。" for event in director_stream)
+    assert any(event["channel"] == "output" and "schema_version" in event["delta"] for event in director_stream)
     assert [p["page_number"] for p in snapshot["pages"]] == [1, 2]
     assert all(p["status"] == "SUCCEEDED" for p in snapshot["pages"])
     usage = client.get(f"/api/v1/presentations/{pid}/usage").json()
@@ -124,6 +133,35 @@ def test_end_to_end_and_idempotency(client):
     assert "sandbox" in response.headers["content-security-policy"]
     assert client.get("/api/v1/settings/llm/default").json()["credential_configured"]
     assert "secret" not in client.get("/api/v1/settings/llm/default").text
+
+
+@pytest.mark.asyncio
+async def test_sse_replays_from_last_event_id(client):
+    response = client.post("/api/v1/presentations", json={"user_request": "Create a one-page test deck"})
+    pid = response.json()["presentation_id"]
+    wait_status(client, pid, {"WAITING_CONFIRMATION", "FAILED"})
+    with session_scope() as db:
+        sequences = [row[0] for row in db.query(main.Event.seq).filter_by(presentation_id=pid).order_by(main.Event.seq).all()]
+    assert len(sequences) > 2
+    expected_seq = sequences[-2]
+
+    # The native EventSource reconnects with Last-Event-ID. The server honors the
+    # newer of that header and the initial query cursor, then replays persisted rows.
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = main.Request({
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": "GET", "scheme": "http",
+        "path": f"/api/v1/presentations/{pid}/events", "raw_path": b"/events",
+        "query_string": b"", "headers": [], "client": ("test", 1), "server": ("test", 80),
+    }, receive)
+    streamed = await main.events(pid, request, after=sequences[0], last_event_id=str(expected_seq - 1))
+    iterator = streamed.body_iterator.__aiter__()
+    first_chunk = await anext(iterator)
+    await iterator.aclose()
+    first_event_id = int(first_chunk.splitlines()[0].removeprefix("id: "))
+    assert first_event_id == expected_seq
 
 
 def test_stale_outline_is_rejected(client):

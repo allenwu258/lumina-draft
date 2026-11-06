@@ -206,6 +206,7 @@ def get_presentation(presentation_id: str):
         outline = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
         runs = db.scalars(select(Run).where(Run.presentation_id == p.id).order_by(Run.created_at.desc())).all()
         pages = db.scalars(select(PageTask).where(PageTask.presentation_id == p.id).order_by(PageTask.page_number)).all()
+        active_run = next((r for r in runs if r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}), None)
         last_seq = db.scalar(select(Event.seq).where(Event.presentation_id == p.id).order_by(Event.seq.desc()).limit(1)) or 0
         running_ids = {page.id for page in pages if page.status == "RUNNING"}
         streams: dict[str, str] = {}
@@ -220,7 +221,20 @@ def get_presentation(presentation_id: str):
                     streams[task_id] = ""
                 else:
                     streams[task_id] = streams.get(task_id, "") + payload.get("delta", "")
-        return {"presentation": presentation_dict(p), "latest_outline": outline_dict(outline), "active_run": run_dict(next((r for r in runs if r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}), None)), "latest_run": run_dict(runs[0]) if runs else None, "pages": [page_dict(x) for x in pages], "active_streams": streams, "last_event_seq": last_seq}
+        director_stream = {"reasoning": "", "output": ""}
+        director_run = next((r for r in runs if r.kind == "DIRECTOR"), None)
+        stream_run = active_run if active_run and active_run.kind == "DIRECTOR" else director_run
+        if stream_run:
+            director_events = db.scalars(select(Event).where(Event.presentation_id == p.id, Event.run_id == stream_run.id, Event.seq <= last_seq, Event.type.in_(["director.stream.reset", "director.stream.delta"])).order_by(Event.seq)).all()
+            for event in director_events:
+                payload = loads(event.payload_json)
+                if event.type == "director.stream.reset":
+                    director_stream = {"reasoning": "", "output": ""}
+                    continue
+                channel = payload.get("channel")
+                if channel in director_stream:
+                    director_stream[channel] += payload.get("delta", "")
+        return {"presentation": presentation_dict(p), "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "latest_run": run_dict(runs[0]) if runs else None, "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")

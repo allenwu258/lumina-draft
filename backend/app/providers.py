@@ -85,9 +85,16 @@ async def stream_responses(
                         if kind == "response.output_text.delta":
                             key = (int(payload.get("output_index", 0)), int(payload.get("content_index", 0)))
                             delta = payload.get("delta", "")
+                            if not isinstance(delta, str):
+                                raise ProviderError("INVALID_PROVIDER_EVENT", "供应商返回了无效的文本增量")
                             content.setdefault(key, []).append(delta)
                             if delta:
                                 yield ProviderEvent("text_delta", delta)
+                        elif kind in {"response.reasoning_text.delta", "response.reasoning_summary_text.delta"}:
+                            # Normalize supported Responses reasoning text and optional summaries.
+                            delta = payload.get("delta", "")
+                            if isinstance(delta, str) and delta:
+                                yield ProviderEvent("reasoning_delta", delta)
                         elif kind == "response.refusal.delta":
                             yield ProviderEvent("refusal_delta", payload.get("delta", ""))
                         elif kind in {"response.completed", "response.incomplete", "response.failed"}:

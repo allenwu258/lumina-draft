@@ -31,6 +31,8 @@ npm --prefix frontend run dev -- --port 5173
 
 正式生成请求不设置输入或输出 token 预算；供应商或模型自身的上下文和输出限制仍然适用。作品会话中展示供应商返回的输入、输出及总 token 用量，包含失败和重试中有返回用量的调用；`≥` 表示部分调用未返回对应数据，实际用量可能更高。连接测试不计入会话统计。现有的请求字符数、输出字节数及 HTML 安全准入限制仍然生效，它们不是 token 计数限制。
 
+Director 生成大纲时，工作台会将 Responses 流中的 reasoning 文本与 JSON 正文分栏实时显示，并持久化以支持刷新恢复；供应商未返回 reasoning 增量时会显示明确提示。流文本仅作查看，最终 JSON 完整解析和校验后才开放结构化大纲编辑与确认。DeepSeek Responses 的事件行为以[官方文档](https://api-docs.deepseek.com/guides/responses_api#streaming)为准。
+
 默认数据库为工作目录的 `data/lumina.db`；可用 `DATABASE_URL` 指定其他 SQLAlchemy 连接串。当前仅验证 SQLite；更换在线数据库前需要补充驱动、迁移、并发与事务测试。请勿在网络共享目录多进程写 SQLite。
 
 ## 测试

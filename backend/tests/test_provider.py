@@ -35,6 +35,42 @@ async def test_responses_stream_reports_usage(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_responses_streams_reasoning_and_final_text_separately(monkeypatch):
+    events = [
+        {"type": "response.reasoning_text.delta", "delta": "先分析结构。", "output_index": 0},
+        {"type": "response.output_text.delta", "delta": "{\"title\":", "output_index": 1, "content_index": 0},
+        {"type": "response.completed", "response": {"status": "completed", "usage": {}}},
+    ]
+    wire = "".join(f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n" for event in events).encode()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=wire, headers={"content-type": "text/event-stream"}))
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=transport, **kwargs))
+
+    result = [event async for event in providers.stream_responses(base_url="https://example.com", api_key="secret", model="model", instructions="system", prompt="hello")]
+
+    assert [(event.kind, event.data) for event in result if event.kind.endswith("delta")] == [
+        ("reasoning_delta", "先分析结构。"),
+        ("text_delta", "{\"title\":"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_accepts_reasoning_summary_text_delta(monkeypatch):
+    events = [
+        {"type": "response.reasoning_summary_text.delta", "delta": "计划摘要。", "output_index": 0, "summary_index": 0},
+        {"type": "response.completed", "response": {"status": "completed", "usage": {}}},
+    ]
+    wire = "".join(f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n" for event in events).encode()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=wire, headers={"content-type": "text/event-stream"}))
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=transport, **kwargs))
+
+    result = [event async for event in providers.stream_responses(base_url="https://example.com/v1", api_key="secret", model="model", instructions="system", prompt="hello")]
+
+    assert [(event.kind, event.data) for event in result if event.kind.endswith("delta")] == [("reasoning_delta", "计划摘要。")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("token_limit", [None, 32])
 async def test_responses_omits_unset_output_limit(monkeypatch, token_limit):
     requests = []

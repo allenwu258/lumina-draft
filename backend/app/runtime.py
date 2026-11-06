@@ -53,7 +53,7 @@ async def run_graph(graph, state):
 def build_director_graph():
     async def generate(state: DirectorState):
         prompt = f"用户需求：\n{state['user_request']}\n\n附加选项：{json.dumps(state.get('options', {}), ensure_ascii=False)}\n请严格按系统要求输出结构化说明书。"
-        output = await ProviderGateway().complete_json(prompt, state["presentation_id"], "director")
+        output = await ProviderGateway().complete_json(prompt, state["presentation_id"], "director", state["run_id"])
         return {"result": output}
     graph = StateGraph(DirectorState)
     graph.add_node("generate", generate)
@@ -95,7 +95,7 @@ def build_page_graph():
 
 
 class ProviderGateway:
-    async def _stream(self, prompt: str, presentation_id: str, purpose: str, schema: dict | None = None, page_task_id: str | None = None) -> str:
+    async def _stream(self, prompt: str, presentation_id: str, purpose: str, schema: dict | None = None, page_task_id: str | None = None, run_id: str | None = None) -> str:
         with session_scope() as db:
             presentation = db.get(Presentation, presentation_id)
             snapshot = loads(presentation.config_snapshot_json) if presentation else {}
@@ -115,12 +115,31 @@ class ProviderGateway:
             key = read_secret(snapshot.get("credential_ref") or endpoint.credential_ref or "") or ""
         output: list[str] = []
         buffer: list[str] = []
+        director_stream_buffer: list[tuple[str, str]] = []
         last_flush = time.monotonic()
+        last_director_flush = last_flush
         total_bytes = 0
+        reasoning_bytes = 0
         refused = False
         usage: dict[str, Any] = {}
         status = "FAILED"
         error: str | None = None
+
+        async def flush_director_stream() -> None:
+            nonlocal last_director_flush
+            if not director_stream_buffer or not run_id:
+                return
+            segments: list[tuple[str, str]] = []
+            for channel, delta in director_stream_buffer:
+                if segments and segments[-1][0] == channel:
+                    segments[-1] = (channel, segments[-1][1] + delta)
+                else:
+                    segments.append((channel, delta))
+            director_stream_buffer.clear()
+            for channel, delta in segments:
+                await emit_event(presentation_id, "director.stream.delta", {"run_id": run_id, "channel": channel, "delta": delta}, run_id)
+            last_director_flush = time.monotonic()
+
         try:
             async for event in stream_responses(base_url=base_url, api_key=key, model=model, instructions=DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT, prompt=prompt, json_schema=schema, reasoning_effort=request_reasoning_effort(snapshot)):
                 if event.kind == "text_delta":
@@ -128,12 +147,23 @@ class ProviderGateway:
                     total_bytes += len(event.data.encode("utf-8"))
                     if total_bytes > 256 * 1024:
                         raise ProviderError("OUTPUT_TOO_LARGE", "模型输出超过大小限制")
+                    if purpose == "director":
+                        director_stream_buffer.append(("output", event.data))
+                        if time.monotonic() - last_director_flush >= 0.12 or sum(len(value) for _, value in director_stream_buffer) >= 2048:
+                            await flush_director_stream()
                     if page_task_id:
                         buffer.append(event.data)
                         if time.monotonic() - last_flush >= 0.15 or sum(map(len, buffer)) >= 16384:
                             await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
                             buffer.clear()
                             last_flush = time.monotonic()
+                elif event.kind == "reasoning_delta" and purpose == "director":
+                    reasoning_bytes += len(event.data.encode("utf-8"))
+                    if reasoning_bytes > 256 * 1024:
+                        raise ProviderError("REASONING_TOO_LARGE", "模型 reasoning 输出超过大小限制")
+                    director_stream_buffer.append(("reasoning", event.data))
+                    if time.monotonic() - last_director_flush >= 0.12 or sum(len(value) for _, value in director_stream_buffer) >= 2048:
+                        await flush_director_stream()
                 elif event.kind == "refusal_delta":
                     refused = True
                     status, error = "REFUSED", "模型拒绝了该请求"
@@ -152,6 +182,7 @@ class ProviderGateway:
             status = "FAILED"
             raise
         finally:
+            await flush_director_stream()
             if page_task_id and buffer:
                 await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
             with session_scope() as db:
@@ -168,9 +199,9 @@ class ProviderGateway:
             raise ProviderError("MODEL_INCOMPLETE", error or "模型未完成输出")
         return "".join(output)
 
-    async def complete_json(self, prompt: str, presentation_id: str, purpose: str) -> dict[str, Any]:
+    async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None) -> dict[str, Any]:
         schema = OutlineDocument.model_json_schema()
-        text = await self._stream(prompt, presentation_id, purpose, schema)
+        text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id)
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
@@ -223,6 +254,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         run.status = "RUNNING"
         presentation.status = "PLANNING"
         request, options = presentation.user_request, loads(presentation.options_json)
+    await emit_event(presentation_id, "director.stream.reset", {"run_id": run_id}, run_id)
     await emit_event(presentation_id, "director.started", {"run_id": run_id}, run_id)
     try:
         result = await run_graph(DIRECTOR_GRAPH, {"presentation_id": presentation_id, "run_id": run_id, "user_request": request, "options": options})
