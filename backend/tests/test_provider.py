@@ -1,9 +1,27 @@
+import asyncio
 import json
 
 import httpx
 import pytest
 
 from backend.app import providers
+
+
+class GatedSSEStream(httpx.AsyncByteStream):
+    def __init__(self, first_chunk: bytes, final_chunk: bytes):
+        self.first_chunk = first_chunk
+        self.final_chunk = final_chunk
+        self.first_chunk_sent = asyncio.Event()
+        self.release_final_chunk = asyncio.Event()
+
+    async def __aiter__(self):
+        self.first_chunk_sent.set()
+        yield self.first_chunk
+        await self.release_final_chunk.wait()
+        yield self.final_chunk
+
+    async def aclose(self):
+        self.release_final_chunk.set()
 
 
 @pytest.mark.asyncio
@@ -32,6 +50,62 @@ async def test_responses_stream_reports_usage(monkeypatch):
     assert [e.kind for e in result] == ["started", "text_delta", "completed"]
     assert result[-1].data["text"] == "hello"
     assert result[-1].data["usage"]["output_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_yields_small_delta_before_response_finishes(monkeypatch):
+    delta = {
+        "type": "response.output_text.delta",
+        "delta": "first token",
+        "output_index": 0,
+        "content_index": 0,
+    }
+    completed = {
+        "type": "response.completed",
+        "response": {"status": "completed", "usage": {}},
+    }
+    stream = GatedSSEStream(
+        f"event: {delta['type']}\ndata: {json.dumps(delta)}\n\n".encode(),
+        f"event: {completed['type']}\ndata: {json.dumps(completed)}\n\n".encode(),
+    )
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        providers.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_type(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    stream=stream,
+                    headers={"content-type": "text/event-stream"},
+                )
+            ),
+            **kwargs,
+        ),
+    )
+
+    events = providers.stream_responses(
+        base_url="https://example.com/v1",
+        api_key="secret",
+        model="model",
+        instructions="system",
+        prompt="hello",
+    )
+    assert (await anext(events)).kind == "started"
+    next_event = asyncio.create_task(anext(events))
+    try:
+        await asyncio.wait_for(stream.first_chunk_sent.wait(), timeout=1)
+        done, _ = await asyncio.wait({next_event}, timeout=0.1)
+        assert next_event in done, "small SSE deltas must not wait for later response bytes"
+        event = await next_event
+        assert (event.kind, event.data) == ("text_delta", "first token")
+    finally:
+        stream.release_final_chunk.set()
+        if not next_event.done():
+            await asyncio.gather(next_event, return_exceptions=True)
+
+    result = [event async for event in events]
+    assert result[-1].kind == "completed"
 
 
 @pytest.mark.asyncio

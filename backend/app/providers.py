@@ -79,7 +79,7 @@ def strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 async def bounded_lines(response: httpx.Response) -> AsyncIterator[str]:
     pending = bytearray()
-    async for chunk in response.aiter_bytes(chunk_size=8192):
+    async for chunk in response.aiter_bytes():
         pending.extend(chunk)
         while b"\n" in pending:
             line, _, rest = pending.partition(b"\n")
