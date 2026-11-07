@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, select, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings, _read_key_file
@@ -238,6 +238,7 @@ class Job(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), unique=True, index=True)
     presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
     kind: Mapped[str] = mapped_column(String(30))
+    model_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
     queue_reason: Mapped[str | None] = mapped_column(String(40), default="SCHEDULER", nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -248,6 +249,9 @@ class Job(Base):
     queue_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (
+        Index("ix_jobs_status_model_queued", "status", "model_id", "queued_at", "created_at"),
+    )
 
 
 class IdempotencyRecord(Base):
@@ -407,6 +411,7 @@ def _upgrade_existing_schema() -> bool:
         "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
         "page_tasks": {"error_code": "VARCHAR(80) NULL"},
         "jobs": {
+            "model_id": "VARCHAR(36) NULL",
             "error_code": "VARCHAR(80) NULL",
             "error": "TEXT NULL",
             "queue_reason": "VARCHAR(40) NULL",
@@ -442,6 +447,29 @@ def _upgrade_existing_schema() -> bool:
         connection.execute(text("UPDATE api_providers SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
         connection.execute(text("UPDATE api_providers SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
         connection.execute(text("UPDATE jobs SET queued_at = created_at WHERE queued_at IS NULL"))
+        connection.execute(
+            text(
+                """UPDATE jobs
+                SET model_id = (
+                    SELECT COALESCE(
+                        CASE WHEN jobs.kind = 'DIRECTOR'
+                            THEN json_extract(presentations.config_snapshot_json,
+                                '$.resolved_routes.ppt_outline.model_id')
+                            ELSE json_extract(presentations.config_snapshot_json,
+                                '$.resolved_routes.ppt_html.model_id')
+                        END,
+                        json_extract(presentations.config_snapshot_json, '$.model_id')
+                    )
+                    FROM presentations
+                    WHERE presentations.id = jobs.presentation_id
+                )
+                WHERE jobs.model_id IS NULL"""
+            )
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_status_model_queued "
+            "ON jobs (status, model_id, queued_at, created_at)"
+        )
     return needs_data_migration
 
 

@@ -106,6 +106,12 @@ def page_dict(p: PageTask) -> dict:
     return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt}
 
 
+def scheduled_model_id(snapshot: dict[str, Any], kind: str) -> str | None:
+    route_code = "ppt_outline" if kind == "DIRECTOR" else "ppt_html"
+    route = (snapshot.get("resolved_routes") or {}).get(route_code) or {}
+    return route.get("model_id") or snapshot.get("model_id")
+
+
 def provider_dict(route, model, binding, endpoint, owner) -> dict:
     return {"id": owner.id, "code": owner.code, "name": owner.name, "protocol": endpoint.protocol, "base_url": endpoint.base_url, "model": binding.remote_model_id, "enabled": owner.enabled and endpoint.enabled and model.enabled and binding.enabled, "revision": endpoint.revision, "credential_configured": bool(endpoint.credential_ref), "business_route": route.code, "logical_model_id": model.id, "binding_id": binding.id, "endpoint_id": endpoint.id}
 
@@ -245,7 +251,13 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         run = Run(presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED")
         db.add(run)
         db.flush()
-        db.add(Job(run_id=run.id, presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED"))
+        db.add(Job(
+            run_id=run.id,
+            presentation_id=presentation.id,
+            kind="DIRECTOR",
+            model_id=scheduled_model_id(snapshot, "DIRECTOR"),
+            status="QUEUED",
+        ))
         pid, rid = presentation.id, run.id
         response = {"presentation_id": pid, "run_id": rid, "status": "PLANNING"}
         if idempotency_key:
@@ -358,7 +370,14 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
         db.flush()
         for slide in document["slides"]:
             db.add(PageTask(presentation_id=p.id, run_id=run.id, slide_id=slide["slide_id"], page_number=slide["page_number"], title=slide["title"], brief_json=dumps(slide)))
-        db.add(Job(run_id=run.id, presentation_id=p.id, kind="GENERATION", status="QUEUED"))
+        snapshot = loads(p.config_snapshot_json)
+        db.add(Job(
+            run_id=run.id,
+            presentation_id=p.id,
+            kind="GENERATION",
+            model_id=scheduled_model_id(snapshot, "GENERATION"),
+            status="QUEUED",
+        ))
         rid, count = run.id, len(document["slides"])
     await emit_event(presentation_id, "generation.queued", {"run_id": rid, "page_count": count}, rid)
     await emit_event(presentation_id, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
@@ -376,7 +395,12 @@ async def retry_presentation(presentation_id: str):
             p.status = "PLANNING"
             db.add(run)
             db.flush()
-            db.add(Job(run_id=run.id, presentation_id=p.id, kind="DIRECTOR"))
+            db.add(Job(
+                run_id=run.id,
+                presentation_id=p.id,
+                kind="DIRECTOR",
+                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
+            ))
         elif p.status in {"PARTIAL_FAILED", "CANCELLED"} and previous.kind == "GENERATION":
             run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")
             db.add(run)
@@ -385,7 +409,12 @@ async def retry_presentation(presentation_id: str):
                 task.run_id = run.id
                 if task.status != "SUCCEEDED": task.status, task.error = "PENDING", None
             p.status = "GENERATING"
-            db.add(Job(run_id=run.id, presentation_id=p.id, kind="GENERATION"))
+            db.add(Job(
+                run_id=run.id,
+                presentation_id=p.id,
+                kind="GENERATION",
+                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
+            ))
         else:
             fail("INVALID_STATE", "当前没有可以重试的任务")
         rid, kind = run.id, run.kind

@@ -463,6 +463,109 @@ async def test_scheduler_runs_models_concurrently_and_fairly(managed_client, mon
 
 
 @pytest.mark.asyncio
+async def test_scheduler_reserves_slots_for_idle_models_behind_large_backlog(
+    managed_client, monkeypatch
+):
+    provider = create_provider(managed_client)
+    model_a = create_model(managed_client, provider, "backlogged-model-a", concurrency=1)
+    model_b = create_model(managed_client, provider, "idle-model-b", concurrency=3)
+    model_ids = {"a": model_a["id"], "b": model_b["id"]}
+    run_models = {}
+    with session_scope() as db:
+        for index in range(101):
+            presentation = Presentation(
+                user_request=f"backlogged A {index}",
+                status="PLANNING",
+                config_snapshot_json=dumps(
+                    {"resolved_routes": {"ppt_outline": {"model_id": model_ids["a"]}}}
+                ),
+            )
+            db.add(presentation)
+            db.flush()
+            run = Run(presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED")
+            db.add(run)
+            db.flush()
+            db.add(
+                Job(
+                    run_id=run.id,
+                    presentation_id=presentation.id,
+                    kind="DIRECTOR",
+                    model_id=model_ids["a"],
+                    status="QUEUED",
+                )
+            )
+            run_models[run.id] = model_ids["a"]
+
+        presentation_b = Presentation(
+            user_request="idle model B",
+            status="PLANNING",
+            config_snapshot_json=dumps(
+                {"resolved_routes": {"ppt_outline": {"model_id": model_ids["b"]}}}
+            ),
+        )
+        db.add(presentation_b)
+        db.flush()
+        run_b = Run(
+            presentation_id=presentation_b.id,
+            kind="DIRECTOR",
+            status="QUEUED",
+        )
+        db.add(run_b)
+        db.flush()
+        job_b = Job(
+            run_id=run_b.id,
+            presentation_id=presentation_b.id,
+            kind="DIRECTOR",
+            model_id=model_ids["b"],
+            status="QUEUED",
+        )
+        db.add(job_b)
+        db.flush()
+        run_models[run_b.id] = model_ids["b"]
+        job_b_id = job_b.id
+
+    monkeypatch.setattr(
+        runtime,
+        "settings",
+        replace(runtime.settings, max_active_runs=8, scheduler_queue_timeout_seconds=600),
+    )
+    started_models = []
+    releases = {model_id: asyncio.Event() for model_id in model_ids.values()}
+
+    async def fake_director(presentation_id, run_id):
+        model_id = run_models[run_id]
+        started_models.append(model_id)
+        await releases[model_id].wait()
+        with session_scope() as db:
+            db.get(Run, run_id).status = "SUCCEEDED"
+            db.get(Presentation, presentation_id).status = "WAITING_CONFIRMATION"
+
+    monkeypatch.setattr(runtime, "run_director", fake_director)
+    stop = asyncio.Event()
+    scheduler_task = asyncio.create_task(runtime.scheduler(stop))
+    try:
+        await eventually(lambda: set(started_models) == set(model_ids.values()))
+        assert started_models.count(model_ids["a"]) == 1
+        assert started_models.count(model_ids["b"]) == 1
+        with session_scope() as db:
+            queued_a = db.scalars(
+                select(Job).where(Job.model_id == model_ids["a"], Job.status == "QUEUED")
+            ).all()
+            assert len(queued_a) == 100
+            assert db.get(Job, job_b_id).status == "RUNNING"
+
+        stop.set()
+        releases[model_ids["b"]].set()
+        await eventually(lambda: _job_status(job_b_id) == "SUCCEEDED")
+        releases[model_ids["a"]].set()
+    finally:
+        stop.set()
+        for release in releases.values():
+            release.set()
+        await asyncio.wait_for(scheduler_task, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_scheduler_finalizes_cancelled_run_before_execute_starts(
     managed_client, monkeypatch
 ):

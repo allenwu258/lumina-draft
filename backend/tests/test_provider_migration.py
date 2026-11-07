@@ -13,8 +13,10 @@ from backend.app.db import (
     Base,
     BusinessRoute,
     BusinessRouteOverride,
+    Job,
     ModelReasoningTier,
     Presentation,
+    Run,
     SchemaMigration,
     dumps,
     loads,
@@ -115,11 +117,28 @@ def test_upgrade_preserves_routes_credentials_and_snapshots(
             }
         )
         with sessions.begin() as db:
+            presentation = Presentation(
+                id="old-presentation",
+                user_request="existing",
+                config_snapshot_json=original_snapshot,
+            )
+            db.add(presentation)
+            db.flush()
+            run = Run(
+                id="old-run",
+                presentation_id=presentation.id,
+                kind="DIRECTOR",
+                status="QUEUED",
+            )
+            db.add(run)
+            db.flush()
             db.add(
-                Presentation(
-                    id="old-presentation",
-                    user_request="existing",
-                    config_snapshot_json=original_snapshot,
+                Job(
+                    id="old-job",
+                    run_id=run.id,
+                    presentation_id=presentation.id,
+                    kind="DIRECTOR",
+                    status="QUEUED",
                 )
             )
         if source == "interrupted":
@@ -154,6 +173,7 @@ def test_upgrade_preserves_routes_credentials_and_snapshots(
                 db.get(Presentation, "old-presentation").config_snapshot_json
                 == original_snapshot
             )
+            assert db.get(Job, "old-job").model_id == "model"
             assert len(db.scalars(select(BusinessRouteOverride)).all()) == 2
             assert len(db.scalars(select(SchemaMigration)).all()) == 2
             assert len(db.scalars(select(ApiProvider)).all()) == 1

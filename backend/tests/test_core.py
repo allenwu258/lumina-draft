@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 _tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = "sqlite:///" + (Path(_tmp.name) / "test.db").as_posix()
@@ -15,7 +16,7 @@ os.environ.pop("DS_API_KEY", None)
 from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
-from backend.app.db import engine, LlmCall, Presentation, loads, session_scope  # noqa: E402
+from backend.app.db import engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -96,6 +97,11 @@ def test_end_to_end_and_idempotency(client):
     assert first.json() == duplicate.json()
     assert client.post("/api/v1/presentations", json={"user_request": "Different"}, headers=headers).status_code == 409
     pid = first.json()["presentation_id"]
+    with session_scope() as db:
+        presentation = db.get(Presentation, pid)
+        route_model_id = loads(presentation.config_snapshot_json)["resolved_routes"]["ppt_outline"]["model_id"]
+        job = db.scalar(select(Job).where(Job.run_id == first.json()["run_id"]))
+        assert job.model_id == route_model_id
     assert client.put("/api/v1/settings/generation", json={"reasoning_effort": "max"}).status_code == 200
     with session_scope() as db:
         presentation = db.get(Presentation, pid)
@@ -109,6 +115,11 @@ def test_end_to_end_and_idempotency(client):
     result = client.post(f"/api/v1/presentations/{pid}/confirm", json=confirmation)
     assert result.status_code == 202
     assert client.post(f"/api/v1/presentations/{pid}/confirm", json=confirmation).json()["run_id"] == result.json()["run_id"]
+    with session_scope() as db:
+        presentation = db.get(Presentation, pid)
+        route_model_id = loads(presentation.config_snapshot_json)["resolved_routes"]["ppt_html"]["model_id"]
+        job = db.scalar(select(Job).where(Job.run_id == result.json()["run_id"]))
+        assert job.model_id == route_model_id
     snapshot = wait_status(client, pid, {"READY", "PARTIAL_FAILED"})
     assert snapshot["presentation"]["status"] == "READY", snapshot
     assert main.app.state.reasoning_efforts == ["low", "low", "low"]

@@ -560,7 +560,8 @@ async def scheduler(stop: asyncio.Event) -> None:
             elif run and run.kind == "DIRECTOR":
                 run.status = "QUEUED"
     active_tasks: dict[str, asyncio.Task] = {}
-    fair_cursor = 0
+    active_model_keys: dict[str, str] = {}
+    fair_model_cursor: str | None = None
 
     def elapsed_seconds(start: datetime, end: datetime) -> float:
         if start.tzinfo is None:
@@ -573,7 +574,8 @@ async def scheduler(stop: asyncio.Event) -> None:
         snapshot = loads(snapshot_json) if snapshot_json else {}
         routes = snapshot.get("resolved_routes") or {}
         route = routes.get("ppt_outline" if job.kind == "DIRECTOR" else "ppt_html") or {}
-        return str(route.get("model_id") or snapshot.get("model_id") or "unknown")
+        model_id = job.model_id or route.get("model_id") or snapshot.get("model_id")
+        return str(model_id or f"unknown:{job.presentation_id}")
 
     async def execute(job_id: str, run_id: str, presentation_id: str, kind: str) -> None:
         try:
@@ -611,7 +613,6 @@ async def scheduler(stop: asyncio.Event) -> None:
                 .outerjoin(Presentation, Presentation.id == Job.presentation_id)
                 .where(Job.status == "QUEUED")
                 .order_by(Job.queued_at, Job.created_at)
-                .limit(100)
             ).all()
             queued = [row[0] for row in queued_rows]
             model_keys = {
@@ -619,6 +620,14 @@ async def scheduler(stop: asyncio.Event) -> None:
                 for job, snapshot_json in queued_rows
             }
             now = utcnow()
+            model_ids = set(model_keys.values()) | set(active_model_keys.values())
+            model_limits = dict(
+                db.execute(
+                    select(LogicalModel.id, LogicalModel.max_concurrency).where(
+                        LogicalModel.id.in_(model_ids)
+                    )
+                ).all()
+            ) if model_ids else {}
             expired = [job for job in queued if elapsed_seconds(job.queued_at, now) > settings.scheduler_queue_timeout_seconds]
             for job in expired:
                 run = db.get(Run, job.run_id)
@@ -639,16 +648,25 @@ async def scheduler(stop: asyncio.Event) -> None:
             groups: dict[str, list[Job]] = {}
             for job in queued:
                 groups.setdefault(model_keys[job.id], []).append(job)
-            keys = list(groups)
+            keys = sorted(groups)
+            active_counts: dict[str, int] = {}
+            for model_id in active_model_keys.values():
+                active_counts[model_id] = active_counts.get(model_id, 0) + 1
             if keys:
                 selected: list[Job] = []
+                projected_counts = active_counts.copy()
                 while len(selected) < capacity:
+                    start = keys.index(fair_model_cursor) if fair_model_cursor in keys else 0
                     for offset in range(len(keys)):
-                        index = (fair_cursor + offset) % len(keys)
+                        index = (start + offset) % len(keys)
                         key = keys[index]
-                        if groups[key]:
+                        if (
+                            groups[key]
+                            and projected_counts.get(key, 0) < model_limits.get(key, 1)
+                        ):
                             selected.append(groups[key].pop(0))
-                            fair_cursor = (index + 1) % len(keys)
+                            projected_counts[key] = projected_counts.get(key, 0) + 1
+                            fair_model_cursor = keys[(index + 1) % len(keys)]
                             break
                     else:
                         break
@@ -666,6 +684,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                         run_id, presentation_id, kind = row.run_id, row.presentation_id, row.kind
                     task = asyncio.create_task(execute(job.id, run_id, presentation_id, kind))
                     active_tasks[run_id] = task
+                    active_model_keys[run_id] = model_keys[job.id]
                     ACTIVE_RUNS[run_id] = task
                     await emit_event(presentation_id, "job.started", {"job_id": job.id, "run_id": run_id, "queue_duration_ms": queue_duration_ms}, run_id)
         if active_tasks:
@@ -684,6 +703,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                         if task.cancelled():
                             await finalize_cancelled_run(run_id)
                         ACTIVE_RUNS.pop(run_id, None)
+                        active_model_keys.pop(run_id, None)
                         active_tasks.pop(run_id, None)
                         break
         else:
