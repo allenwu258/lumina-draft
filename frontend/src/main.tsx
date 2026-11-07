@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, ArrowDown, ArrowLeft, ArrowRight, Check, CheckCircle2, ChevronDown, CircleHelp, FileText, Layers3, LoaderCircle, PanelLeftClose, Plus, RefreshCw, Send, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import './styles.css';
@@ -14,6 +14,42 @@ type Snapshot = { presentation:{id:string;user_request:string;status:string;crea
 type SessionUsage = {presentation_id:string;call_count:number;input_tokens:number|null;output_tokens:number|null;total_tokens:number|null;input_unreported_calls:number;output_unreported_calls:number;total_unreported_calls:number};
 type Provider = {name:string;base_url:string;model:string;enabled:boolean;revision:number;credential_configured:boolean};
 const api = async <T,>(path:string, init?:RequestInit):Promise<T> => { const response=await fetch(`/api/v1${path}`,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})}}); const data=await response.json(); if(!response.ok) throw new Error(data?.detail?.message||data?.detail||'请求失败'); return data as T; };
+
+function OutlineBulletsInput({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    const container = input?.parentElement;
+    if (!input || !container) return;
+
+    const fitContent = () => {
+      input.style.height = 'auto';
+      input.style.height = `${input.scrollHeight}px`;
+    };
+    fitContent();
+
+    let width = container.getBoundingClientRect().width;
+    const observer = new ResizeObserver(([entry]) => {
+      if (Math.abs(entry.contentRect.width - width) < 1) return;
+      width = entry.contentRect.width;
+      fitContent();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [value]);
+
+  return (
+    <textarea
+      ref={inputRef}
+      className="outline-bullets"
+      aria-label="页面要点"
+      rows={1}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  );
+}
 
 function App(){
   const [presentations,setPresentations]=useState<any[]>([]); const [activeId,setActiveId]=useState<string|null>(()=>sessionStorage.getItem('lumina.activePresentation')); const [snapshot,setSnapshot]=useState<Snapshot|null>(null);
@@ -80,11 +116,62 @@ function App(){
         {isPlanning&&!doc?<div className="planning-panel"><div className="planning-visual"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><Sparkles size={25}/></div><div className="planning-content"><h2>正在梳理内容结构</h2><p>Director 正在确定叙事主线、页面大纲与全局视觉规范。</p><div className="progress-track"><i/></div><small>说明书完成后，你可以逐页编辑和确认</small><DirectorStreamView stream={directorStream} active={isPlanning}/></div></div>:null}
         {snapshot.director_stream&&(waiting||generating||status==='READY'||status==='PARTIAL_FAILED'||status==='CANCELLED'||(status==='FAILED'&&snapshot.latest_run?.kind==='DIRECTOR'))&&<DirectorStreamView stream={directorStream} active={false} defaultOpen={false}/>}
         {status==='FAILED'&&<div className="inline-error"><X size={14}/>{snapshot.latest_run?.error||'生成失败，请检查模型配置后重试。'}</div>}
-        {doc&&waiting&&<div className="outline-layout"><div className="outline-main"><div className="section-heading"><div><span className="section-index">01</span><h2>叙事结构</h2></div><span>{doc.slides.length} 页 · 可编辑</span></div><div className="slide-outline-list">{doc.slides.map((slide,i)=><article className={`outline-card ${selectedPage===i?'focused':''}`} key={slide.slide_id} onClick={()=>setSelectedPage(i)}><div className="outline-number">{String(i+1).padStart(2,'0')}</div><div className="outline-content"><div className="outline-meta"><span>{pageType(slide.page_type)}</span><i/>核心观点</div><input className="outline-title-input" value={slide.title} onChange={e=>updateSlide(i,{title:e.target.value})}/><input className="key-message-input" value={slide.key_message} onChange={e=>updateSlide(i,{key_message:e.target.value})}/><textarea className="outline-bullets" value={slide.content_outline.join('\n')} rows={Math.min(4,Math.max(2,slide.content_outline.length))} onChange={e=>updateSlide(i,{content_outline:e.target.value.split('\n').filter(Boolean)})}/></div><div className="outline-card-tail"><span>{slide.content_outline.length} 个要点</span><ArrowRight size={15}/></div></article>)}</div></div>
+        {doc && waiting && (
+          <div className="outline-layout">
+            <div className="outline-main">
+              <div className="section-heading">
+                <div>
+                  <span className="section-index">01</span>
+                  <h2>叙事结构</h2>
+                </div>
+                <span>{doc.slides.length} 页 · 可编辑</span>
+              </div>
+              <div className="slide-outline-list">
+                {doc.slides.map((slide, index) => (
+                  <article
+                    className={`outline-card ${selectedPage === index ? 'focused' : ''}`}
+                    key={slide.slide_id}
+                    onClick={() => setSelectedPage(index)}
+                  >
+                    <div className="outline-number">{String(index + 1).padStart(2, '0')}</div>
+                    <div className="outline-content">
+                      <div className="outline-meta">
+                        <span>{pageType(slide.page_type)}</span>
+                        <i />核心观点
+                      </div>
+                      <input
+                        className="outline-title-input"
+                        value={slide.title}
+                        onChange={(event) => updateSlide(index, { title: event.target.value })}
+                      />
+                      <input
+                        className="key-message-input"
+                        value={slide.key_message}
+                        onChange={(event) =>
+                          updateSlide(index, { key_message: event.target.value })
+                        }
+                      />
+                      <OutlineBulletsInput
+                        value={slide.content_outline.join('\n')}
+                        onChange={(value) =>
+                          updateSlide(index, {
+                            content_outline: value.split('\n').filter(Boolean),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="outline-card-tail">
+                      <span>{slide.content_outline.length} 个要点</span>
+                      <ArrowRight size={15} />
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </div>
           <aside className="outline-aside"><div className="aside-block"><div className="aside-title"><span className="aside-icon purple"><Sparkles size={15}/></span>作品 Brief</div><label>面向对象<input value={doc.brief.audience} onChange={e=>setDoc({...doc,brief:{...doc.brief,audience:e.target.value}})}/></label><label>内容语气<input value={doc.brief.tone} onChange={e=>setDoc({...doc,brief:{...doc.brief,tone:e.target.value}})}/></label><label>制作目的<textarea value={doc.brief.purpose} onChange={e=>setDoc({...doc,brief:{...doc.brief,purpose:e.target.value}})} rows={3}/></label></div>
             <div className="aside-block style-block"><div className="aside-title"><span className="aside-icon green"><Layers3 size={15}/></span>全局视觉规范</div><p>{doc.style_spec.description}</p><div className="swatch-row">{Object.entries(doc.style_spec.colors).slice(0,5).map(([name,color])=><span title={`${name} ${color}`} key={name} style={{backgroundColor:color}}/>)}</div><ul>{doc.style_spec.layout_rules.slice(0,3).map(x=><li key={x}>{x}</li>)}</ul></div>
             {doc.brief.assumptions.length>0&&<div className="assumption-note"><CircleHelp size={14}/><span>{doc.brief.assumptions.join('；')}</span></div>}
-          </aside></div>}
+          </aside></div>)}
         {doc&&(generating||status==='READY'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<div className="generation-layout"><aside className="page-rail"><div className="section-heading compact"><div><span className="section-index">02</span><h2>页面</h2></div><span>{snapshot.pages.filter(p=>p.status==='SUCCEEDED').length}/{snapshot.pages.length}</span></div><div className="page-rail-list">{doc.slides.map((s,i)=>{const p=snapshot.pages.find(x=>x.page_number===i+1);return <button key={s.slide_id} className={`page-thumb ${i===selectedPage?'active':''}`} onClick={()=>setSelectedPage(i)}><span className="thumb-number">{String(i+1).padStart(2,'0')}</span><span className="thumb-title">{s.title}</span><span className={`thumb-state ${p?.status?.toLowerCase()||'pending'}`}><PageStatusIcon status={p?.status}/></span></button>})}</div><div className="rail-footer"><Activity size={14}/>{generating?<GenerationProgress pages={snapshot.pages}/>:status==='CANCELLED'?'已取消':'生成完成'}</div></aside>
           <div className="canvas-column"><div className="canvas-toolbar"><div className="canvas-page-label"><strong>{String(selectedPage+1).padStart(2,'0')}</strong><span>/</span>{String(doc.slides.length).padStart(2,'0')}<i/>{currentSlide?.title}</div><div className="canvas-controls"><div className="segmented"><button className={view==='preview'?'selected':''} onClick={()=>setView('preview')}>预览</button><button className={view==='source'?'selected':''} onClick={()=>setView('source')}>HTML</button></div><span className="canvas-size">800 × 450</span><button className="icon-button" title="上一页" disabled={selectedPage===0} onClick={()=>setSelectedPage(x=>Math.max(0,x-1))}><ArrowLeft size={15}/></button><button className="icon-button" title="下一页" disabled={selectedPage===doc.slides.length-1} onClick={()=>setSelectedPage(x=>Math.min(doc.slides.length-1,x+1))}><ArrowRight size={15}/></button></div></div>
             <div className="canvas-stage">{currentTask?.status==='SUCCEEDED'&&displayHtml&&view==='preview'?<SlideFrame url={displayHtml} number={selectedPage+1}/>:view==='source'?<pre className="source-view">{displayHtml?sourceHtml||'正在读取 HTML…':typeof previewHtml==='string'?previewHtml:'等待页面生成…'}</pre>:<div className="empty-canvas">{currentTask?.status==='WAITING_CAPACITY'||currentTask?.status==='VALIDATING'?<><PageStatusIcon status={currentTask.status}/><span>{pageStatusLabel(currentTask.status)}</span></>:currentTask?.status==='RUNNING'?<><LoaderCircle className="spin" size={20}/><span>正在创作第 {selectedPage+1} 页</span><small>页面完成后会自动显示</small></>:currentTask?.status==='FAILED'?<><X size={20}/><span>这一页生成失败</span><small>{currentTask.error}</small></>:<><div className="empty-page-icon"><FileText size={21}/></div><span>等待这一页开始生成</span></>}</div>}</div>

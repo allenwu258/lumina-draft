@@ -75,6 +75,29 @@ test('Provider configuration, model discovery, routing and presentation generati
   await page.getByRole('button', { name: '返回工作台', exact: true }).click();
   await page.locator('.composer textarea').fill('制作一个用于验收 Provider 管理闭环的演示文稿。');
   await page.getByRole('button', { name: '生成说明书', exact: true }).click();
+  const outlineBullets = page.locator('.outline-bullets').first();
+  await expect(outlineBullets).toBeVisible();
+  const longOutline = Array.from(
+    { length: 7 },
+    (_, index) =>
+      `要点 ${index + 1}：这是一条用于验证完整显示的长内容，确保在较窄卡片中换行后仍然可以完整阅读。`,
+  ).join('\n');
+  await outlineBullets.fill(longOutline);
+  for (const viewport of [
+    { width: 1440, height: 1000 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const dimensions = await outlineBullets.evaluate((element: HTMLTextAreaElement) => ({
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+      overflowY: getComputedStyle(element).overflowY,
+    }));
+    expect(dimensions.scrollHeight - dimensions.clientHeight).toBeLessThanOrEqual(1);
+    expect(dimensions.overflowY).toBe('hidden');
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.screenshot({ path: testInfo.outputPath('outline-full.png'), fullPage: true });
   await page.getByRole('button', { name: '确认并生成 1 页', exact: true }).click();
   await expect(page.getByText('页面已就绪', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '模型设置', exact: true }).click();
