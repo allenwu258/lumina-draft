@@ -26,7 +26,7 @@ export type ProviderModel = {
   display_name: string;
   context_window_tokens: number | null;
   max_output_tokens: number | null;
-  max_concurrency: number;
+  provider_concurrency: number;
   enabled: boolean;
   revision: number;
   metadata_source: string;
@@ -61,11 +61,7 @@ export type ProviderFields = Pick<
 >;
 export type ModelFields = Pick<
   ProviderModel,
-  | 'remote_model_id'
-  | 'display_name'
-  | 'context_window_tokens'
-  | 'max_output_tokens'
-  | 'max_concurrency'
+  'remote_model_id' | 'display_name' | 'context_window_tokens' | 'max_output_tokens'
 >;
 export type ModelCandidate = ModelFields & { metadata_source: string; already_added: boolean };
 export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html';
@@ -78,7 +74,6 @@ export type ResolvedRoute = {
   reasoning_tier: string;
   reasoning_effort: string | null;
   provider_concurrency: number;
-  model_concurrency: number;
 };
 export type BusinessRoute = {
   code: RouteCode;

@@ -8,8 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test:e2e": "playwright test",
-    "format:providers": "prettier --write src/{CallHistory,ModelEditor,ProviderEditor,ProviderSettings,RoutingSettings,SettingsDialog,SettingsNotice}.tsx src/provider-api.ts src/provider-settings.css playwright.config.ts tests/provider-management.spec.ts",
-    "format:providers:check": "prettier --check src/{CallHistory,ModelEditor,ProviderEditor,ProviderSettings,RoutingSettings,SettingsDialog,SettingsNotice}.tsx src/provider-api.ts src/provider-settings.css playwright.config.ts tests/provider-management.spec.ts"
+    "format:providers": "prettier --write src/{CallHistory,ModelEditor,PageStatus,ProviderEditor,ProviderSettings,RoutingSettings,SettingsDialog,SettingsNotice}.tsx src/provider-api.ts src/provider-settings.css playwright.config.ts vite.config.ts tests/provider-management.spec.ts",
+    "format:providers:check": "prettier --check src/{CallHistory,ModelEditor,PageStatus,ProviderEditor,ProviderSettings,RoutingSettings,SettingsDialog,SettingsNotice}.tsx src/provider-api.ts src/provider-settings.css playwright.config.ts vite.config.ts tests/provider-management.spec.ts"
   },
   "dependencies": {
     "@vitejs/plugin-react": "4.4.1",

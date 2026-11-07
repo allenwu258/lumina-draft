@@ -142,7 +142,7 @@ def update_provider(body: ProviderUpdate):
         fields = ModelPatch(
             expected_revision=model.revision, remote_model_id=body.model,
             display_name=body.name, context_window_tokens=model.context_window_tokens,
-            max_output_tokens=model.max_output_tokens, max_concurrency=model.max_concurrency,
+            max_output_tokens=model.max_output_tokens,
             enabled=body.enabled,
         )
         provider_fields = ProviderPatch(
@@ -247,7 +247,7 @@ def get_presentation(presentation_id: str):
         pages = db.scalars(select(PageTask).where(PageTask.presentation_id == p.id).order_by(PageTask.page_number)).all()
         active_run = next((r for r in runs if r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}), None)
         last_seq = db.scalar(select(Event.seq).where(Event.presentation_id == p.id).order_by(Event.seq.desc()).limit(1)) or 0
-        running_ids = {page.id for page in pages if page.status == "RUNNING"}
+        running_ids = {page.id for page in pages if page.status in {"RUNNING", "VALIDATING"}}
         streams: dict[str, str] = {}
         if running_ids:
             stream_events = db.scalars(select(Event).where(Event.presentation_id == p.id, Event.seq <= last_seq, Event.type.in_(["page.started", "page.html.delta", "page.retrying"])).order_by(Event.seq)).all()

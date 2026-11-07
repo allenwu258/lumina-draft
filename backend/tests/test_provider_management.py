@@ -23,7 +23,7 @@ from backend.app.db import (
     session_scope,
     utcnow,
 )
-from backend.app.provider_management import ProviderModelLimiter, resolve_business_route
+from backend.app.provider_management import ProviderLimiter, resolve_business_route
 from backend.tests.test_core import document, valid_html
 
 PREFIX = "/api/v1/settings/llm"
@@ -153,7 +153,6 @@ def model_patch(model, **updates):
                 "display_name",
                 "context_window_tokens",
                 "max_output_tokens",
-                "max_concurrency",
                 "enabled",
             )
         }
@@ -487,13 +486,13 @@ def test_discovery_import_metadata_and_failure_preserves_models(
 
 
 @pytest.mark.asyncio
-async def test_shared_limiter_provider_model_and_cancellation():
-    limiter = ProviderModelLimiter(system_limit=3)
+async def test_shared_limiter_provider_and_cancellation():
+    limiter = ProviderLimiter(lambda provider_id: 1)
     started = asyncio.Event()
     release = asyncio.Event()
 
     async def occupy():
-        async with limiter.acquire("provider", 1, "model", 1):
+        async with limiter.acquire("provider"):
             started.set()
             await release.wait()
 
@@ -501,14 +500,14 @@ async def test_shared_limiter_provider_model_and_cancellation():
     await started.wait()
     waiting = asyncio.create_task(occupy())
     await asyncio.sleep(0)
-    assert limiter._active == 1 and not waiting.done()
+    assert limiter.active_count == 1 and not waiting.done()
     waiting.cancel()
     await asyncio.gather(waiting, return_exceptions=True)
     first.cancel()
     await asyncio.gather(first, return_exceptions=True)
-    assert limiter._active == 0 and limiter._providers == {} and limiter._models == {}
-    async with limiter.acquire("provider", 1, "model", 1):
-        assert limiter._active == 1
+    assert limiter.active_count == 0 and not limiter._capacities
+    async with limiter.acquire("provider"):
+        assert limiter.active_count == 1
 
 
 def test_call_cursor_is_chronological_and_detail_is_sanitized(managed_client):
@@ -621,8 +620,8 @@ async def test_gateway_cancellation_records_audit_and_releases_limit(
     provider = create_provider(managed_client)
     model = create_model(managed_client, provider)
     seed_default(model)
-    limiter = ProviderModelLimiter()
-    monkeypatch.setattr(runtime, "MODEL_LIMITER", limiter)
+    limiter = ProviderLimiter()
+    monkeypatch.setattr(runtime, "PROVIDER_LIMITER", limiter)
     started = asyncio.Event()
 
     async def blocking_stream(**kwargs):
@@ -638,7 +637,7 @@ async def test_gateway_cancellation_records_audit_and_releases_limit(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert limiter._active == 0
+    assert limiter.active_count == 0
     call = managed_client.get(PREFIX + "/calls").json()["items"][0]
     assert call["status"] == "CANCELLED" and call["error_code"] == "CALL_CANCELLED"
 
@@ -679,8 +678,8 @@ async def test_queued_call_revalidates_before_sending(
     provider = create_provider(client, auth_mode="bearer", api_key="queued-key")
     model = create_model(client, provider)
     seed_default(model)
-    limiter = ProviderModelLimiter(system_limit=1)
-    monkeypatch.setattr(runtime, "MODEL_LIMITER", limiter)
+    limiter = ProviderLimiter(lambda provider_id: 1)
+    monkeypatch.setattr(runtime, "PROVIDER_LIMITER", limiter)
     sent = []
 
     async def stream(**kwargs):
@@ -688,7 +687,7 @@ async def test_queued_call_revalidates_before_sending(
         yield providers.ProviderEvent("completed", {"text": "OK"})
 
     monkeypatch.setattr(runtime, "stream_responses", stream)
-    async with limiter.acquire(provider["id"], 1):
+    async with limiter.acquire(provider["id"]):
         task = asyncio.create_task(
             runtime.ProviderGateway()._stream("test", None, "provider_test")
         )
@@ -711,7 +710,7 @@ async def test_queued_call_revalidates_before_sending(
     assert error.value.code == (
         "CREDENTIAL_REVOKED" if change == "revoke" else "CONFIG_NOT_READY"
     )
-    assert sent == [] and limiter._active == 0
+    assert sent == [] and limiter.active_count == 0
     call = client.get(PREFIX + "/calls").json()["items"][0]
     assert call["status"] == "FAILED" and call["error_code"] == error.value.code
 

@@ -26,7 +26,6 @@ class Settings:
     api_base_url: str = os.getenv("DS_API_BASE_URL", _read_key_file().get("base_url", "https://api.deepseek.com"))
     api_model: str = os.getenv("DS_API_MODEL", _read_key_file().get("model", "deepseek-flash"))
     max_pages: int = 20
-    max_concurrency: int = 3
 
 
 settings = Settings()

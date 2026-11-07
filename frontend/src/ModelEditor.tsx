@@ -21,7 +21,6 @@ const modelFields = (model?: ProviderModel): ModelFields => ({
   display_name: model?.display_name || '',
   context_window_tokens: model?.context_window_tokens ?? null,
   max_output_tokens: model?.max_output_tokens ?? null,
-  max_concurrency: model?.max_concurrency ?? 3,
 });
 
 export function ModelEditor({ providerId, model: initialModel, onClose, onSaved }: Props) {
@@ -101,7 +100,7 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
       <header>
         <div>
           <h2>{model ? '模型设置' : '添加模型'}</h2>
-          <p>编辑远程标识、上下文元数据和模型并发。</p>
+          <p>编辑远程标识与上下文元数据；所有模型共享 Provider 总并发。</p>
         </div>
         <button className="icon-button" title="关闭模型设置" disabled={!!busy} onClick={onClose}>
           <X size={18} />
@@ -131,7 +130,7 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
               />
             </label>
           </div>
-          <div className="settings-fields three-fields">
+          <div className="settings-fields">
             <label>
               上下文窗口（Token）
               <input
@@ -162,17 +161,6 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
                   )
                 }
                 placeholder="未知"
-              />
-            </label>
-            <label>
-              模型并发限制
-              <input
-                type="number"
-                required
-                min={1}
-                max={32}
-                value={fields.max_concurrency}
-                onChange={(event) => update('max_concurrency', Number(event.target.value))}
               />
             </label>
           </div>

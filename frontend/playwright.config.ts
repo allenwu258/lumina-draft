@@ -2,6 +2,9 @@ import { defineConfig } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
+const apiPort = process.env.E2E_API_PORT || '18000';
+const webPort = process.env.E2E_WEB_PORT || '15173';
+const apiOrigin = `http://127.0.0.1:${apiPort}`;
 const python = fileURLToPath(
   new URL(
     process.platform === 'win32' ? '../.venv/Scripts/python.exe' : '../.venv/bin/python',
@@ -15,7 +18,7 @@ export default defineConfig({
   workers: 1,
   timeout: 45000,
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: `http://127.0.0.1:${webPort}`,
     viewport: { width: 1440, height: 1000 },
     trace: 'retain-on-failure',
   },
@@ -23,12 +26,14 @@ export default defineConfig({
     {
       command: '"' + python + '" -m backend.tests.e2e_server',
       cwd: root,
-      url: 'http://127.0.0.1:8000/api/v1/health/ready',
+      env: { E2E_API_PORT: apiPort, E2E_WEB_PORT: webPort },
+      url: `${apiOrigin}/api/v1/health/ready`,
       reuseExistingServer: false,
     },
     {
-      command: 'npm run dev -- --port 5173 --strictPort',
-      url: 'http://127.0.0.1:5173',
+      command: `npm run dev -- --port ${webPort} --strictPort`,
+      env: { API_PROXY_TARGET: apiOrigin },
+      url: `http://127.0.0.1:${webPort}`,
       reuseExistingServer: false,
     },
   ],

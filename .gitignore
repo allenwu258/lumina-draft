@@ -7,7 +7,6 @@ dist/
 *.tsbuildinfo
 data/
 docs/*
-!docs/PROVIDER_MANAGEMENT_PLAN.md
 .env
 .env.*
 !.env.example

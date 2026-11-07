@@ -11,11 +11,10 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
-from .config import settings
 from .db import ApiCredential, ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, Run, dumps, loads, session_scope, utcnow
 from .prompts import COMPOSER_PROMPT, DIRECTOR_PROMPT
 from .providers import ProviderError, stream_responses
-from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
+from .provider_management import PROVIDER_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
 from .rendering import html_hash, validate_html
 from .schemas import OutlineDocument
 from .secrets import read_secret
@@ -86,7 +85,7 @@ def build_page_graph():
             ])
         if state.get("error"):
             prompt += "\n上一次输出未通过校验：" + state["error"] + "。请完整重写并确保符合所有输出合同。"
-        html = await ProviderGateway().complete_html(prompt, task.presentation_id, task.id, "ppt_html")
+        html = await ProviderGateway().complete_html(prompt, task.presentation_id, task.id, "ppt_html", run_id=state["run_id"])
         return {"result": html}
     graph = StateGraph(PageState)
     graph.add_node("compose", compose)
@@ -162,7 +161,7 @@ class ProviderGateway:
                 presentation_id=presentation_id,
                 purpose=purpose,
                 model=model,
-                status="RUNNING",
+                status="QUEUED",
                 provider_id=owner.id,
                 model_id=model_record.id,
                 business_code=business_code if purpose != "provider_test" else None,
@@ -171,8 +170,7 @@ class ProviderGateway:
             db.add(call)
             db.flush()
             call_id = call.id
-            provider_id, provider_limit = owner.id, owner.max_concurrency
-            model_id, model_limit = model_record.id, model_record.max_concurrency
+            provider_id, model_id = owner.id, model_record.id
             auth_mode = config.get("auth_mode", endpoint.auth_mode)
             allow_private_http = config.get("allow_private_http", endpoint.allow_private_http)
         output: list[str] = []
@@ -191,6 +189,7 @@ class ProviderGateway:
         final_text: str | None = None
         started_at = time.monotonic()
         first_token_at: float | None = None
+        admitted_at: float | None = None
 
         async def flush_director_stream() -> None:
             nonlocal last_director_flush
@@ -210,7 +209,8 @@ class ProviderGateway:
         queue_duration_ms = 0
         try:
             queued_at = time.monotonic()
-            async with MODEL_LIMITER.acquire(provider_id, provider_limit, model_id, model_limit):
+            async with PROVIDER_LIMITER.acquire(provider_id):
+                admitted_at = time.monotonic()
                 queue_duration_ms = int((time.monotonic() - queued_at) * 1000)
                 # Configuration can be revoked or disabled while waiting for a slot.
                 with session_scope() as db:
@@ -232,6 +232,18 @@ class ProviderGateway:
                     raise ProviderError("CREDENTIAL_STORE_UNAVAILABLE", "系统凭据存储暂不可用") from exc
                 if auth_mode == "bearer" and not key:
                     raise ProviderError("CREDENTIAL_NOT_CONFIGURED", "请先配置 API 凭据")
+                with session_scope() as db:
+                    call = db.get(LlmCall, call_id)
+                    call.status, call.queue_duration_ms = "RUNNING", queue_duration_ms
+                    if page_task_id:
+                        page = db.get(PageTask, page_task_id)
+                        run = db.get(Run, run_id) if run_id else None
+                        if not page or page.run_id != run_id or not run or run.status != "RUNNING":
+                            raise asyncio.CancelledError()
+                        page.status, page.attempt = "RUNNING", page.attempt + 1
+                        page_number = page.page_number
+                if page_task_id and presentation_id:
+                    await emit_event(presentation_id, "page.started", {"page_task_id": page_task_id, "page_number": page_number}, run_id)
                 request_options = {
                     "base_url": base_url,
                     "api_key": key or "",
@@ -262,7 +274,7 @@ class ProviderGateway:
                         if page_task_id and presentation_id:
                             buffer.append(event.data)
                             if time.monotonic() - last_flush >= 0.15 or sum(map(len, buffer)) >= 16384:
-                                await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
+                                await emit_page_delta(presentation_id, page_task_id, "".join(buffer), run_id)
                                 buffer.clear()
                                 last_flush = time.monotonic()
                     elif event.kind == "reasoning_delta" and purpose == "director":
@@ -291,6 +303,12 @@ class ProviderGateway:
                                 error = "供应商因输出 token 上限截断了结果"
                             elif reason == "content_filter":
                                 error = "供应商的内容过滤中断了生成"
+                if page_task_id and presentation_id and status == "SUCCEEDED":
+                    with session_scope() as db:
+                        page = db.get(PageTask, page_task_id)
+                        if page and page.run_id == run_id:
+                            page.status = "VALIDATING"
+                    await emit_event(presentation_id, "page.validating", {"page_task_id": page_task_id}, run_id)
         except asyncio.CancelledError:
             status, error_code, error = "CANCELLED", "CALL_CANCELLED", "调用已取消"
             raise
@@ -299,13 +317,18 @@ class ProviderGateway:
             error_code = exc.code
             status = "REFUSED" if exc.code == "MODEL_REFUSED" else "FAILED"
             raise
+        except ConfigurationError as exc:
+            status, error_code, error = "FAILED", exc.code, str(exc)
+            raise ProviderError(error_code, error) from exc
         except Exception as exc:
             status, error_code, error = "FAILED", "PROVIDER_CALL_FAILED", "模型调用失败"
             raise ProviderError(error_code, error) from exc
         finally:
+            if admitted_at is None:
+                queue_duration_ms = int((time.monotonic() - queued_at) * 1000)
             await flush_director_stream()
             if page_task_id and presentation_id and buffer:
-                await emit_page_delta(presentation_id, page_task_id, "".join(buffer))
+                await emit_page_delta(presentation_id, page_task_id, "".join(buffer), run_id)
             with session_scope() as db:
                 call = db.get(LlmCall, call_id)
                 if call:
@@ -317,7 +340,7 @@ class ProviderGateway:
                     call.error_code = error_code
                     call.provider_response_id = response_id
                     call.queue_duration_ms = queue_duration_ms
-                    call.time_to_first_token_ms = int((first_token_at - started_at) * 1000) if first_token_at else None
+                    call.time_to_first_token_ms = int((first_token_at - admitted_at) * 1000) if first_token_at and admitted_at else None
                     call.total_duration_ms = int((time.monotonic() - started_at) * 1000)
                     call.finished_at = utcnow()
             if presentation_id:
@@ -334,8 +357,8 @@ class ProviderGateway:
         except json.JSONDecodeError as exc:
             raise ProviderError("INVALID_MODEL_JSON", "Director 返回的 JSON 无法解析") from exc
 
-    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str, business_code: str = "ppt_html") -> str:
-        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, business_code=business_code)
+    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str, business_code: str = "ppt_html", *, run_id: str | None = None) -> str:
+        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, run_id=run_id, business_code=business_code)
 
 
 async def emit_event(presentation_id: str, event_type: str, payload: dict[str, Any], run_id: str | None = None) -> None:
@@ -346,8 +369,8 @@ async def emit_event(presentation_id: str, event_type: str, payload: dict[str, A
     await EVENT_BUS.notify(presentation_id)
 
 
-async def emit_page_delta(presentation_id: str, task_id: str, delta: str) -> None:
-    await emit_event(presentation_id, "page.html.delta", {"page_task_id": task_id, "delta": delta})
+async def emit_page_delta(presentation_id: str, task_id: str, delta: str, run_id: str | None = None) -> None:
+    await emit_event(presentation_id, "page.html.delta", {"page_task_id": task_id, "delta": delta}, run_id)
 
 
 class EventBus:
@@ -404,44 +427,49 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message}, run_id)
 
 
-async def compose_page(presentation_id: str, run_id: str, task_id: str, semaphore: asyncio.Semaphore) -> None:
-    async with semaphore:
+async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
+    try:
+        reason = ""
+        for attempt_number in range(1, 3):
+            with session_scope() as db:
+                task = db.get(PageTask, task_id)
+                run = db.get(Run, run_id)
+                if not task or task.run_id != run_id or not run or run.status != "RUNNING":
+                    raise asyncio.CancelledError()
+                task.status = "WAITING_CAPACITY"
+                number = task.page_number
+            await emit_event(presentation_id, "page.queued", {"page_task_id": task_id, "page_number": number}, run_id)
+            result = await run_graph(PAGE_GRAPH, {"task_id": task_id, "run_id": run_id, "error": reason})
+            html = result["result"]
+            valid, reason = validate_html(html)
+            if valid:
+                break
+            if attempt_number < 2:
+                await emit_event(presentation_id, "page.retrying", {"page_task_id": task_id, "page_number": number, "reason": reason, "attempt": attempt_number + 1}, run_id)
+        if not valid:
+            raise ProviderError("INVALID_HTML", reason)
+        digest = html_hash(html)
         with session_scope() as db:
             task = db.get(PageTask, task_id)
-            if not task: return
-            task.status, task.attempt = "RUNNING", task.attempt + 1
-            number = task.page_number
-        await emit_event(presentation_id, "page.started", {"page_task_id": task_id, "page_number": number}, run_id)
-        try:
-            reason = ""
-            for attempt_number in range(1, 3):
-                result = await run_graph(PAGE_GRAPH, {"task_id": task_id, "run_id": run_id, "error": reason})
-                html = result["result"]
-                valid, reason = validate_html(html)
-                if valid:
-                    break
-                if attempt_number < 2:
-                    await emit_event(presentation_id, "page.retrying", {"page_task_id": task_id, "page_number": number, "reason": reason, "attempt": attempt_number + 1}, run_id)
-            if not valid: raise ProviderError("INVALID_HTML", reason)
-            digest = html_hash(html)
-            with session_scope() as db:
-                task = db.get(PageTask, task_id)
+            if task and task.run_id == run_id:
                 task.status, task.html, task.html_hash, task.error = "SUCCEEDED", html, digest, None
-            await emit_event(presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
-        except Exception as exc:
-            message = str(exc)[:500]
-            with session_scope() as db:
-                task = db.get(PageTask, task_id)
-                if task: task.status, task.error = "FAILED", message
-            await emit_event(presentation_id, "page.failed", {"page_task_id": task_id, "page_number": number, "error": message}, run_id)
+        await emit_event(presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
+    except Exception as exc:
+        message = str(exc)[:500]
+        with session_scope() as db:
+            task = db.get(PageTask, task_id)
+            if task and task.run_id == run_id:
+                task.status, task.error = "FAILED", message
+        await emit_event(presentation_id, "page.failed", {"page_task_id": task_id, "error": message}, run_id)
 
 
 async def run_generation(presentation_id: str, run_id: str) -> None:
     await emit_event(presentation_id, "generation.started", {"run_id": run_id}, run_id)
     with session_scope() as db:
-        tasks = list(db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status != "SUCCEEDED")).all())
-    semaphore = asyncio.Semaphore(settings.max_concurrency)
-    await asyncio.gather(*(compose_page(presentation_id, run_id, task.id, semaphore) for task in tasks))
+        tasks = list(db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status != "SUCCEEDED").order_by(PageTask.page_number)).all())
+    async with asyncio.TaskGroup() as group:
+        for task in tasks:
+            group.create_task(compose_page(presentation_id, run_id, task.id))
     with session_scope() as db:
         statuses = [t.status for t in db.scalars(select(PageTask).where(PageTask.run_id == run_id)).all()]
         run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
@@ -453,6 +481,9 @@ async def run_generation(presentation_id: str, run_id: str) -> None:
 async def scheduler(stop: asyncio.Event) -> None:
     """Single-process durable queue consumer; interrupted work is re-queued on startup."""
     with session_scope() as db:
+        for call in db.scalars(select(LlmCall).where(LlmCall.status.in_(["QUEUED", "RUNNING"]))).all():
+            call.status, call.error_code, call.error = "CANCELLED", "CALL_INTERRUPTED", "后端重启，调用已中断"
+            call.finished_at = utcnow()
         for job in db.scalars(select(Job).where(Job.status == "RUNNING")).all():
             run = db.get(Run, job.run_id)
             if run and run.status in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED"}:
@@ -460,7 +491,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                 continue
             job.status = "QUEUED"
             if run and run.kind == "GENERATION":
-                for task in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status == "RUNNING")).all():
+                for task in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status.in_(["RUNNING", "WAITING_CAPACITY", "VALIDATING"]))).all():
                     task.status = "PENDING"
             elif run and run.kind == "DIRECTOR":
                 run.status = "QUEUED"
@@ -485,7 +516,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                     run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
                     if run: run.status = "CANCELLED"
                     if presentation: presentation.status = "CANCELLED"
-                    for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status.in_(["RUNNING", "PENDING"]))).all():
+                    for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "VALIDATING"]))).all():
                         page.status = "CANCELLED"
                 await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
             finally:

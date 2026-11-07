@@ -32,7 +32,7 @@ from .db import (
 )
 from .provider_management import (
     ConfigurationError,
-    MODEL_LIMITER,
+    PROVIDER_LIMITER,
     endpoint_test_hash,
     get_model_tiers,
     latest_model_test,
@@ -126,7 +126,10 @@ class ModelCreate(BaseModel):
     display_name: str | None = Field(default=None, max_length=200)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    max_concurrency: int = Field(default=3, ge=1, le=32)
+    # Accepted for older clients; admission is controlled only by the Provider.
+    max_concurrency: int | None = Field(
+        default=None, ge=1, le=32, json_schema_extra={"deprecated": True}
+    )
     metadata_source: Literal["provider_api", "catalog", "manual", "unknown"] = "manual"
 
     @field_validator("remote_model_id", "display_name")
@@ -151,7 +154,9 @@ class ModelPatch(BaseModel):
     display_name: str = Field(min_length=1, max_length=200)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    max_concurrency: int = Field(ge=1, le=32)
+    max_concurrency: int | None = Field(
+        default=None, ge=1, le=32, json_schema_extra={"deprecated": True}
+    )
     enabled: bool
 
     @field_validator("remote_model_id", "display_name")
@@ -243,7 +248,7 @@ def _model_payload(
         "display_name": model.name,
         "context_window_tokens": model.context_window_tokens,
         "max_output_tokens": model.max_output_tokens,
-        "max_concurrency": model.max_concurrency,
+        "provider_concurrency": owner.max_concurrency,
         "capabilities": loads(model.capabilities_json),
         "capability_source": model.capability_source,
         "metadata_source": model.metadata_source,
@@ -507,6 +512,7 @@ def patch_provider(provider_id: str, body: ProviderPatch):
         endpoint.revision += 1
         db.flush()
         result = _provider_payload(db, owner, endpoint)
+    PROVIDER_LIMITER.provider_changed(provider_id)
     for ref in revoked_refs:
         delete_secret(ref)
     return result
@@ -537,7 +543,9 @@ def archive_provider(provider_id: str, expected_revision: int = Query(ge=1)):
         owner.archived_at = utcnow()
         owner.revision += 1
         endpoint.revision += 1
-        return {"id": owner.id, "archived": True, "revision": owner.revision}
+        result = {"id": owner.id, "archived": True, "revision": owner.revision}
+    PROVIDER_LIMITER.provider_changed(provider_id)
+    return result
 
 
 @router.put("/providers/{provider_id}/credential")
@@ -685,7 +693,6 @@ def create_model(provider_id: str, body: ModelCreate):
             enabled=True,
             context_window_tokens=body.context_window_tokens,
             max_output_tokens=body.max_output_tokens,
-            max_concurrency=body.max_concurrency,
             capabilities_json=dumps(
                 {"text_input": True, "multimodal_input": True, "tool_calling": True}
             ),
@@ -751,7 +758,7 @@ def patch_model(model_id: str, body: ModelPatch):
             model.metadata_source = "manual"
         model.context_window_tokens = body.context_window_tokens
         model.max_output_tokens = body.max_output_tokens
-        model.max_concurrency = body.max_concurrency
+        # Preserve the legacy column for old snapshots; it no longer limits calls.
         model.enabled = body.enabled
         binding.remote_model_id = body.remote_model_id
         model.revision += 1
@@ -904,7 +911,6 @@ def list_business_routes():
                         "reasoning_tier",
                         "reasoning_effort",
                         "provider_concurrency",
-                        "model_concurrency",
                         "config_hash",
                     )
                 }
@@ -1009,10 +1015,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
             endpoint.auth_mode,
             endpoint.credential_ref,
         )
-        allow_private_http, provider_limit = (
-            endpoint.allow_private_http,
-            owner.max_concurrency,
-        )
+        allow_private_http = endpoint.allow_private_http
         try:
             validate_endpoint(base_url, allow_private_http=allow_private_http)
             key = (
@@ -1040,7 +1043,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
     candidates = []
     try:
         async with asyncio.timeout(30):
-            async with MODEL_LIMITER.acquire(provider_id_snapshot, provider_limit):
+            async with PROVIDER_LIMITER.acquire(provider_id_snapshot):
                 with session_scope() as db:
                     current_owner, current_endpoint = provider_endpoint(
                         db, provider_id_snapshot
@@ -1135,6 +1138,8 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                 }
             )
         return {"provider_id": provider_id_snapshot, "items": candidates}
+    except ConfigurationError as exc:
+        handle_configuration_error(exc)
     except HTTPException:
         raise
     except (TimeoutError, httpx.TimeoutException) as exc:

@@ -130,3 +130,5 @@
 @media (max-width: 900px) {
   .director-stream-body { grid-template-columns: 1fr; }
 }
+
+.generation-progress { display: grid; gap: 4px; line-height: 1.5; }

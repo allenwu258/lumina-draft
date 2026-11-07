@@ -1,6 +1,7 @@
 """Local-only browser test server. All model calls and secrets stay in memory."""
 
 import json
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -21,9 +22,30 @@ for module in (db, provider_api):
 for module in (main, provider_api, runtime):
     module.read_secret = lambda ref: _secrets.get(ref)
 provider_api.delete_secret = lambda ref: _secrets.pop(ref, None) is not None
+_html_release = asyncio.Event()
+_html_release.set()
+_active_html = 0
+_web_origin = "http://127.0.0.1:" + os.getenv("E2E_WEB_PORT", "15173")
+
+
+@main.app.middleware("http")
+async def isolated_browser_origin(request, call_next):
+    # Keep production's loopback Origin/CSP policy unchanged on isolated test ports.
+    if request.headers.get("origin") == _web_origin:
+        request.scope["headers"] = [
+            (name, b"http://127.0.0.1:5173" if name == b"origin" else value)
+            for name, value in request.scope["headers"]
+        ]
+    response = await call_next(request)
+    if policy := response.headers.get("content-security-policy"):
+        response.headers["content-security-policy"] = policy.replace(
+            "http://127.0.0.1:5173", _web_origin
+        )
+    return response
 
 
 async def fake_stream(**kwargs):
+    global _active_html
     schema = kwargs.get("json_schema") or {}
     if "ok" in schema.get("properties", {}):
         text = '{"ok":true}'
@@ -74,6 +96,18 @@ async def fake_stream(**kwargs):
         text = "OK"
     else:
         text = '<!doctype html><html><head><style>#ppt-page{width:800px;height:450px}</style></head><body><main id="ppt-page">Provider 验收完成</main></body></html>'
+        _active_html += 1
+        try:
+            await _html_release.wait()
+        finally:
+            _active_html -= 1
+    if schema and "concurrency-check" in kwargs.get("prompt", ""):
+        doc = json.loads(text)
+        doc["slides"] = [
+            dict(doc["slides"][0], page_number=n, title=f"Page {n}")
+            for n in range(1, 21)
+        ]
+        text = json.dumps(doc, ensure_ascii=False)
     yield ProviderEvent("text_delta", text)
     yield ProviderEvent(
         "completed",
@@ -98,11 +132,30 @@ def fixture_models():
     }
 
 
+@main.app.post("/api/v1/mock/html-capacity")
+async def html_capacity(body: dict):
+    if body.get("hold"):
+        _html_release.clear()
+    else:
+        _html_release.set()
+    return {"active": _active_html}
+
+
+@main.app.get("/api/v1/mock/html-capacity")
+async def html_capacity_status():
+    return {"active": _active_html}
+
+
 if __name__ == "__main__":
     import uvicorn
 
     try:
-        uvicorn.run(main.app, host="127.0.0.1", port=8000, access_log=False)
+        uvicorn.run(
+            main.app,
+            host="127.0.0.1",
+            port=int(os.getenv("E2E_API_PORT", "18000")),
+            access_log=False,
+        )
     finally:
         db.engine.dispose()
         _temporary.cleanup()

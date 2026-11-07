@@ -67,12 +67,12 @@ export function CallHistory() {
                       'settings-badge ' +
                       (call.status === 'SUCCEEDED'
                         ? 'success'
-                        : call.status === 'RUNNING'
+                        : call.status === 'RUNNING' || call.status === 'QUEUED'
                           ? ''
                           : 'warning')
                     }
                   >
-                    {call.status}
+                    {call.status === 'QUEUED' ? '等待调用名额' : call.status}
                   </span>
                   {call.error && <small>{call.error}</small>}
                 </td>

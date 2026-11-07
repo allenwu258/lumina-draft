@@ -205,7 +205,10 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                 value={fields.max_concurrency}
                 onChange={(event) => update('max_concurrency', Number(event.target.value))}
               />
-              <small>同一 Provider 下所有模型共享，上限 32。</small>
+              <small>
+                同一 Provider 下生成、测试和模型发现共享 1–32
+                个调用名额。等待名额的页面不显示生成中。
+              </small>
             </label>
           </div>
           {fields.auth_mode === 'bearer' && (
@@ -310,7 +313,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                   <tr>
                     <th>模型</th>
                     <th>上下文 / 输出</th>
-                    <th>并发</th>
+                    <th>共享并发</th>
                     <th>测试状态</th>
                     <th>操作</th>
                   </tr>
@@ -327,7 +330,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                         {model.context_window_tokens?.toLocaleString() || '未提供'}
                         <small>输出 {model.max_output_tokens?.toLocaleString() || '未提供'}</small>
                       </td>
-                      <td>{model.max_concurrency}</td>
+                      <td>Provider 总额 {provider.max_concurrency}</td>
                       <td>
                         <ModelTestStatus model={model} />
                       </td>
@@ -503,7 +506,6 @@ function DiscoveryDialog({
             display_name: item.display_name || item.remote_model_id,
             context_window_tokens: item.context_window_tokens,
             max_output_tokens: item.max_output_tokens,
-            max_concurrency: 3,
           },
           item.metadata_source,
         );
