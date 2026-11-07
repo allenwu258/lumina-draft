@@ -606,7 +606,37 @@ async def scheduler(stop: asyncio.Event) -> None:
                     job.status = "SUCCEEDED" if run.status in {"SUCCEEDED", "PARTIAL_FAILED"} else run.status
                     job.finished_at = utcnow()
 
+    async def wait_for_active_tasks() -> None:
+        try:
+            done, _ = await asyncio.wait(
+                active_tasks.values(),
+                timeout=0.25,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            for task in active_tasks.values():
+                task.cancel()
+            await asyncio.gather(*active_tasks.values(), return_exceptions=True)
+            for run_id in active_tasks:
+                await finalize_cancelled_run(run_id)
+            raise
+        for task in done:
+            for run_id, current in list(active_tasks.items()):
+                if current is task:
+                    if task.cancelled():
+                        await finalize_cancelled_run(run_id)
+                    ACTIVE_RUNS.pop(run_id, None)
+                    active_model_keys.pop(run_id, None)
+                    active_tasks.pop(run_id, None)
+                    break
+
     while not stop.is_set() or active_tasks:
+        if stop.is_set():
+            if not active_tasks:
+                break
+            await wait_for_active_tasks()
+            continue
+
         with session_scope() as db:
             queued_rows = db.execute(
                 select(Job, Presentation.config_snapshot_json)
@@ -642,6 +672,8 @@ async def scheduler(stop: asyncio.Event) -> None:
                             page.status, page.error_code, page.error = "FAILED", "JOB_QUEUE_TIMEOUT", "等待任务调度超时"
         for job in expired:
             await emit_event(job.presentation_id, "job.queue_timeout", {"job_id": job.id, "run_id": job.run_id, "error_code": "JOB_QUEUE_TIMEOUT"}, job.run_id)
+        if stop.is_set():
+            continue
         queued = [job for job in queued if job not in expired]
         capacity = max(0, settings.max_active_runs - len(active_tasks))
         if capacity:
@@ -671,6 +703,8 @@ async def scheduler(stop: asyncio.Event) -> None:
                     else:
                         break
                 for job in selected:
+                    if stop.is_set():
+                        break
                     with session_scope() as db:
                         row = db.get(Job, job.id)
                         if not row or row.status != "QUEUED":
@@ -688,24 +722,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                     ACTIVE_RUNS[run_id] = task
                     await emit_event(presentation_id, "job.started", {"job_id": job.id, "run_id": run_id, "queue_duration_ms": queue_duration_ms}, run_id)
         if active_tasks:
-            try:
-                done, _ = await asyncio.wait(active_tasks.values(), timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
-            except asyncio.CancelledError:
-                for task in active_tasks.values():
-                    task.cancel()
-                await asyncio.gather(*active_tasks.values(), return_exceptions=True)
-                for run_id in active_tasks:
-                    await finalize_cancelled_run(run_id)
-                raise
-            for task in done:
-                for run_id, current in list(active_tasks.items()):
-                    if current is task:
-                        if task.cancelled():
-                            await finalize_cancelled_run(run_id)
-                        ACTIVE_RUNS.pop(run_id, None)
-                        active_model_keys.pop(run_id, None)
-                        active_tasks.pop(run_id, None)
-                        break
+            await wait_for_active_tasks()
         else:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=0.25)

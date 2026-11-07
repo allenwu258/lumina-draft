@@ -566,6 +566,103 @@ async def test_scheduler_reserves_slots_for_idle_models_behind_large_backlog(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_stops_dispatching_queued_jobs_during_shutdown(
+    managed_client, monkeypatch
+):
+    with session_scope() as db:
+        presentation_a = Presentation(
+            user_request="active during shutdown",
+            status="PLANNING",
+            config_snapshot_json=dumps(
+                {"resolved_routes": {"ppt_outline": {"model_id": "model-a"}}}
+            ),
+        )
+        db.add(presentation_a)
+        db.flush()
+        run_a = Run(presentation_id=presentation_a.id, kind="DIRECTOR", status="QUEUED")
+        db.add(run_a)
+        db.flush()
+        job_a = Job(
+            run_id=run_a.id,
+            presentation_id=presentation_a.id,
+            kind="DIRECTOR",
+            model_id="model-a",
+            status="QUEUED",
+        )
+        db.add(job_a)
+        db.flush()
+        run_a_id = run_a.id
+
+    monkeypatch.setattr(
+        runtime,
+        "settings",
+        replace(runtime.settings, max_active_runs=2, scheduler_queue_timeout_seconds=600),
+    )
+    started = []
+    release = asyncio.Event()
+
+    async def fake_director(presentation_id, run_id):
+        started.append(run_id)
+        await release.wait()
+        with session_scope() as db:
+            db.get(Run, run_id).status = "SUCCEEDED"
+            db.get(Presentation, presentation_id).status = "WAITING_CONFIRMATION"
+
+    monkeypatch.setattr(runtime, "run_director", fake_director)
+    stop = asyncio.Event()
+    scheduler_task = asyncio.create_task(runtime.scheduler(stop))
+    try:
+        await eventually(lambda: started == [run_a_id])
+        with session_scope() as db:
+            presentation_b = Presentation(
+                user_request="queued during shutdown",
+                status="PLANNING",
+                config_snapshot_json=dumps(
+                    {"resolved_routes": {"ppt_outline": {"model_id": "model-b"}}}
+                ),
+            )
+            db.add(presentation_b)
+            db.flush()
+            run_b = Run(
+                presentation_id=presentation_b.id,
+                kind="DIRECTOR",
+                status="QUEUED",
+            )
+            db.add(run_b)
+            db.flush()
+            job_b = Job(
+                run_id=run_b.id,
+                presentation_id=presentation_b.id,
+                kind="DIRECTOR",
+                model_id="model-b",
+                status="QUEUED",
+            )
+            db.add(job_b)
+            db.flush()
+            run_b_id, job_b_id = run_b.id, job_b.id
+
+        stop.set()
+        await asyncio.sleep(0.4)
+        assert started == [run_a_id]
+        assert _job_status(job_b_id) == "QUEUED"
+        assert _run_status(run_b_id) == "QUEUED"
+        assert not scheduler_task.done()
+
+        release.set()
+        await asyncio.wait_for(scheduler_task, timeout=3)
+    finally:
+        stop.set()
+        release.set()
+        if not scheduler_task.done():
+            await asyncio.wait_for(scheduler_task, timeout=3)
+
+    assert started == [run_a_id]
+    assert _job_status(job_b_id) == "QUEUED"
+    assert _run_status(run_b_id) == "QUEUED"
+    assert _run_status(run_a_id) == "SUCCEEDED"
+
+
+@pytest.mark.asyncio
 async def test_scheduler_finalizes_cancelled_run_before_execute_starts(
     managed_client, monkeypatch
 ):
