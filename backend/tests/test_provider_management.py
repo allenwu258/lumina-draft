@@ -15,15 +15,19 @@ from backend.app.db import (
     Base,
     BusinessRoute,
     BusinessRouteOverride,
+    Event,
     GenerationSettingsRecord,
+    Job,
     LlmCall,
+    PageTask,
     Presentation,
+    Run,
     dumps,
     loads,
     session_scope,
     utcnow,
 )
-from backend.app.provider_management import ProviderLimiter, resolve_business_route
+from backend.app.provider_management import ModelLimiter, resolve_business_route
 from backend.tests.test_core import document, valid_html
 
 PREFIX = "/api/v1/settings/llm"
@@ -104,14 +108,64 @@ def create_provider(client, **overrides):
     return response.json()
 
 
-def create_model(client, provider, remote="model-a"):
+@pytest.mark.parametrize("initial_status", ["QUEUED", "RUNNING"])
+def test_cancel_without_active_task_finishes_run_and_emits_terminal_event(
+    managed_client, initial_status
+):
+    page_status = "PENDING" if initial_status == "QUEUED" else "WAITING_MODEL_CAPACITY"
+    with session_scope() as db:
+        presentation = Presentation(user_request="cancel test", status="GENERATING")
+        db.add(presentation)
+        db.flush()
+        run = Run(
+            presentation_id=presentation.id,
+            kind="GENERATION",
+            status=initial_status,
+        )
+        db.add(run)
+        db.flush()
+        job = Job(
+            run_id=run.id,
+            presentation_id=presentation.id,
+            kind="GENERATION",
+            status=initial_status,
+        )
+        page = PageTask(
+            presentation_id=presentation.id,
+            run_id=run.id,
+            slide_id="slide-1",
+            page_number=1,
+            title="Cancellation",
+            brief_json="{}",
+            status=page_status,
+        )
+        db.add_all([job, page])
+        db.flush()
+        run_id, page_id = run.id, page.id
+
+    response = managed_client.post(f"/api/v1/runs/{run_id}/cancel")
+
+    assert response.status_code == 202
+    assert response.json() == {"run_id": run_id, "status": "CANCELLED"}
+    with session_scope() as db:
+        run = db.get(Run, run_id)
+        job = db.scalar(select(Job).where(Job.run_id == run_id))
+        page = db.get(PageTask, page_id)
+        event = db.scalar(select(Event).where(Event.run_id == run_id))
+        assert run.status == job.status == page.status == "CANCELLED"
+        assert job.finished_at is not None
+        assert page.error_code == "PAGE_CANCELLED"
+        assert event.type == "run.cancelled"
+
+
+def create_model(client, provider, remote="model-a", concurrency=2):
     response = client.post(
         PREFIX + f"/providers/{provider['id']}/models",
         json={
             "remote_model_id": remote,
             "display_name": remote.upper(),
             "context_window_tokens": 128000,
-            "max_concurrency": 2,
+            "model_concurrency": concurrency,
         },
     )
     assert response.status_code == 201, response.text
@@ -135,7 +189,6 @@ def provider_patch(provider, **updates):
                 "base_url",
                 "auth_mode",
                 "allow_private_http",
-                "max_concurrency",
                 "enabled",
             )
         }
@@ -153,6 +206,7 @@ def model_patch(model, **updates):
                 "display_name",
                 "context_window_tokens",
                 "max_output_tokens",
+                "model_concurrency",
                 "enabled",
             )
         }
@@ -168,7 +222,7 @@ def test_provider_model_crud_validation_and_revision(managed_client):
     assert "credential_ref" not in provider
     response = client.patch(
         PREFIX + f"/providers/{provider['id']}",
-        json=provider_patch(provider, name="Renamed", max_concurrency=6),
+        json=provider_patch(provider, name="Renamed"),
     )
     assert response.status_code == 200
     assert (
@@ -178,6 +232,8 @@ def test_provider_model_crud_validation_and_revision(managed_client):
         == 409
     )
     model = create_model(client, provider)
+    assert model["model_concurrency"] == 2
+    assert "max_concurrency" not in provider and "max_concurrency" not in model
     assert [tier["code"] for tier in model["reasoning_tiers"]] == [
         "off",
         "low",
@@ -302,7 +358,7 @@ def test_credentials_are_write_only_rotated_and_revoked(managed_client):
             "name": "Invalid",
             "base_url": "https://example.com",
             "api_key": "sensitive-value",
-            "max_concurrency": 0,
+            "unexpected_provider_concurrency": 0,
         },
     )
     assert response.status_code == 422 and "sensitive-value" not in response.text
@@ -486,8 +542,8 @@ def test_discovery_import_metadata_and_failure_preserves_models(
 
 
 @pytest.mark.asyncio
-async def test_shared_limiter_provider_and_cancellation():
-    limiter = ProviderLimiter(lambda provider_id: 1)
+async def test_shared_model_limiter_and_cancellation():
+    limiter = ModelLimiter(lambda model_id: 1)
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -620,8 +676,8 @@ async def test_gateway_cancellation_records_audit_and_releases_limit(
     provider = create_provider(managed_client)
     model = create_model(managed_client, provider)
     seed_default(model)
-    limiter = ProviderLimiter()
-    monkeypatch.setattr(runtime, "PROVIDER_LIMITER", limiter)
+    limiter = ModelLimiter()
+    monkeypatch.setattr(runtime, "MODEL_LIMITER", limiter)
     started = asyncio.Event()
 
     async def blocking_stream(**kwargs):
@@ -678,8 +734,8 @@ async def test_queued_call_revalidates_before_sending(
     provider = create_provider(client, auth_mode="bearer", api_key="queued-key")
     model = create_model(client, provider)
     seed_default(model)
-    limiter = ProviderLimiter(lambda provider_id: 1)
-    monkeypatch.setattr(runtime, "PROVIDER_LIMITER", limiter)
+    limiter = ModelLimiter(lambda model_id: 1)
+    monkeypatch.setattr(runtime, "MODEL_LIMITER", limiter)
     sent = []
 
     async def stream(**kwargs):
@@ -687,7 +743,7 @@ async def test_queued_call_revalidates_before_sending(
         yield providers.ProviderEvent("completed", {"text": "OK"})
 
     monkeypatch.setattr(runtime, "stream_responses", stream)
-    async with limiter.acquire(provider["id"]):
+    async with limiter.acquire(model["id"]):
         task = asyncio.create_task(
             runtime.ProviderGateway()._stream("test", None, "provider_test")
         )

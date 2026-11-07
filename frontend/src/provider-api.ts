@@ -26,7 +26,7 @@ export type ProviderModel = {
   display_name: string;
   context_window_tokens: number | null;
   max_output_tokens: number | null;
-  provider_concurrency: number;
+  model_concurrency: number;
   enabled: boolean;
   revision: number;
   metadata_source: string;
@@ -44,24 +44,21 @@ export type ApiProvider = {
   credential_version: number | null;
   credential_store_available?: boolean;
   allow_private_http: boolean;
-  max_concurrency: number;
   enabled: boolean;
   revision: number;
   models: ProviderModel[];
 };
 export type ProviderFields = Pick<
   ApiProvider,
-  | 'name'
-  | 'protocol'
-  | 'base_url'
-  | 'auth_mode'
-  | 'allow_private_http'
-  | 'max_concurrency'
-  | 'enabled'
+  'name' | 'protocol' | 'base_url' | 'auth_mode' | 'allow_private_http' | 'enabled'
 >;
 export type ModelFields = Pick<
   ProviderModel,
-  'remote_model_id' | 'display_name' | 'context_window_tokens' | 'max_output_tokens'
+  | 'remote_model_id'
+  | 'display_name'
+  | 'context_window_tokens'
+  | 'max_output_tokens'
+  | 'model_concurrency'
 >;
 export type ModelCandidate = ModelFields & { metadata_source: string; already_added: boolean };
 export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html';
@@ -73,7 +70,7 @@ export type ResolvedRoute = {
   remote_model_id: string;
   reasoning_tier: string;
   reasoning_effort: string | null;
-  provider_concurrency: number;
+  model_concurrency: number;
 };
 export type BusinessRoute = {
   code: RouteCode;
@@ -91,10 +88,12 @@ export type ModelCall = {
   business_code: string | null;
   model: string;
   status: string;
+  queue_reason?: string | null;
   error: string | null;
   error_code: string | null;
   started_at: string;
   queue_duration_ms: number | null;
+  admitted_at?: string | null;
   total_duration_ms: number | null;
 };
 export type CallDetail = ModelCall & {

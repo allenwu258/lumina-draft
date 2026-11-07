@@ -83,11 +83,27 @@ def outline_dict(o: Outline | None) -> dict | None:
 
 
 def run_dict(r: Run | None) -> dict | None:
-    return None if r is None else {"id": r.id, "kind": r.kind, "status": r.status, "error": r.error, "created_at": r.created_at.isoformat()}
+    return None if r is None else {"id": r.id, "kind": r.kind, "status": r.status, "error": r.error, "error_code": r.error_code, "created_at": r.created_at.isoformat()}
+
+
+def job_dict(job: Job | None) -> dict | None:
+    if not job:
+        return None
+    return {
+        "id": job.id,
+        "status": job.status,
+        "queue_reason": job.queue_reason,
+        "queue_duration_ms": job.queue_duration_ms,
+        "queued_at": job.queued_at.isoformat() if job.queued_at else None,
+        "error_code": job.error_code,
+        "error": job.error,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
 
 
 def page_dict(p: PageTask) -> dict:
-    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "attempt": p.attempt}
+    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt}
 
 
 def provider_dict(route, model, binding, endpoint, owner) -> dict:
@@ -143,13 +159,14 @@ def update_provider(body: ProviderUpdate):
             expected_revision=model.revision, remote_model_id=body.model,
             display_name=body.name, context_window_tokens=model.context_window_tokens,
             max_output_tokens=model.max_output_tokens,
+            model_concurrency=model.max_concurrency,
             enabled=body.enabled,
         )
         provider_fields = ProviderPatch(
             expected_revision=revision, name=body.name, protocol="openai_responses",
             base_url=body.base_url, auth_mode="bearer" if body.api_key else endpoint.auth_mode,
             allow_private_http=endpoint.allow_private_http,
-            max_concurrency=owner.max_concurrency, enabled=body.enabled,
+            enabled=body.enabled,
         )
     updated = patch_provider(owner_id, provider_fields)
     if body.api_key:
@@ -234,6 +251,7 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         if idempotency_key:
             db.add(IdempotencyRecord(scope="presentations.create", key=idempotency_key, request_hash=request_hash, response_json=dumps(response)))
     await emit_event(pid, "presentation.created", {"presentation_id": pid, "run_id": rid}, rid)
+    await emit_event(pid, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
     return response
 
 
@@ -246,6 +264,8 @@ def get_presentation(presentation_id: str):
         runs = db.scalars(select(Run).where(Run.presentation_id == p.id).order_by(Run.created_at.desc())).all()
         pages = db.scalars(select(PageTask).where(PageTask.presentation_id == p.id).order_by(PageTask.page_number)).all()
         active_run = next((r for r in runs if r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}), None)
+        active_job = db.scalar(select(Job).where(Job.run_id == active_run.id)) if active_run else None
+        latest_job = db.scalar(select(Job).where(Job.run_id == runs[0].id)) if runs else None
         last_seq = db.scalar(select(Event.seq).where(Event.presentation_id == p.id).order_by(Event.seq.desc()).limit(1)) or 0
         running_ids = {page.id for page in pages if page.status in {"RUNNING", "VALIDATING"}}
         streams: dict[str, str] = {}
@@ -273,7 +293,7 @@ def get_presentation(presentation_id: str):
                 channel = payload.get("channel")
                 if channel in director_stream:
                     director_stream[channel] += payload.get("delta", "")
-        return {"presentation": presentation_dict(p), "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "latest_run": run_dict(runs[0]) if runs else None, "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
+        return {"presentation": presentation_dict(p), "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")
@@ -341,6 +361,7 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
         db.add(Job(run_id=run.id, presentation_id=p.id, kind="GENERATION", status="QUEUED"))
         rid, count = run.id, len(document["slides"])
     await emit_event(presentation_id, "generation.queued", {"run_id": rid, "page_count": count}, rid)
+    await emit_event(presentation_id, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
     return {"presentation_id": presentation_id, "run_id": rid, "status": "GENERATING", "page_count": count}
 
 
@@ -369,6 +390,7 @@ async def retry_presentation(presentation_id: str):
             fail("INVALID_STATE", "当前没有可以重试的任务")
         rid, kind = run.id, run.kind
     await emit_event(presentation_id, "run.queued", {"run_id": rid, "kind": kind}, rid)
+    await emit_event(presentation_id, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
     return {"run_id": rid, "status": "QUEUED"}
 
 
@@ -381,20 +403,47 @@ async def cancel_run(run_id: str):
             return {"run_id": run_id, "status": run.status}
         presentation_id = run.presentation_id
         job = db.scalar(select(Job).where(Job.run_id == run_id))
-        if run.status == "QUEUED":
+        queued = run.status == "QUEUED"
+        if queued:
             run.status = "CANCELLED"
-            if job: job.status = "CANCELLED"
+            if job:
+                job.status, job.finished_at = "CANCELLED", utcnow()
             p = db.get(Presentation, presentation_id)
             if p: p.status = "CANCELLED"
             for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status == "PENDING")).all():
-                page.status = "CANCELLED"
+                page.status, page.error_code, page.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
         else:
             run.status = "CANCEL_REQUESTED"
     active = ACTIVE_RUNS.get(run_id)
     if active:
         active.cancel()
-    await emit_event(presentation_id, "run.cancel_requested", {"run_id": run_id}, run_id)
-    return {"run_id": run_id, "status": "CANCEL_REQUESTED" if active else "CANCELLED"}
+
+    if active and not queued:
+        await emit_event(presentation_id, "run.cancel_requested", {"run_id": run_id}, run_id)
+        return {"run_id": run_id, "status": "CANCEL_REQUESTED"}
+
+    if not queued:
+        # A RUNNING row without a local task cannot make progress in this process.
+        # Finalize it instead of leaving the UI stuck in CANCEL_REQUESTED.
+        with session_scope() as db:
+            run = db.get(Run, run_id)
+            if run and run.status == "CANCEL_REQUESTED":
+                run.status = "CANCELLED"
+                if job := db.scalar(select(Job).where(Job.run_id == run_id)):
+                    job.status, job.finished_at = "CANCELLED", utcnow()
+                p = db.get(Presentation, presentation_id)
+                if p and p.status in {"PLANNING", "GENERATING"}:
+                    p.status = "CANCELLED"
+                for page in db.scalars(select(PageTask).where(
+                    PageTask.run_id == run_id,
+                    PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "WAITING_MODEL_CAPACITY", "VALIDATING"]),
+                )).all():
+                    page.status, page.error_code, page.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
+        await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
+        return {"run_id": run_id, "status": "CANCELLED"}
+
+    await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
+    return {"run_id": run_id, "status": "CANCELLED"}
 
 
 @app.get(f"{API}/page-tasks/{{task_id}}/html")

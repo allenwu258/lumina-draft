@@ -11,10 +11,11 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
-from .db import ApiCredential, ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, Run, dumps, loads, session_scope, utcnow
+from .config import settings
+from .db import ApiCredential, ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, ProviderTest, Run, dumps, loads, session_scope, utcnow
 from .prompts import COMPOSER_PROMPT, DIRECTOR_PROMPT
 from .providers import ProviderError, stream_responses
-from .provider_management import PROVIDER_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
+from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
 from .rendering import html_hash, validate_html
 from .schemas import OutlineDocument
 from .secrets import read_secret
@@ -162,6 +163,7 @@ class ProviderGateway:
                 purpose=purpose,
                 model=model,
                 status="QUEUED",
+                queue_reason="MODEL_CAPACITY",
                 provider_id=owner.id,
                 model_id=model_record.id,
                 business_code=business_code if purpose != "provider_test" else None,
@@ -207,9 +209,11 @@ class ProviderGateway:
             last_director_flush = time.monotonic()
 
         queue_duration_ms = 0
+        queued_at = time.monotonic()
         try:
-            queued_at = time.monotonic()
-            async with PROVIDER_LIMITER.acquire(provider_id):
+            if presentation_id:
+                await emit_event(presentation_id, "llm.queued", {"call_id": call_id, "model_id": model_id, "queue_reason": "MODEL_CAPACITY"}, run_id)
+            async with MODEL_LIMITER.acquire(model_id, run_id=run_id or purpose, timeout_seconds=settings.model_queue_timeout_seconds):
                 admitted_at = time.monotonic()
                 queue_duration_ms = int((time.monotonic() - queued_at) * 1000)
                 # Configuration can be revoked or disabled while waiting for a slot.
@@ -234,7 +238,7 @@ class ProviderGateway:
                     raise ProviderError("CREDENTIAL_NOT_CONFIGURED", "请先配置 API 凭据")
                 with session_scope() as db:
                     call = db.get(LlmCall, call_id)
-                    call.status, call.queue_duration_ms = "RUNNING", queue_duration_ms
+                    call.status, call.queue_duration_ms, call.admitted_at = "RUNNING", queue_duration_ms, utcnow()
                     if page_task_id:
                         page = db.get(PageTask, page_task_id)
                         run = db.get(Run, run_id) if run_id else None
@@ -244,6 +248,8 @@ class ProviderGateway:
                         page_number = page.page_number
                 if page_task_id and presentation_id:
                     await emit_event(presentation_id, "page.started", {"page_task_id": page_task_id, "page_number": page_number}, run_id)
+                if presentation_id:
+                    await emit_event(presentation_id, "llm.started", {"call_id": call_id, "model_id": model_id, "queue_duration_ms": queue_duration_ms}, run_id)
                 request_options = {
                     "base_url": base_url,
                     "api_key": key or "",
@@ -309,6 +315,9 @@ class ProviderGateway:
                         if page and page.run_id == run_id:
                             page.status = "VALIDATING"
                     await emit_event(presentation_id, "page.validating", {"page_task_id": page_task_id}, run_id)
+        except asyncio.TimeoutError:
+            status, error_code, error = "FAILED", "CALL_QUEUE_TIMEOUT", "等待模型调用名额超时"
+            raise ProviderError(error_code, error)
         except asyncio.CancelledError:
             status, error_code, error = "CANCELLED", "CALL_CANCELLED", "调用已取消"
             raise
@@ -345,6 +354,8 @@ class ProviderGateway:
                     call.finished_at = utcnow()
             if presentation_id:
                 await emit_event(presentation_id, "llm.usage.updated", {"call_id": call_id, "purpose": purpose})
+                if error_code == "CALL_QUEUE_TIMEOUT":
+                    await emit_event(presentation_id, "call.queue_timeout", {"call_id": call_id, "model_id": model_id, "queue_duration_ms": queue_duration_ms}, run_id)
         if status != "SUCCEEDED":
             raise ProviderError(error_code or "MODEL_INCOMPLETE", error or "模型未完成输出")
         return final_text if final_text is not None else "".join(output)
@@ -420,11 +431,12 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED", "kind": "DIRECTOR"}, run_id)
     except Exception as exc:
         message = str(exc)[:500]
+        error_code = exc.code if isinstance(exc, ProviderError) else "DIRECTOR_FAILED"
         with session_scope() as db:
             run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
-            if run: run.status, run.error = "FAILED", message
+            if run: run.status, run.error_code, run.error = "FAILED", error_code, message
             if presentation: presentation.status = "FAILED"
-        await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message}, run_id)
+        await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": error_code}, run_id)
 
 
 async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
@@ -436,9 +448,9 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
                 run = db.get(Run, run_id)
                 if not task or task.run_id != run_id or not run or run.status != "RUNNING":
                     raise asyncio.CancelledError()
-                task.status = "WAITING_CAPACITY"
+                task.status = "WAITING_MODEL_CAPACITY"
                 number = task.page_number
-            await emit_event(presentation_id, "page.queued", {"page_task_id": task_id, "page_number": number}, run_id)
+            await emit_event(presentation_id, "page.queued", {"page_task_id": task_id, "page_number": number, "queue_reason": "MODEL_CAPACITY"}, run_id)
             result = await run_graph(PAGE_GRAPH, {"task_id": task_id, "run_id": run_id, "error": reason})
             html = result["result"]
             valid, reason = validate_html(html)
@@ -454,13 +466,20 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
             if task and task.run_id == run_id:
                 task.status, task.html, task.html_hash, task.error = "SUCCEEDED", html, digest, None
         await emit_event(presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
+    except asyncio.CancelledError:
+        with session_scope() as db:
+            task = db.get(PageTask, task_id)
+            if task and task.run_id == run_id and task.status not in {"SUCCEEDED", "FAILED"}:
+                task.status, task.error_code, task.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
+        raise
     except Exception as exc:
         message = str(exc)[:500]
+        error_code = exc.code if isinstance(exc, ProviderError) else "PAGE_GENERATION_FAILED"
         with session_scope() as db:
             task = db.get(PageTask, task_id)
             if task and task.run_id == run_id:
-                task.status, task.error = "FAILED", message
-        await emit_event(presentation_id, "page.failed", {"page_task_id": task_id, "error": message}, run_id)
+                task.status, task.error_code, task.error = "FAILED", error_code, message
+        await emit_event(presentation_id, "page.failed", {"page_task_id": task_id, "error": message, "error_code": error_code}, run_id)
 
 
 async def run_generation(presentation_id: str, run_id: str) -> None:
@@ -474,61 +493,167 @@ async def run_generation(presentation_id: str, run_id: str) -> None:
         statuses = [t.status for t in db.scalars(select(PageTask).where(PageTask.run_id == run_id)).all()]
         run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
         success = all(s == "SUCCEEDED" for s in statuses)
-        run.status, presentation.status = ("SUCCEEDED" if success else "PARTIAL_FAILED"), ("READY" if success else "PARTIAL_FAILED")
+        run.status, run.error_code, presentation.status = ("SUCCEEDED" if success else "PARTIAL_FAILED"), (None if success else "PAGE_GENERATION_FAILED"), ("READY" if success else "PARTIAL_FAILED")
     await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED" if success else "PARTIAL_FAILED", "kind": "GENERATION"}, run_id)
 
 
 async def scheduler(stop: asyncio.Event) -> None:
-    """Single-process durable queue consumer; interrupted work is re-queued on startup."""
+    """Durable, fair scheduler with bounded concurrent runs."""
     with session_scope() as db:
         for call in db.scalars(select(LlmCall).where(LlmCall.status.in_(["QUEUED", "RUNNING"]))).all():
             call.status, call.error_code, call.error = "CANCELLED", "CALL_INTERRUPTED", "后端重启，调用已中断"
             call.finished_at = utcnow()
+        for test in db.scalars(select(ProviderTest).where(ProviderTest.status == "running")).all():
+            test.status, test.finished_at = "cancelled", utcnow()
         for job in db.scalars(select(Job).where(Job.status == "RUNNING")).all():
             run = db.get(Run, job.run_id)
             if run and run.status in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED"}:
                 job.status = "SUCCEEDED" if run.status in {"SUCCEEDED", "PARTIAL_FAILED"} else run.status
                 continue
             job.status = "QUEUED"
+            job.started_at, job.queued_at = None, utcnow()
             if run and run.kind == "GENERATION":
-                for task in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status.in_(["RUNNING", "WAITING_CAPACITY", "VALIDATING"]))).all():
+                for task in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status.in_(["RUNNING", "WAITING_CAPACITY", "WAITING_MODEL_CAPACITY", "VALIDATING"]))).all():
                     task.status = "PENDING"
             elif run and run.kind == "DIRECTOR":
                 run.status = "QUEUED"
-    while not stop.is_set():
-        job_id = run_id = presentation_id = kind = None
+    active_tasks: dict[str, asyncio.Task] = {}
+    fair_cursor = 0
+
+    def elapsed_seconds(start: datetime, end: datetime) -> float:
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        return (end - start).total_seconds()
+
+    def job_key(job: Job, snapshot_json: str | None) -> str:
+        snapshot = loads(snapshot_json) if snapshot_json else {}
+        routes = snapshot.get("resolved_routes") or {}
+        route = routes.get("ppt_outline" if job.kind == "DIRECTOR" else "ppt_html") or {}
+        return str(route.get("model_id") or snapshot.get("model_id") or "unknown")
+
+    async def finish_cancelled(run_id: str, presentation_id: str) -> None:
         with session_scope() as db:
-            job = db.scalar(select(Job).where(Job.status == "QUEUED").order_by(Job.created_at).limit(1))
-            if job:
-                job.status = "RUNNING"
-                run_id, presentation_id, kind = job.run_id, job.presentation_id, job.kind
+            run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
+            if run and run.status not in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}:
+                run.status = "CANCELLED"
+            if presentation and presentation.status in {"PLANNING", "GENERATING"}:
+                presentation.status = "CANCELLED"
+            for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "WAITING_MODEL_CAPACITY", "VALIDATING"]))).all():
+                page.status = "CANCELLED"
+        await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
+
+    async def execute(job_id: str, run_id: str, presentation_id: str, kind: str) -> None:
+        try:
+            await (run_director(presentation_id, run_id) if kind == "DIRECTOR" else run_generation(presentation_id, run_id))
+        except asyncio.CancelledError:
+            if not stop.is_set():
+                await finish_cancelled(run_id, presentation_id)
+            raise
+        except Exception as exc:
+            message = str(exc)[:500]
+            code = exc.code if isinstance(exc, ProviderError) else "JOB_EXECUTION_FAILED"
+            with session_scope() as db:
                 run = db.get(Run, run_id)
-                if run: run.status = "RUNNING"
-        if run_id:
+                presentation = db.get(Presentation, presentation_id)
+                job = db.get(Job, job_id)
+                if run:
+                    run.status, run.error_code, run.error = "FAILED", code, message
+                if presentation:
+                    presentation.status = "FAILED" if kind == "DIRECTOR" else "PARTIAL_FAILED"
+                if job:
+                    job.status, job.error_code, job.error, job.finished_at = "FAILED", code, message, utcnow()
+            await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": code}, run_id)
+        finally:
+            ACTIVE_RUNS.pop(run_id, None)
+            with session_scope() as db:
+                job = db.get(Job, job_id)
+                run = db.get(Run, run_id)
+                if job and run and run.status in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED"}:
+                    job.status = "SUCCEEDED" if run.status in {"SUCCEEDED", "PARTIAL_FAILED"} else run.status
+                    job.finished_at = utcnow()
+
+    while not stop.is_set() or active_tasks:
+        with session_scope() as db:
+            queued_rows = db.execute(
+                select(Job, Presentation.config_snapshot_json)
+                .outerjoin(Presentation, Presentation.id == Job.presentation_id)
+                .where(Job.status == "QUEUED")
+                .order_by(Job.queued_at, Job.created_at)
+                .limit(100)
+            ).all()
+            queued = [row[0] for row in queued_rows]
+            model_keys = {
+                job.id: job_key(job, snapshot_json)
+                for job, snapshot_json in queued_rows
+            }
+            now = utcnow()
+            expired = [job for job in queued if elapsed_seconds(job.queued_at, now) > settings.scheduler_queue_timeout_seconds]
+            for job in expired:
+                run = db.get(Run, job.run_id)
+                job.status, job.error_code, job.error, job.finished_at = "FAILED", "JOB_QUEUE_TIMEOUT", "等待任务调度超时", now
+                if run:
+                    run.status, run.error_code, run.error = "FAILED", "JOB_QUEUE_TIMEOUT", "等待任务调度超时"
+                    presentation = db.get(Presentation, run.presentation_id)
+                    if presentation:
+                        presentation.status = "FAILED" if run.kind == "DIRECTOR" else "PARTIAL_FAILED"
+                    if run.kind == "GENERATION":
+                        for page in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status == "PENDING")).all():
+                            page.status, page.error_code, page.error = "FAILED", "JOB_QUEUE_TIMEOUT", "等待任务调度超时"
+        for job in expired:
+            await emit_event(job.presentation_id, "job.queue_timeout", {"job_id": job.id, "run_id": job.run_id, "error_code": "JOB_QUEUE_TIMEOUT"}, job.run_id)
+        queued = [job for job in queued if job not in expired]
+        capacity = max(0, settings.max_active_runs - len(active_tasks))
+        if capacity:
+            groups: dict[str, list[Job]] = {}
+            for job in queued:
+                groups.setdefault(model_keys[job.id], []).append(job)
+            keys = list(groups)
+            if keys:
+                selected: list[Job] = []
+                while len(selected) < capacity:
+                    for offset in range(len(keys)):
+                        index = (fair_cursor + offset) % len(keys)
+                        key = keys[index]
+                        if groups[key]:
+                            selected.append(groups[key].pop(0))
+                            fair_cursor = (index + 1) % len(keys)
+                            break
+                    else:
+                        break
+                for job in selected:
+                    with session_scope() as db:
+                        row = db.get(Job, job.id)
+                        if not row or row.status != "QUEUED":
+                            continue
+                        now = utcnow()
+                        queue_duration_ms = int(elapsed_seconds(row.queued_at, now) * 1000)
+                        row.status, row.started_at, row.queue_duration_ms = "RUNNING", now, queue_duration_ms
+                        run = db.get(Run, row.run_id)
+                        if run:
+                            run.status = "RUNNING"
+                        run_id, presentation_id, kind = row.run_id, row.presentation_id, row.kind
+                    task = asyncio.create_task(execute(job.id, run_id, presentation_id, kind))
+                    active_tasks[run_id] = task
+                    ACTIVE_RUNS[run_id] = task
+                    await emit_event(presentation_id, "job.started", {"job_id": job.id, "run_id": run_id, "queue_duration_ms": queue_duration_ms}, run_id)
+        if active_tasks:
             try:
-                active = asyncio.create_task(run_director(presentation_id, run_id) if kind == "DIRECTOR" else run_generation(presentation_id, run_id))
-                ACTIVE_RUNS[run_id] = active
-                await active
+                done, _ = await asyncio.wait(active_tasks.values(), timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
-                if stop.is_set():
-                    raise
-                with session_scope() as db:
-                    run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
-                    if run: run.status = "CANCELLED"
-                    if presentation: presentation.status = "CANCELLED"
-                    for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "VALIDATING"]))).all():
-                        page.status = "CANCELLED"
-                await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
-            finally:
-                ACTIVE_RUNS.pop(run_id, None)
-                with session_scope() as db:
-                    job = db.scalar(select(Job).where(Job.run_id == run_id))
-                    run = db.get(Run, run_id)
-                    if job and run and run.status in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED"}:
-                        job.status = "SUCCEEDED" if run.status in {"SUCCEEDED", "PARTIAL_FAILED"} else run.status
+                for task in active_tasks.values():
+                    task.cancel()
+                await asyncio.gather(*active_tasks.values(), return_exceptions=True)
+                raise
+            for task in done:
+                for run_id, current in list(active_tasks.items()):
+                    if current is task:
+                        active_tasks.pop(run_id, None)
+                        break
         else:
             try:
-                await asyncio.wait_for(stop.wait(), timeout=0.5)
+                await asyncio.wait_for(stop.wait(), timeout=0.25)
             except asyncio.TimeoutError:
                 pass
 

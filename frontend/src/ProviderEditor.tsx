@@ -18,7 +18,6 @@ const newProvider: ProviderFields = {
   base_url: '',
   auth_mode: 'bearer',
   allow_private_http: false,
-  max_concurrency: 3,
   enabled: true,
 };
 const fieldsOf = (provider: ApiProvider): ProviderFields => ({
@@ -27,7 +26,6 @@ const fieldsOf = (provider: ApiProvider): ProviderFields => ({
   base_url: provider.base_url,
   auth_mode: provider.auth_mode,
   allow_private_http: provider.allow_private_http,
-  max_concurrency: provider.max_concurrency,
   enabled: provider.enabled,
 });
 type Props = {
@@ -139,7 +137,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
           <div>
             <h2>{provider?.name || '添加 Provider'}</h2>
             <p>
-              {provider ? '编辑连接、认证与共享并发限制' : '创建一个兼容 OpenAI Responses 的连接'}
+              {provider ? '编辑 Provider 连接与认证信息' : '创建一个兼容 OpenAI Responses 的连接'}
             </p>
           </div>
           <span className="settings-badge">Responses</span>
@@ -193,22 +191,6 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                 <option value="bearer">Bearer API Key</option>
                 <option value="none">无认证</option>
               </select>
-            </label>
-            <label>
-              Provider 总并发
-              <input
-                aria-label="Provider 总并发"
-                type="number"
-                min={1}
-                max={32}
-                required
-                value={fields.max_concurrency}
-                onChange={(event) => update('max_concurrency', Number(event.target.value))}
-              />
-              <small>
-                同一 Provider 下生成、测试和模型发现共享 1–32
-                个调用名额。等待名额的页面不显示生成中。
-              </small>
             </label>
           </div>
           {fields.auth_mode === 'bearer' && (
@@ -330,7 +312,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                         {model.context_window_tokens?.toLocaleString() || '未提供'}
                         <small>输出 {model.max_output_tokens?.toLocaleString() || '未提供'}</small>
                       </td>
-                      <td>Provider 总额 {provider.max_concurrency}</td>
+                      <td>模型并发 {model.model_concurrency}</td>
                       <td>
                         <ModelTestStatus model={model} />
                       </td>
@@ -506,6 +488,7 @@ function DiscoveryDialog({
             display_name: item.display_name || item.remote_model_id,
             context_window_tokens: item.context_window_tokens,
             max_output_tokens: item.max_output_tokens,
+            model_concurrency: item.model_concurrency,
           },
           item.metadata_source,
         );

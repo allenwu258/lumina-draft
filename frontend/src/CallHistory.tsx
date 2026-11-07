@@ -72,7 +72,11 @@ export function CallHistory() {
                           : 'warning')
                     }
                   >
-                    {call.status === 'QUEUED' ? '等待调用名额' : call.status}
+                    {call.status === 'QUEUED'
+                      ? call.queue_reason === 'MODEL_CAPACITY'
+                        ? '等待模型调用名额'
+                        : '等待任务调度'
+                      : call.status}
                   </span>
                   {call.error && <small>{call.error}</small>}
                 </td>

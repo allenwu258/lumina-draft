@@ -29,6 +29,7 @@ class SchemaMigration(Base):
 
 
 PROVIDER_MIGRATION = "20261106_provider_management_v1"
+MODEL_CONCURRENCY_MIGRATION = "20261107_model_concurrency_v1"
 
 
 class Provider(Base):
@@ -54,7 +55,6 @@ class ApiProvider(Base):
     name: Mapped[str] = mapped_column(String(160))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
-    max_concurrency: Mapped[int] = mapped_column(Integer, default=3)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -84,7 +84,7 @@ class LogicalModel(Base):
     revision: Mapped[int] = mapped_column(Integer, default=1)
     context_window_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    max_concurrency: Mapped[int] = mapped_column(Integer, default=3)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=1)
     capabilities_json: Mapped[str] = mapped_column(Text, default='{"text_input":true,"multimodal_input":true,"tool_calling":true}')
     capability_source: Mapped[str] = mapped_column(String(20), default="assumed")
     metadata_source: Mapped[str] = mapped_column(String(30), default="unknown")
@@ -185,6 +185,7 @@ class Run(Base):
     kind: Mapped[str] = mapped_column(String(30))
     status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -213,6 +214,7 @@ class PageTask(Base):
     html: Mapped[str | None] = mapped_column(Text, nullable=True)
     html_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -237,6 +239,13 @@ class Job(Base):
     presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
     kind: Mapped[str] = mapped_column(String(30))
     status: Mapped[str] = mapped_column(String(30), default="QUEUED", index=True)
+    queue_reason: Mapped[str | None] = mapped_column(String(40), default="SCHEDULER", nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queue_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -269,6 +278,8 @@ class LlmCall(Base):
     provider_response_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     config_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     queue_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    queue_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    admitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     time_to_first_token_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -368,6 +379,7 @@ def init_db() -> None:
         if not db.get(SchemaMigration, PROVIDER_MIGRATION):
             db.add(SchemaMigration(version=PROVIDER_MIGRATION))
         db.commit()
+    _migrate_model_concurrency()
 
 
 def _upgrade_existing_schema() -> bool:
@@ -375,7 +387,6 @@ def _upgrade_existing_schema() -> bool:
         return False
     additions = {
         "api_providers": {
-            "max_concurrency": "INTEGER NOT NULL DEFAULT 3",
             "archived_at": "DATETIME NULL",
             "created_at": "DATETIME NULL",
             "updated_at": "DATETIME NULL",
@@ -387,13 +398,24 @@ def _upgrade_existing_schema() -> bool:
         "logical_models": {
             "context_window_tokens": "INTEGER NULL",
             "max_output_tokens": "INTEGER NULL",
-            "max_concurrency": "INTEGER NOT NULL DEFAULT 3",
+            "max_concurrency": "INTEGER NOT NULL DEFAULT 1",
             "capabilities_json": "TEXT NOT NULL DEFAULT '{\"text_input\":true,\"multimodal_input\":true,\"tool_calling\":true}'",
             "capability_source": "VARCHAR(20) NOT NULL DEFAULT 'assumed'",
             "metadata_source": "VARCHAR(30) NOT NULL DEFAULT 'unknown'",
             "archived_at": "DATETIME NULL",
         },
         "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
+        "page_tasks": {"error_code": "VARCHAR(80) NULL"},
+        "jobs": {
+            "error_code": "VARCHAR(80) NULL",
+            "error": "TEXT NULL",
+            "queue_reason": "VARCHAR(40) NULL",
+            "started_at": "DATETIME NULL",
+            "queued_at": "DATETIME NULL",
+            "finished_at": "DATETIME NULL",
+            "queue_duration_ms": "INTEGER NULL",
+        },
+        "runs": {"error_code": "VARCHAR(80) NULL"},
         "llm_calls": {
             "error_code": "VARCHAR(80) NULL",
             "provider_id": "VARCHAR(36) NULL",
@@ -402,6 +424,8 @@ def _upgrade_existing_schema() -> bool:
             "provider_response_id": "VARCHAR(200) NULL",
             "config_snapshot_json": "TEXT NULL",
             "queue_duration_ms": "INTEGER NULL",
+            "queue_reason": "VARCHAR(40) NULL",
+            "admitted_at": "DATETIME NULL",
             "time_to_first_token_ms": "INTEGER NULL",
             "total_duration_ms": "INTEGER NULL",
         },
@@ -417,7 +441,48 @@ def _upgrade_existing_schema() -> bool:
                     connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         connection.execute(text("UPDATE api_providers SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
         connection.execute(text("UPDATE api_providers SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
+        connection.execute(text("UPDATE jobs SET queued_at = created_at WHERE queued_at IS NULL"))
     return needs_data_migration
+
+
+def _migrate_model_concurrency() -> None:
+    with engine.begin() as connection:
+        applied = connection.execute(
+            text("SELECT 1 FROM schema_migrations WHERE version = :version"),
+            {"version": MODEL_CONCURRENCY_MIGRATION},
+        ).first()
+        if applied:
+            return
+        provider_columns = {
+            column["name"] for column in inspect(connection).get_columns("api_providers")
+        }
+        if "max_concurrency" in provider_columns:
+            connection.execute(
+                text(
+                    """UPDATE logical_models
+                    SET max_concurrency = (
+                        SELECT api_providers.max_concurrency
+                        FROM model_bindings
+                        JOIN api_endpoints ON api_endpoints.id = model_bindings.endpoint_id
+                        JOIN api_providers ON api_providers.id = api_endpoints.provider_id
+                        WHERE model_bindings.model_id = logical_models.id
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 FROM model_bindings
+                        WHERE model_bindings.model_id = logical_models.id
+                    )"""
+                )
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE api_providers DROP COLUMN max_concurrency"
+            )
+        connection.execute(
+            text(
+                "INSERT INTO schema_migrations (version, applied_at) "
+                "VALUES (:version, CURRENT_TIMESTAMP)"
+            ),
+            {"version": MODEL_CONCURRENCY_MIGRATION},
+        )
 
 
 def resolve_default(db):

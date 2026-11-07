@@ -160,8 +160,7 @@ function RouteEditor({
           {model?.display_name || '未选择模型'}
         </strong>
         <small>
-          预算 {effectiveTier || '—'} · Provider 总并发 {provider?.max_concurrency ?? '—'}
-          （所有模型共享）
+          预算 {effectiveTier || '—'} · 模型并发 {model?.model_concurrency ?? '—'}
           {selectedTier && ' · API effort: ' + (selectedTier.api_value || '省略')}
         </small>
       </div>

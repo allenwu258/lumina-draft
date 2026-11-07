@@ -26,6 +26,13 @@ class Settings:
     api_base_url: str = os.getenv("DS_API_BASE_URL", _read_key_file().get("base_url", "https://api.deepseek.com"))
     api_model: str = os.getenv("DS_API_MODEL", _read_key_file().get("model", "deepseek-flash"))
     max_pages: int = 20
+    max_active_runs: int = int(os.getenv("MAX_ACTIVE_RUNS", "8"))
+    scheduler_queue_timeout_seconds: int = int(
+        os.getenv("SCHEDULER_QUEUE_TIMEOUT_SECONDS", "1800")
+    )
+    model_queue_timeout_seconds: int = int(
+        os.getenv("MODEL_QUEUE_TIMEOUT_SECONDS", "1800")
+    )
 
 
 settings = Settings()

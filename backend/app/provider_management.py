@@ -95,7 +95,7 @@ def resolve_model_config(
         "provider_name": owner.name,
         "provider_revision": owner.revision,
         "provider_enabled": owner.enabled,
-        "provider_concurrency": owner.max_concurrency,
+        "model_concurrency": model.max_concurrency,
         "endpoint_id": endpoint.id,
         "endpoint_revision": endpoint.revision,
         "endpoint_enabled": endpoint.enabled,
@@ -262,75 +262,142 @@ def route_issues(db, config: dict[str, Any], *, require_test: bool = True) -> li
     return issues
 
 
-def current_provider_limit(provider_id: str) -> int:
+def current_model_limit(model_id: str) -> int:
     with session_scope() as db:
-        provider = db.get(ApiProvider, provider_id)
-        if not provider or not provider.enabled or provider.archived_at:
-            raise ConfigurationError("CONFIG_NOT_READY", "Provider 已停用或不存在")
-        return provider.max_concurrency
+        owner, endpoint, model, binding = model_records(db, model_id)
+        if (
+            not owner.enabled
+            or owner.archived_at
+            or not endpoint.enabled
+            or not model.enabled
+            or model.archived_at
+            or not binding.enabled
+        ):
+            raise ConfigurationError("CONFIG_NOT_READY", "Provider 或模型已停用")
+        return model.max_concurrency
 
 
 @dataclass
-class _ProviderCapacity:
+class _ModelCapacity:
     loop: asyncio.AbstractEventLoop
     active: int = 0
-    waiters: deque[object] = field(default_factory=deque)
-    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    users: int = 0
+    waiters: dict[str, deque[object]] = field(default_factory=dict)
+    run_order: deque[str] = field(default_factory=deque)
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
-class ProviderLimiter:
-    """FIFO request admission per Provider, shared by all models in one worker."""
+class ModelLimiter:
+    """Fair, process-local request admission per model for one event loop."""
 
-    def __init__(self, limit_reader: Callable[[str], int] = current_provider_limit):
+    def __init__(self, limit_reader: Callable[[str], int] = current_model_limit):
         self._limit_reader = limit_reader
-        self._capacities: dict[str, _ProviderCapacity] = {}
+        self._capacities: dict[str, _ModelCapacity] = {}
 
     @property
     def active_count(self) -> int:
         return sum(capacity.active for capacity in self._capacities.values())
 
-    def provider_changed(self, provider_id: str) -> None:
-        """Wake queued calls after commit; FastAPI updates may run in a thread."""
-        capacity = self._capacities.get(provider_id)
+    def model_changed(self, model_id: str) -> None:
+        """Wake queued calls after a committed model or provider state change."""
+        capacity = self._capacities.get(model_id)
         if capacity and not capacity.loop.is_closed():
-            capacity.loop.call_soon_threadsafe(capacity.changed.set)
+            capacity.loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._notify(capacity))
+            )
+
+    @staticmethod
+    async def _notify(capacity: _ModelCapacity) -> None:
+        async with capacity.condition:
+            capacity.condition.notify_all()
+
+    def provider_changed(self, provider_id: str) -> None:
+        with session_scope() as db:
+            model_ids = db.scalars(
+                select(LogicalModel.id)
+                .join(ModelBinding, ModelBinding.model_id == LogicalModel.id)
+                .join(ApiEndpoint, ApiEndpoint.id == ModelBinding.endpoint_id)
+                .where(ApiEndpoint.provider_id == provider_id)
+            ).all()
+        for model_id in model_ids:
+            self.model_changed(model_id)
 
     @asynccontextmanager
-    async def acquire(self, provider_id: str) -> AsyncIterator[None]:
+    async def acquire(
+        self,
+        model_id: str,
+        run_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> AsyncIterator[None]:
         loop = asyncio.get_running_loop()
-        capacity = self._capacities.setdefault(provider_id, _ProviderCapacity(loop))
+        capacity = self._capacities.setdefault(model_id, _ModelCapacity(loop))
         if capacity.loop is not loop:
-            raise RuntimeError("ProviderLimiter requires a single event loop")
+            raise RuntimeError("ModelLimiter requires a single event loop")
+        capacity.users += 1
+        queue_key = run_id or "__unscoped__"
         ticket = object()
-        capacity.waiters.append(ticket)
+        registered = False
         admitted = False
         try:
-            while True:
-                capacity.changed.clear()
-                if capacity.waiters[0] is ticket:
-                    # Read current committed policy, never a frozen request snapshot.
-                    limit = self._limit_reader(provider_id)
-                    if limit < 1:
-                        raise ConfigurationError(
-                            "CONFIG_NOT_READY", "Provider 并发必须大于零"
-                        )
-                    if capacity.active < limit:
-                        capacity.waiters.popleft()
-                        capacity.active += 1
-                        admitted = True
-                        capacity.changed.set()
-                        break
-                await capacity.changed.wait()
+            async with capacity.condition:
+                capacity.waiters.setdefault(queue_key, deque()).append(ticket)
+                if queue_key not in capacity.run_order:
+                    capacity.run_order.append(queue_key)
+                registered = True
+
+            async def wait_for_admission() -> None:
+                nonlocal admitted
+                while True:
+                    async with capacity.condition:
+                        selected = None
+                        for key in capacity.run_order:
+                            queue = capacity.waiters.get(key)
+                            if queue:
+                                selected = queue[0]
+                                break
+                        if selected is ticket:
+                            limit = self._limit_reader(model_id)
+                            if limit < 1:
+                                raise ConfigurationError(
+                                    "CONFIG_NOT_READY", "模型并发必须大于零"
+                                )
+                            if capacity.active < limit:
+                                queue = capacity.waiters[queue_key]
+                                queue.popleft()
+                                if queue:
+                                    capacity.run_order.rotate(-1)
+                                else:
+                                    del capacity.waiters[queue_key]
+                                    capacity.run_order.remove(queue_key)
+                                capacity.active += 1
+                                admitted = True
+                                capacity.condition.notify_all()
+                                return
+                        await capacity.condition.wait()
+
+            if timeout_seconds is None:
+                await wait_for_admission()
+            else:
+                await asyncio.wait_for(wait_for_admission(), timeout=timeout_seconds)
             yield
         finally:
-            # No await during release: cancellation cannot leak a slot or ticket.
-            if admitted:
-                capacity.active -= 1
-            else:
-                capacity.waiters.remove(ticket)
-            capacity.changed.set()
-            if not capacity.active and not capacity.waiters:
-                self._capacities.pop(provider_id, None)
+            # Always release the admission slot and waiter registration on exit.
+            async with capacity.condition:
+                if admitted:
+                    capacity.active -= 1
+                elif registered:
+                    queue = capacity.waiters.get(queue_key)
+                    if queue and ticket in queue:
+                        queue.remove(ticket)
+                        if not queue:
+                            del capacity.waiters[queue_key]
+                            if queue_key in capacity.run_order:
+                                capacity.run_order.remove(queue_key)
+                capacity.condition.notify_all()
+            capacity.users -= 1
+            if not capacity.active and not capacity.waiters and not capacity.users:
+                if self._capacities.get(model_id) is capacity:
+                    self._capacities.pop(model_id, None)
 
 
-PROVIDER_LIMITER = ProviderLimiter()
+MODEL_LIMITER = ModelLimiter()

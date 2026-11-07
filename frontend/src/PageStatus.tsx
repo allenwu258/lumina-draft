@@ -5,7 +5,8 @@ export function pageStatusLabel(status?: string): string {
     case 'RUNNING':
       return '正在生成';
     case 'WAITING_CAPACITY':
-      return '等待 Provider 调用名额';
+    case 'WAITING_MODEL_CAPACITY':
+      return '等待模型调用名额';
     case 'VALIDATING':
       return '正在校验 HTML';
     case 'SUCCEEDED':
@@ -34,7 +35,8 @@ export function GenerationProgress({ pages }: { pages: { status: string }[] }) {
   return (
     <span className="generation-progress" aria-live="polite">
       <span>
-        生成中 {count(['RUNNING'])} · 等待 {count(['PENDING', 'WAITING_CAPACITY'])}
+        生成中 {count(['RUNNING'])} · 等待调度 {count(['PENDING'])} · 等待模型{' '}
+        {count(['WAITING_MODEL_CAPACITY', 'WAITING_CAPACITY'])}
       </span>
       <span>
         校验 {count(['VALIDATING'])} · 完成 {count(['SUCCEEDED'])}

@@ -21,6 +21,7 @@ const modelFields = (model?: ProviderModel): ModelFields => ({
   display_name: model?.display_name || '',
   context_window_tokens: model?.context_window_tokens ?? null,
   max_output_tokens: model?.max_output_tokens ?? null,
+  model_concurrency: model?.model_concurrency ?? 1,
 });
 
 export function ModelEditor({ providerId, model: initialModel, onClose, onSaved }: Props) {
@@ -100,7 +101,7 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
       <header>
         <div>
           <h2>{model ? '模型设置' : '添加模型'}</h2>
-          <p>编辑远程标识与上下文元数据；所有模型共享 Provider 总并发。</p>
+          <p>编辑模型元数据与该模型独立的调用并发上限。</p>
         </div>
         <button className="icon-button" title="关闭模型设置" disabled={!!busy} onClick={onClose}>
           <X size={18} />
@@ -130,6 +131,20 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
               />
             </label>
           </div>
+          <label>
+            模型并发限制
+            <input
+              aria-label="模型并发限制"
+              type="number"
+              min={1}
+              max={32}
+              step={1}
+              required
+              value={fields.model_concurrency}
+              onChange={(event) => update('model_concurrency', Number(event.target.value))}
+            />
+            <small>同一模型的生成、测试和 Override 业务共享此额度，范围为 1–32。</small>
+          </label>
           <div className="settings-fields">
             <label>
               上下文窗口（Token）

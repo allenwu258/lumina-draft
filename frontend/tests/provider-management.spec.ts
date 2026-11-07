@@ -12,7 +12,6 @@ test('Provider configuration, model discovery, routing and presentation generati
   await page.getByLabel('显示名称', { exact: true }).fill('E2E Provider');
   await page.getByLabel('API 根地址', { exact: true }).fill(`${apiOrigin}/mock/v1`);
   await page.getByLabel('认证方式', { exact: true }).selectOption('none');
-  await page.getByLabel('Provider 总并发', { exact: true }).fill('4');
   await page.getByRole('button', { name: '保存 Provider', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'E2E Provider', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '获取可用模型', exact: true }).click();
@@ -34,7 +33,7 @@ test('Provider configuration, model discovery, routing and presentation generati
     .click();
   const editor = page.getByRole('dialog', { name: '模型设置' });
   await editor.getByLabel('上下文窗口（Token）').fill('64000');
-  await expect(editor.getByLabel('模型并发限制')).toHaveCount(0);
+  await editor.getByLabel('模型并发限制').fill('4');
   await editor.getByRole('button', { name: '保存模型信息' }).click();
   await expect(editor.getByText('模型信息已保存。')).toBeVisible();
   await editor.getByRole('button', { name: '添加档位' }).click();
@@ -183,7 +182,7 @@ test('Provider settings and dialogs fit a narrow screen with keyboard navigation
 });
 
 for (const concurrency of [1, 20]) {
-  test(`Page spinners match Provider total concurrency ${concurrency}`, async ({
+  test(`Page spinners match model concurrency ${concurrency}`, async ({
     page,
     request,
   }, testInfo) => {
@@ -193,13 +192,12 @@ for (const concurrency of [1, 20]) {
         name: `Capacity ${concurrency}`,
         base_url: `${apiOrigin}/mock/v1`,
         auth_mode: 'none',
-        max_concurrency: concurrency,
       },
     });
     expect(created.status()).toBe(201);
     const provider = await created.json();
     const added = await request.post(prefix + `/providers/${provider.id}/models`, {
-      data: { remote_model_id: `capacity-${concurrency}` },
+      data: { remote_model_id: `capacity-${concurrency}`, model_concurrency: concurrency },
     });
     expect(added.status()).toBe(201);
     const model = await added.json();
@@ -226,13 +224,17 @@ for (const concurrency of [1, 20]) {
       await page.getByRole('button', { name: '确认并生成 20 页', exact: true }).click();
       const rail = page.locator('.page-rail');
       await expect(rail.locator('.thumb-state.running .spin')).toHaveCount(concurrency);
-      await expect(rail.locator('.thumb-state.waiting_capacity')).toHaveCount(20 - concurrency);
+      await expect(rail.locator('.thumb-state.waiting_model_capacity')).toHaveCount(
+        20 - concurrency,
+      );
       await expect
         .poll(async () => (await (await request.get('/api/v1/mock/html-capacity')).json()).active)
         .toBe(concurrency);
       await page.reload();
       await expect(rail.locator('.thumb-state.running .spin')).toHaveCount(concurrency);
-      await expect(rail.locator('.thumb-state.waiting_capacity')).toHaveCount(20 - concurrency);
+      await expect(rail.locator('.thumb-state.waiting_model_capacity')).toHaveCount(
+        20 - concurrency,
+      );
       await page.screenshot({
         path: testInfo.outputPath(`capacity-${concurrency}.png`),
         fullPage: true,

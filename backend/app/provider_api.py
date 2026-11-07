@@ -32,7 +32,7 @@ from .db import (
 )
 from .provider_management import (
     ConfigurationError,
-    PROVIDER_LIMITER,
+    MODEL_LIMITER,
     endpoint_test_hash,
     get_model_tiers,
     latest_model_test,
@@ -65,7 +65,6 @@ class ProviderCreate(BaseModel):
     auth_mode: Literal["bearer", "none"] = "bearer"
     api_key: str | None = Field(default=None, max_length=500)
     allow_private_http: bool = False
-    max_concurrency: int = Field(default=3, ge=1, le=32)
     enabled: bool = True
 
     @field_validator("name", "base_url")
@@ -94,7 +93,6 @@ class ProviderPatch(BaseModel):
     base_url: str = Field(min_length=8, max_length=500)
     auth_mode: Literal["bearer", "none"]
     allow_private_http: bool
-    max_concurrency: int = Field(ge=1, le=32)
     enabled: bool
 
     @field_validator("name", "base_url")
@@ -126,10 +124,7 @@ class ModelCreate(BaseModel):
     display_name: str | None = Field(default=None, max_length=200)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    # Accepted for older clients; admission is controlled only by the Provider.
-    max_concurrency: int | None = Field(
-        default=None, ge=1, le=32, json_schema_extra={"deprecated": True}
-    )
+    model_concurrency: int = Field(default=1, ge=1, le=32)
     metadata_source: Literal["provider_api", "catalog", "manual", "unknown"] = "manual"
 
     @field_validator("remote_model_id", "display_name")
@@ -154,9 +149,7 @@ class ModelPatch(BaseModel):
     display_name: str = Field(min_length=1, max_length=200)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    max_concurrency: int | None = Field(
-        default=None, ge=1, le=32, json_schema_extra={"deprecated": True}
-    )
+    model_concurrency: int = Field(ge=1, le=32)
     enabled: bool
 
     @field_validator("remote_model_id", "display_name")
@@ -248,7 +241,7 @@ def _model_payload(
         "display_name": model.name,
         "context_window_tokens": model.context_window_tokens,
         "max_output_tokens": model.max_output_tokens,
-        "provider_concurrency": owner.max_concurrency,
+        "model_concurrency": model.max_concurrency,
         "capabilities": loads(model.capabilities_json),
         "capability_source": model.capability_source,
         "metadata_source": model.metadata_source,
@@ -305,7 +298,6 @@ def _provider_payload(
         "credential_version": credential.version if credential else None,
         "credential_store_available": credential_store_available,
         "allow_private_http": endpoint.allow_private_http,
-        "max_concurrency": owner.max_concurrency,
         "enabled": owner.enabled and endpoint.enabled,
         "revision": owner.revision,
         "endpoint_revision": endpoint.revision,
@@ -420,7 +412,6 @@ def create_provider(body: ProviderCreate):
                 code=f"provider-{uuid.uuid4()}",
                 name=body.name,
                 enabled=body.enabled,
-                max_concurrency=body.max_concurrency,
             )
             db.add(owner)
             db.flush()
@@ -503,7 +494,6 @@ def patch_provider(provider_id: str, body: ProviderPatch):
             endpoint.credential_ref = None
         owner.name = endpoint.name = body.name
         owner.enabled = endpoint.enabled = body.enabled
-        owner.max_concurrency = body.max_concurrency
         endpoint.protocol = body.protocol
         endpoint.base_url = url
         endpoint.auth_mode = body.auth_mode
@@ -512,7 +502,7 @@ def patch_provider(provider_id: str, body: ProviderPatch):
         endpoint.revision += 1
         db.flush()
         result = _provider_payload(db, owner, endpoint)
-    PROVIDER_LIMITER.provider_changed(provider_id)
+    MODEL_LIMITER.provider_changed(provider_id)
     for ref in revoked_refs:
         delete_secret(ref)
     return result
@@ -544,7 +534,7 @@ def archive_provider(provider_id: str, expected_revision: int = Query(ge=1)):
         owner.revision += 1
         endpoint.revision += 1
         result = {"id": owner.id, "archived": True, "revision": owner.revision}
-    PROVIDER_LIMITER.provider_changed(provider_id)
+    MODEL_LIMITER.provider_changed(provider_id)
     return result
 
 
@@ -646,6 +636,7 @@ def remove_credential(provider_id: str, expected_revision: int = Query(ge=1)):
         }
     for secret_ref in refs:
         delete_secret(secret_ref)
+    MODEL_LIMITER.provider_changed(provider_id)
     return result
 
 
@@ -693,6 +684,7 @@ def create_model(provider_id: str, body: ModelCreate):
             enabled=True,
             context_window_tokens=body.context_window_tokens,
             max_output_tokens=body.max_output_tokens,
+            max_concurrency=body.model_concurrency,
             capabilities_json=dumps(
                 {"text_input": True, "multimodal_input": True, "tool_calling": True}
             ),
@@ -758,14 +750,16 @@ def patch_model(model_id: str, body: ModelPatch):
             model.metadata_source = "manual"
         model.context_window_tokens = body.context_window_tokens
         model.max_output_tokens = body.max_output_tokens
-        # Preserve the legacy column for old snapshots; it no longer limits calls.
+        model.max_concurrency = body.model_concurrency
         model.enabled = body.enabled
         binding.remote_model_id = body.remote_model_id
         model.revision += 1
         binding.revision += 1
         owner.revision += 1
         db.flush()
-        return _model_payload(db, owner, endpoint, model)
+        result = _model_payload(db, owner, endpoint, model)
+    MODEL_LIMITER.model_changed(model_id)
+    return result
 
 
 @router.delete("/models/{model_id}")
@@ -786,7 +780,9 @@ def archive_model(model_id: str, expected_revision: int = Query(ge=1)):
         model.archived_at = utcnow()
         model.revision += 1
         owner.revision += 1
-        return {"id": model.id, "archived": True, "revision": model.revision}
+        result = {"id": model.id, "archived": True, "revision": model.revision}
+    MODEL_LIMITER.model_changed(model_id)
+    return result
 
 
 @router.put("/models/{model_id}/reasoning-tiers")
@@ -910,7 +906,7 @@ def list_business_routes():
                         "remote_model_id",
                         "reasoning_tier",
                         "reasoning_effort",
-                        "provider_concurrency",
+                        "model_concurrency",
                         "config_hash",
                     )
                 }
@@ -1043,50 +1039,49 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
     candidates = []
     try:
         async with asyncio.timeout(30):
-            async with PROVIDER_LIMITER.acquire(provider_id_snapshot):
-                with session_scope() as db:
-                    current_owner, current_endpoint = provider_endpoint(
-                        db, provider_id_snapshot
+            with session_scope() as db:
+                current_owner, current_endpoint = provider_endpoint(
+                    db, provider_id_snapshot
+                )
+                _check_revision(current_owner.revision, expected_revision)
+                if not current_owner.enabled or not current_endpoint.enabled:
+                    api_error("PROVIDER_DISABLED", "Provider 已停用")
+                if auth_mode == "bearer" and not db.scalar(
+                    select(ApiCredential.id).where(
+                        ApiCredential.endpoint_id == endpoint_id_snapshot,
+                        ApiCredential.secret_ref == secret_ref,
+                        ApiCredential.status == "active",
                     )
-                    _check_revision(current_owner.revision, expected_revision)
-                    if not current_owner.enabled or not current_endpoint.enabled:
-                        api_error("PROVIDER_DISABLED", "Provider 已停用")
-                    if auth_mode == "bearer" and not db.scalar(
-                        select(ApiCredential.id).where(
-                            ApiCredential.endpoint_id == endpoint_id_snapshot,
-                            ApiCredential.secret_ref == secret_ref,
-                            ApiCredential.status == "active",
+                ):
+                    api_error("CREDENTIAL_REVOKED", "API 凭据已撤销")
+            timeout = httpx.Timeout(25.0, connect=10.0)
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False
+            ) as client:
+                async with client.stream(
+                    "GET", f"{base_url}/models", headers=headers
+                ) as response:
+                    if response.status_code >= 300:
+                        code = {
+                            401: "PROVIDER_UNAUTHORIZED",
+                            403: "PROVIDER_FORBIDDEN",
+                            404: "MODEL_DISCOVERY_UNSUPPORTED",
+                        }.get(response.status_code, "MODEL_DISCOVERY_FAILED")
+                        api_error(
+                            code,
+                            "Provider 未能返回可用模型列表",
+                            422 if response.status_code < 500 else 502,
                         )
-                    ):
-                        api_error("CREDENTIAL_REVOKED", "API 凭据已撤销")
-                timeout = httpx.Timeout(25.0, connect=10.0)
-                async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=False
-                ) as client:
-                    async with client.stream(
-                        "GET", f"{base_url}/models", headers=headers
-                    ) as response:
-                        if response.status_code >= 300:
-                            code = {
-                                401: "PROVIDER_UNAUTHORIZED",
-                                403: "PROVIDER_FORBIDDEN",
-                                404: "MODEL_DISCOVERY_UNSUPPORTED",
-                            }.get(response.status_code, "MODEL_DISCOVERY_FAILED")
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > 2 * 1024 * 1024:
                             api_error(
-                                code,
-                                "Provider 未能返回可用模型列表",
-                                422 if response.status_code < 500 else 502,
+                                "MODEL_LIST_TOO_LARGE",
+                                "模型目录响应超过 2 MiB",
+                                502,
                             )
-                        body = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            body.extend(chunk)
-                            if len(body) > 2 * 1024 * 1024:
-                                api_error(
-                                    "MODEL_LIST_TOO_LARGE",
-                                    "模型目录响应超过 2 MiB",
-                                    502,
-                                )
-                        payload = json.loads(body)
+                    payload = json.loads(body)
         data = (
             payload.get("data", payload.get("models", []))
             if isinstance(payload, dict)
@@ -1131,6 +1126,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                     "max_output_tokens": (
                         output if type(output) is int and output > 0 else None
                     ),
+                    "model_concurrency": 1,
                     "metadata_source": (
                         "provider_api" if context or output else "unknown"
                     ),
@@ -1347,9 +1343,11 @@ def list_calls(
                     "model_id": row.model_id,
                     "model": row.model,
                     "status": row.status,
+                    "queue_reason": row.queue_reason,
                     "error_code": row.error_code,
                     "error": row.error,
                     "queue_duration_ms": row.queue_duration_ms,
+                    "admitted_at": row.admitted_at.isoformat() if row.admitted_at else None,
                     "time_to_first_token_ms": row.time_to_first_token_ms,
                     "total_duration_ms": row.total_duration_ms,
                     "started_at": row.started_at.isoformat(),
@@ -1374,6 +1372,7 @@ def get_call(call_id: str):
             "model_id": row.model_id,
             "model": row.model,
             "status": row.status,
+            "queue_reason": row.queue_reason,
             "error_code": row.error_code,
             "error": row.error,
             "usage": {
@@ -1382,6 +1381,7 @@ def get_call(call_id: str):
                 "total_tokens": row.total_tokens,
             },
             "queue_duration_ms": row.queue_duration_ms,
+            "admitted_at": row.admitted_at.isoformat() if row.admitted_at else None,
             "time_to_first_token_ms": row.time_to_first_token_ms,
             "total_duration_ms": row.total_duration_ms,
             "provider_response_id": row.provider_response_id,
