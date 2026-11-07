@@ -18,7 +18,7 @@ from .db import BusinessRoute, Event, GenerationSettingsRecord, IdempotencyRecor
 from .provider_management import ConfigurationError, resolve_all_routes, resolve_business_route, route_issues
 from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
-from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, scheduler
+from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, finalize_cancelled_run, scheduler
 from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettingsUpdate, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
 from .secrets import read_secret
 
@@ -399,11 +399,12 @@ async def cancel_run(run_id: str):
     with session_scope() as db:
         run = db.get(Run, run_id)
         if not run: fail("NOT_FOUND", "任务不存在", 404)
-        if run.status not in {"QUEUED", "RUNNING"}:
+        if run.status not in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
             return {"run_id": run_id, "status": run.status}
         presentation_id = run.presentation_id
         job = db.scalar(select(Job).where(Job.run_id == run_id))
         queued = run.status == "QUEUED"
+        already_requested = run.status == "CANCEL_REQUESTED"
         if queued:
             run.status = "CANCELLED"
             if job:
@@ -412,35 +413,23 @@ async def cancel_run(run_id: str):
             if p: p.status = "CANCELLED"
             for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status == "PENDING")).all():
                 page.status, page.error_code, page.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
-        else:
+        elif not already_requested:
             run.status = "CANCEL_REQUESTED"
     active = ACTIVE_RUNS.get(run_id)
     if active:
         active.cancel()
 
     if active and not queued:
-        await emit_event(presentation_id, "run.cancel_requested", {"run_id": run_id}, run_id)
+        if not already_requested:
+            await emit_event(presentation_id, "run.cancel_requested", {"run_id": run_id}, run_id)
         return {"run_id": run_id, "status": "CANCEL_REQUESTED"}
 
     if not queued:
-        # A RUNNING row without a local task cannot make progress in this process.
-        # Finalize it instead of leaving the UI stuck in CANCEL_REQUESTED.
+        await finalize_cancelled_run(run_id)
         with session_scope() as db:
             run = db.get(Run, run_id)
-            if run and run.status == "CANCEL_REQUESTED":
-                run.status = "CANCELLED"
-                if job := db.scalar(select(Job).where(Job.run_id == run_id)):
-                    job.status, job.finished_at = "CANCELLED", utcnow()
-                p = db.get(Presentation, presentation_id)
-                if p and p.status in {"PLANNING", "GENERATING"}:
-                    p.status = "CANCELLED"
-                for page in db.scalars(select(PageTask).where(
-                    PageTask.run_id == run_id,
-                    PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "WAITING_MODEL_CAPACITY", "VALIDATING"]),
-                )).all():
-                    page.status, page.error_code, page.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
-        await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
-        return {"run_id": run_id, "status": "CANCELLED"}
+            status = run.status if run else "CANCELLED"
+        return {"run_id": run_id, "status": status}
 
     await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
     return {"run_id": run_id, "status": "CANCELLED"}

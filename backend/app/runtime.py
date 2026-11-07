@@ -380,6 +380,48 @@ async def emit_event(presentation_id: str, event_type: str, payload: dict[str, A
     await EVENT_BUS.notify(presentation_id)
 
 
+async def finalize_cancelled_run(run_id: str) -> bool:
+    """Finalize a requested cancellation, including tasks cancelled before startup."""
+    with session_scope() as db:
+        run = db.get(Run, run_id)
+        if not run or run.status != "CANCEL_REQUESTED":
+            return False
+        presentation_id = run.presentation_id
+        run.status = "CANCELLED"
+        job = db.scalar(select(Job).where(Job.run_id == run_id))
+        if job and job.status in {"QUEUED", "RUNNING"}:
+            job.status, job.finished_at = "CANCELLED", utcnow()
+        presentation = db.get(Presentation, presentation_id)
+        if presentation and presentation.status in {"PLANNING", "GENERATING"}:
+            presentation.status = "CANCELLED"
+        for page in db.scalars(
+            select(PageTask).where(
+                PageTask.run_id == run_id,
+                PageTask.status.in_(
+                    [
+                        "RUNNING",
+                        "PENDING",
+                        "WAITING_CAPACITY",
+                        "WAITING_MODEL_CAPACITY",
+                        "VALIDATING",
+                    ]
+                ),
+            )
+        ).all():
+            page.status, page.error_code, page.error = (
+                "CANCELLED",
+                "PAGE_CANCELLED",
+                "页面生成已取消",
+            )
+    await emit_event(
+        presentation_id,
+        "run.cancelled",
+        {"run_id": run_id, "status": "CANCELLED"},
+        run_id,
+    )
+    return True
+
+
 async def emit_page_delta(presentation_id: str, task_id: str, delta: str, run_id: str | None = None) -> None:
     await emit_event(presentation_id, "page.html.delta", {"page_task_id": task_id, "delta": delta}, run_id)
 
@@ -533,23 +575,11 @@ async def scheduler(stop: asyncio.Event) -> None:
         route = routes.get("ppt_outline" if job.kind == "DIRECTOR" else "ppt_html") or {}
         return str(route.get("model_id") or snapshot.get("model_id") or "unknown")
 
-    async def finish_cancelled(run_id: str, presentation_id: str) -> None:
-        with session_scope() as db:
-            run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
-            if run and run.status not in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}:
-                run.status = "CANCELLED"
-            if presentation and presentation.status in {"PLANNING", "GENERATING"}:
-                presentation.status = "CANCELLED"
-            for page in db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status.in_(["RUNNING", "PENDING", "WAITING_CAPACITY", "WAITING_MODEL_CAPACITY", "VALIDATING"]))).all():
-                page.status = "CANCELLED"
-        await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
-
     async def execute(job_id: str, run_id: str, presentation_id: str, kind: str) -> None:
         try:
             await (run_director(presentation_id, run_id) if kind == "DIRECTOR" else run_generation(presentation_id, run_id))
         except asyncio.CancelledError:
-            if not stop.is_set():
-                await finish_cancelled(run_id, presentation_id)
+            await finalize_cancelled_run(run_id)
             raise
         except Exception as exc:
             message = str(exc)[:500]
@@ -645,10 +675,15 @@ async def scheduler(stop: asyncio.Event) -> None:
                 for task in active_tasks.values():
                     task.cancel()
                 await asyncio.gather(*active_tasks.values(), return_exceptions=True)
+                for run_id in active_tasks:
+                    await finalize_cancelled_run(run_id)
                 raise
             for task in done:
                 for run_id, current in list(active_tasks.items()):
                     if current is task:
+                        if task.cancelled():
+                            await finalize_cancelled_run(run_id)
+                        ACTIVE_RUNS.pop(run_id, None)
                         active_tasks.pop(run_id, None)
                         break
         else:

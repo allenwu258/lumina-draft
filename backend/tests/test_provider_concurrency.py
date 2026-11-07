@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from backend.app import provider_api, providers, runtime
-from backend.app.db import Job, LlmCall, PageTask, Presentation, Run, dumps, session_scope, utcnow
+from backend.app.db import Event, Job, LlmCall, PageTask, Presentation, Run, dumps, session_scope, utcnow
 from backend.app.provider_management import ModelLimiter
 from backend.tests.test_core import document, valid_html
 from backend.tests.test_provider_management import (
@@ -463,6 +463,80 @@ async def test_scheduler_runs_models_concurrently_and_fairly(managed_client, mon
 
 
 @pytest.mark.asyncio
+async def test_scheduler_finalizes_cancelled_run_before_execute_starts(
+    managed_client, monkeypatch
+):
+    with session_scope() as db:
+        presentation = Presentation(
+            user_request="cancel before startup",
+            status="PLANNING",
+            config_snapshot_json=dumps(
+                {"resolved_routes": {"ppt_outline": {"model_id": "model-a"}}}
+            ),
+        )
+        db.add(presentation)
+        db.flush()
+        run = Run(presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED")
+        db.add(run)
+        db.flush()
+        job = Job(
+            run_id=run.id,
+            presentation_id=presentation.id,
+            kind="DIRECTOR",
+            status="QUEUED",
+        )
+        db.add(job)
+        db.flush()
+        run_id, job_id = run.id, job.id
+
+    monkeypatch.setattr(
+        runtime,
+        "settings",
+        replace(runtime.settings, max_active_runs=1, scheduler_queue_timeout_seconds=60),
+    )
+    started = asyncio.Event()
+
+    async def unexpected_execution(presentation_id, current_run_id):
+        started.set()
+
+    monkeypatch.setattr(runtime, "run_director", unexpected_execution)
+    loop = asyncio.get_running_loop()
+    requested = asyncio.Event()
+
+    def cancel_before_first_step():
+        task = runtime.ACTIVE_RUNS.get(run_id)
+        if task is None:
+            loop.call_soon(cancel_before_first_step)
+            return
+        with session_scope() as db:
+            current = db.get(Run, run_id)
+            if current and current.status == "RUNNING":
+                current.status = "CANCEL_REQUESTED"
+        task.cancel()
+        requested.set()
+
+    loop.call_soon(cancel_before_first_step)
+    stop = asyncio.Event()
+    scheduler_task = asyncio.create_task(runtime.scheduler(stop))
+    try:
+        await asyncio.wait_for(requested.wait(), timeout=3)
+        await eventually(
+            lambda: _run_status(run_id) == "CANCELLED"
+            and _job_status(job_id) == "CANCELLED"
+        )
+        assert not started.is_set()
+        with session_scope() as db:
+            cancelled_events = db.scalars(
+                select(Event).where(Event.run_id == run_id, Event.type == "run.cancelled")
+            ).all()
+            assert len(cancelled_events) == 1
+    finally:
+        stop.set()
+        await asyncio.wait_for(scheduler_task, timeout=3)
+    assert run_id not in runtime.ACTIVE_RUNS
+
+
+@pytest.mark.asyncio
 async def test_scheduler_queue_timeout_marks_run_and_generation_pages(managed_client, monkeypatch):
     with session_scope() as db:
         presentation = Presentation(user_request="queued timeout", status="GENERATING")
@@ -560,6 +634,12 @@ def _job_status(job_id: str) -> str | None:
     with session_scope() as db:
         job = db.get(Job, job_id)
         return job.status if job else None
+
+
+def _run_status(run_id: str) -> str | None:
+    with session_scope() as db:
+        run = db.get(Run, run_id)
+        return run.status if run else None
 
 
 @pytest.mark.asyncio
