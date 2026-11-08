@@ -295,7 +295,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                   <tr>
                     <th>模型</th>
                     <th>上下文 / 输出</th>
-                    <th>共享并发</th>
+                    <th>模型并发</th>
                     <th>测试状态</th>
                     <th>操作</th>
                   </tr>
