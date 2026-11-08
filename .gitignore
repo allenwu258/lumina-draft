@@ -6,7 +6,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 data/
-docs/*
+docs/
 .env
 .env.*
 !.env.example
