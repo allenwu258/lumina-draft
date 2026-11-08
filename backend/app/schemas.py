@@ -14,6 +14,7 @@ class CreatePresentationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_request: str = Field(min_length=1, max_length=20_000)
     options: CreateOptions = Field(default_factory=CreateOptions)
+    entry_mode: Literal["agent", "ppt", "design", "image"] = "ppt"
 
     @field_validator("user_request")
     @classmethod

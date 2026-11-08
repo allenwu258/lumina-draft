@@ -12,7 +12,7 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
 from .config import settings
-from .db import ApiCredential, ApiEndpoint, ApiProvider, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, ProviderTest, Run, dumps, loads, session_scope, utcnow
+from .db import ApiCredential, ApiEndpoint, ApiProvider, Conversation, ConversationMessage, ConversationTurn, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, ProviderTest, Run, dumps, loads, session_scope, utcnow
 from .prompts import COMPOSER_PROMPT, DIRECTOR_PROMPT
 from .providers import ProviderError, stream_responses
 from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
@@ -419,11 +419,84 @@ async def finalize_cancelled_run(run_id: str) -> bool:
         {"run_id": run_id, "status": "CANCELLED"},
         run_id,
     )
+    sync_conversation_run(run_id, "CANCELLED")
     return True
 
 
 async def emit_page_delta(presentation_id: str, task_id: str, delta: str, run_id: str | None = None) -> None:
     await emit_event(presentation_id, "page.html.delta", {"page_task_id": task_id, "delta": delta}, run_id)
+
+
+def sync_conversation_run(run_id: str, status: str, *, error: str | None = None) -> None:
+    """Project a run transition onto the persisted conversation messages.
+
+    Conversation messages are the durable UI projection. Runtime events remain the live
+    transport, while this function makes refreshes and reopened works converge to the same
+    state even when a worker exits between two SSE events.
+    """
+    with session_scope() as db:
+        run = db.get(Run, run_id)
+        if not run:
+            return
+        presentation = db.get(Presentation, run.presentation_id)
+        if not presentation or not presentation.conversation_id:
+            return
+        conversation = db.get(Conversation, presentation.conversation_id)
+        turn = db.scalar(
+            select(ConversationTurn)
+            .where(ConversationTurn.presentation_id == presentation.id)
+            .order_by(ConversationTurn.turn_no.desc())
+        )
+        if not conversation:
+            return
+        message_status = {
+            "RUNNING": "STREAMING",
+            "QUEUED": "STREAMING",
+            "SUCCEEDED": "READY",
+            "READY": "READY",
+            "PARTIAL_FAILED": "FAILED",
+            "FAILED": "FAILED",
+            "CANCELLED": "CANCELLED",
+        }.get(status, "READY")
+        for message in db.scalars(
+            select(ConversationMessage).where(
+                ConversationMessage.conversation_id == conversation.id,
+                ConversationMessage.turn_id == (turn.id if turn else None),
+            )
+        ).all():
+            payload = loads(message.payload_json)
+            if payload.get("run_id") != run_id:
+                continue
+            payload["status"] = status
+            if error:
+                payload["error"] = error
+            message.status = message_status
+            message.payload_json = dumps(payload)
+        if turn:
+            turn.active_run_id = run_id if status in {"QUEUED", "RUNNING"} else None
+            turn.state = (
+                "GENERATING" if run.kind == "GENERATION" and status in {"QUEUED", "RUNNING"}
+                else "PLANNING" if run.kind == "DIRECTOR" and status in {"QUEUED", "RUNNING"}
+                else "WAITING_CONFIRMATION" if run.kind == "DIRECTOR" and status == "SUCCEEDED"
+                else "COMPLETED" if status in {"SUCCEEDED", "READY"}
+                else "FAILED" if status in {"FAILED", "PARTIAL_FAILED"}
+                else "CANCELLED" if status == "CANCELLED"
+                else turn.state
+            )
+            if status in {"QUEUED", "RUNNING"}:
+                turn.completed_at = None
+            elif status in {"FAILED", "PARTIAL_FAILED", "CANCELLED"} or (
+                run.kind == "GENERATION" and status in {"SUCCEEDED", "READY"}
+            ):
+                turn.completed_at = utcnow()
+        if status in {"SUCCEEDED", "READY"} and run.kind == "GENERATION":
+            conversation.state = "COMPLETED"
+        elif status in {"FAILED", "PARTIAL_FAILED"}:
+            conversation.state = "FAILED"
+        elif status == "CANCELLED":
+            conversation.state = "CANCELLED"
+        else:
+            conversation.state = "ACTIVE"
 
 
 class EventBus:
@@ -457,6 +530,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         run.status = "RUNNING"
         presentation.status = "PLANNING"
         request, options = presentation.user_request, loads(presentation.options_json)
+    sync_conversation_run(run_id, "RUNNING")
     await emit_event(presentation_id, "director.stream.reset", {"run_id": run_id}, run_id)
     await emit_event(presentation_id, "director.started", {"run_id": run_id}, run_id)
     try:
@@ -466,11 +540,33 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         normalized["slides"] = [s | {"slide_id": str(uuid.uuid4())} for s in normalized["slides"]]
         digest = canonical_hash(normalized)
         with session_scope() as db:
-            db.add(Outline(presentation_id=presentation_id, revision=1, content_hash=digest, document_json=dumps(normalized)))
+            outline = Outline(presentation_id=presentation_id, revision=1, content_hash=digest, document_json=dumps(normalized))
+            db.add(outline)
+            db.flush()
             run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
             run.status, presentation.status = "SUCCEEDED", "WAITING_CONFIRMATION"
+            if presentation and presentation.conversation_id:
+                turn = db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == presentation_id).order_by(ConversationTurn.turn_no.desc()))
+                conversation = db.get(Conversation, presentation.conversation_id)
+                if turn and conversation:
+                    activity = db.scalar(select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id, ConversationMessage.kind == "activity").order_by(ConversationMessage.seq.desc()))
+                    if activity:
+                        activity.status = "READY"
+                        activity.payload_json = dumps({"stage_code": "outline_ready", "label": "大纲已生成，等待确认", "run_id": run_id})
+                    seq = conversation.last_message_seq + 1
+                    db.add(ConversationMessage(
+                        conversation_id=conversation.id,
+                        turn_id=turn.id,
+                        seq=seq,
+                        role="assistant",
+                        kind="outline_card",
+                        status="READY",
+                        payload_json=dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": digest, "status": "READY"}),
+                    ))
+                    conversation.last_message_seq = seq
         await emit_event(presentation_id, "outline.ready", {"run_id": run_id, "outline": normalized, "content_hash": digest}, run_id)
         await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED", "kind": "DIRECTOR"}, run_id)
+        sync_conversation_run(run_id, "SUCCEEDED")
     except Exception as exc:
         message = str(exc)[:500]
         error_code = exc.code if isinstance(exc, ProviderError) else "DIRECTOR_FAILED"
@@ -478,6 +574,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
             run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
             if run: run.status, run.error_code, run.error = "FAILED", error_code, message
             if presentation: presentation.status = "FAILED"
+        sync_conversation_run(run_id, "FAILED", error=message)
         await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": error_code}, run_id)
 
 
@@ -526,6 +623,7 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
 
 async def run_generation(presentation_id: str, run_id: str) -> None:
     await emit_event(presentation_id, "generation.started", {"run_id": run_id}, run_id)
+    sync_conversation_run(run_id, "RUNNING")
     with session_scope() as db:
         tasks = list(db.scalars(select(PageTask).where(PageTask.run_id == run_id, PageTask.status != "SUCCEEDED").order_by(PageTask.page_number)).all())
     async with asyncio.TaskGroup() as group:
@@ -536,6 +634,7 @@ async def run_generation(presentation_id: str, run_id: str) -> None:
         run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
         success = all(s == "SUCCEEDED" for s in statuses)
         run.status, run.error_code, presentation.status = ("SUCCEEDED" if success else "PARTIAL_FAILED"), (None if success else "PAGE_GENERATION_FAILED"), ("READY" if success else "PARTIAL_FAILED")
+    sync_conversation_run(run_id, "SUCCEEDED" if success else "PARTIAL_FAILED")
     await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED" if success else "PARTIAL_FAILED", "kind": "GENERATION"}, run_id)
 
 
@@ -596,6 +695,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                     presentation.status = "FAILED" if kind == "DIRECTOR" else "PARTIAL_FAILED"
                 if job:
                     job.status, job.error_code, job.error, job.finished_at = "FAILED", code, message, utcnow()
+            sync_conversation_run(run_id, "FAILED", error=message)
             await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": code}, run_id)
         finally:
             ACTIVE_RUNS.pop(run_id, None)
@@ -671,6 +771,7 @@ async def scheduler(stop: asyncio.Event) -> None:
                         for page in db.scalars(select(PageTask).where(PageTask.run_id == run.id, PageTask.status == "PENDING")).all():
                             page.status, page.error_code, page.error = "FAILED", "JOB_QUEUE_TIMEOUT", "等待任务调度超时"
         for job in expired:
+            sync_conversation_run(job.run_id, "FAILED", error="等待任务调度超时")
             await emit_event(job.presentation_id, "job.queue_timeout", {"job_id": job.id, "run_id": job.run_id, "error_code": "JOB_QUEUE_TIMEOUT"}, job.run_id)
         if stop.is_set():
             continue

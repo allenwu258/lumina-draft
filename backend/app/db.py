@@ -167,6 +167,50 @@ class GenerationSettingsRecord(Base):
     revision: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    entry_mode: Mapped[str] = mapped_column(String(20), default="ppt", index=True)
+    interaction_mode: Mapped[str] = mapped_column(String(20), default="single_turn")
+    state: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
+    latest_turn_no: Mapped[int] = mapped_column(Integer, default=1)
+    last_message_seq: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ConversationTurn(Base):
+    __tablename__ = "conversation_turns"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    turn_no: Mapped[int] = mapped_column(Integer, default=1)
+    input_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    presentation_id: Mapped[str | None] = mapped_column(ForeignKey("presentations.id"), nullable=True, index=True)
+    workflow_code: Mapped[str] = mapped_column(String(40), default="ppt_create")
+    state: Mapped[str] = mapped_column(String(30), default="QUEUED")
+    active_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("conversation_id", "turn_no", name="uq_conversation_turn_no"),)
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True, index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str] = mapped_column(String(20))
+    kind: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="READY")
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    payload_schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (UniqueConstraint("conversation_id", "seq", name="uq_conversation_message_seq"),)
+
+
 class Presentation(Base):
     __tablename__ = "presentations"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -174,6 +218,9 @@ class Presentation(Base):
     options_json: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(40), default="PLANNING", index=True)
     config_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True, index=True)
+    entry_mode: Mapped[str] = mapped_column(String(20), default="ppt", index=True)
+    workflow_code: Mapped[str] = mapped_column(String(40), default="ppt_create")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -324,6 +371,7 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
     migrated_reasoning = _upgrade_existing_schema()
     with SessionLocal() as db:
+        _backfill_conversations(db)
         if db.get(GenerationSettingsRecord, "default") is None:
             db.add(GenerationSettingsRecord(id="default", reasoning_effort="high"))
             db.commit()
@@ -386,6 +434,106 @@ def init_db() -> None:
     _migrate_model_concurrency()
 
 
+def _backfill_conversations(db) -> None:
+    """Give presentations created before chat persistence a stable conversation projection.
+
+    The migration is intentionally derived from the existing presentation, outline and run
+    records. It never rewrites the presentation content and is safe to run repeatedly because
+    presentations with a conversation id are skipped.
+    """
+    presentations = db.scalars(
+        select(Presentation).where(Presentation.conversation_id.is_(None)).order_by(Presentation.created_at)
+    ).all()
+    if not presentations:
+        return
+    for presentation in presentations:
+        entry_mode = getattr(presentation, "entry_mode", None) or "ppt"
+        conversation = Conversation(
+            entry_mode=entry_mode,
+            interaction_mode="single_turn",
+            state=(
+                "COMPLETED" if presentation.status == "READY"
+                else "FAILED" if presentation.status in {"FAILED", "PARTIAL_FAILED"}
+                else "CANCELLED" if presentation.status == "CANCELLED"
+                else "ACTIVE"
+            ),
+        )
+        db.add(conversation)
+        db.flush()
+        presentation.conversation_id = conversation.id
+        runs = db.scalars(
+            select(Run).where(Run.presentation_id == presentation.id).order_by(Run.created_at.desc())
+        ).all()
+        latest_run = runs[0] if runs else None
+        turn = ConversationTurn(
+            conversation_id=conversation.id,
+            turn_no=1,
+            presentation_id=presentation.id,
+            workflow_code=getattr(presentation, "workflow_code", None) or "ppt_create",
+            state=conversation.state,
+            active_run_id=latest_run.id if latest_run and latest_run.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"} else None,
+        )
+        db.add(turn)
+        db.flush()
+        seq = 1
+        user_message = ConversationMessage(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            seq=seq,
+            role="user",
+            kind="text",
+            status="READY",
+            body_text=presentation.user_request,
+            payload_json=dumps({"entry_mode": entry_mode}),
+        )
+        db.add(user_message)
+        turn.input_message_id = user_message.id
+        seq += 1
+        outline = db.scalar(
+            select(Outline).where(Outline.presentation_id == presentation.id).order_by(Outline.revision.desc())
+        )
+        if outline:
+            db.add(ConversationMessage(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                seq=seq,
+                role="assistant",
+                kind="outline_card",
+                status="READY",
+                payload_json=dumps({
+                    "outline_id": outline.id,
+                    "revision": outline.revision,
+                    "content_hash": outline.content_hash,
+                    "status": "CONFIRMED" if outline.confirmed else "READY",
+                }),
+            ))
+            seq += 1
+        if latest_run and latest_run.kind == "GENERATION":
+            db.add(ConversationMessage(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                seq=seq,
+                role="assistant",
+                kind="generation_card",
+                status=(
+                    "READY" if latest_run.status == "SUCCEEDED"
+                    else "FAILED" if latest_run.status in {"FAILED", "PARTIAL_FAILED"}
+                    else "CANCELLED" if latest_run.status == "CANCELLED"
+                    else "STREAMING"
+                ),
+                payload_json=dumps({
+                    "run_id": latest_run.id,
+                    "outline_id": outline.id if outline else None,
+                    "page_count": db.query(PageTask).filter(PageTask.presentation_id == presentation.id).count(),
+                    "status": latest_run.status,
+                }),
+            ))
+            seq += 1
+        conversation.last_message_seq = seq - 1
+        conversation.latest_turn_no = 1
+    db.flush()
+
+
 def _upgrade_existing_schema() -> bool:
     if not settings.db_url.startswith("sqlite"):
         return False
@@ -421,6 +569,11 @@ def _upgrade_existing_schema() -> bool:
             "queue_duration_ms": "INTEGER NULL",
         },
         "runs": {"error_code": "VARCHAR(80) NULL"},
+        "presentations": {
+            "conversation_id": "VARCHAR(36) NULL",
+            "entry_mode": "VARCHAR(20) NOT NULL DEFAULT 'ppt'",
+            "workflow_code": "VARCHAR(40) NOT NULL DEFAULT 'ppt_create'",
+        },
         "llm_calls": {
             "error_code": "VARCHAR(80) NULL",
             "provider_id": "VARCHAR(36) NULL",

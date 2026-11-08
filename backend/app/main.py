@@ -14,11 +14,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm.exc import StaleDataError
 
-from .db import BusinessRoute, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
+from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
 from .provider_management import ConfigurationError, resolve_all_routes, resolve_business_route, route_issues
 from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
-from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, finalize_cancelled_run, scheduler
+from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, finalize_cancelled_run, scheduler, sync_conversation_run
 from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettingsUpdate, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
 from .secrets import read_secret
 
@@ -75,7 +75,24 @@ def fail(code: str, message: str, status: int = 409):
 
 
 def presentation_dict(p: Presentation) -> dict:
-    return {"id": p.id, "user_request": p.user_request, "options": loads(p.options_json), "status": p.status, "created_at": p.created_at.isoformat(), "updated_at": p.updated_at.isoformat()}
+    return {"id": p.id, "user_request": p.user_request, "options": loads(p.options_json), "status": p.status, "entry_mode": getattr(p, "entry_mode", "ppt"), "workflow_code": getattr(p, "workflow_code", "ppt_create"), "conversation_id": getattr(p, "conversation_id", None), "created_at": p.created_at.isoformat(), "updated_at": p.updated_at.isoformat()}
+
+
+def message_dict(message: ConversationMessage) -> dict:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "turn_id": message.turn_id,
+        "seq": message.seq,
+        "role": message.role,
+        "kind": message.kind,
+        "status": message.status,
+        "body_text": message.body_text,
+        "payload": loads(message.payload_json),
+        "payload_schema_version": message.payload_schema_version,
+        "created_at": message.created_at.isoformat(),
+        "updated_at": message.updated_at.isoformat(),
+    }
 
 
 def outline_dict(o: Outline | None) -> dict | None:
@@ -104,6 +121,38 @@ def job_dict(job: Job | None) -> dict | None:
 
 def page_dict(p: PageTask) -> dict:
     return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt}
+
+
+def conversation_projection(db, presentation: Presentation, outline: Outline | None, runs: list[Run]) -> dict:
+    conversation = db.get(Conversation, presentation.conversation_id) if getattr(presentation, "conversation_id", None) else None
+    messages = []
+    if conversation:
+        messages = [message_dict(item) for item in db.scalars(
+            select(ConversationMessage)
+            .where(ConversationMessage.conversation_id == conversation.id)
+            .order_by(ConversationMessage.seq)
+        ).all()]
+    confirmed = bool(outline and outline.confirmed)
+    has_generation = any(run.kind == "GENERATION" for run in runs)
+    status = presentation.status
+    return {
+        "id": conversation.id if conversation else None,
+        "entry_mode": getattr(presentation, "entry_mode", "ppt"),
+        "interaction_mode": conversation.interaction_mode if conversation else "single_turn",
+        "state": conversation.state if conversation else "ACTIVE",
+        "messages": messages,
+        "allowed_actions": {
+            "send_message": False,
+            "edit_outline": status == "WAITING_CONFIRMATION",
+            "confirm_outline": status == "WAITING_CONFIRMATION" and not confirmed,
+            "cancel_run": status in {"PLANNING", "GENERATING"},
+            "retry_run": status in {"FAILED", "PARTIAL_FAILED", "CANCELLED"},
+        },
+        "allowed_views": {
+            "outline": True,
+            "generation": confirmed and has_generation,
+        },
+    }
 
 
 def scheduled_model_id(snapshot: dict[str, Any], kind: str) -> str | None:
@@ -201,10 +250,55 @@ def list_presentations():
         return {"items": [presentation_dict(p) for p in db.scalars(select(Presentation).order_by(Presentation.updated_at.desc()).limit(100)).all()]}
 
 
+@app.get(f"{API}/conversations/{{conversation_id}}")
+def get_conversation(conversation_id: str):
+    """Read the durable conversation projection independently from a workbench view."""
+    with session_scope() as db:
+        conversation = db.get(Conversation, conversation_id)
+        if not conversation:
+            fail("NOT_FOUND", "会话不存在", 404)
+        turns = db.scalars(
+            select(ConversationTurn)
+            .where(ConversationTurn.conversation_id == conversation_id)
+            .order_by(ConversationTurn.turn_no)
+        ).all()
+        messages = db.scalars(
+            select(ConversationMessage)
+            .where(ConversationMessage.conversation_id == conversation_id)
+            .order_by(ConversationMessage.seq)
+        ).all()
+        return {
+            "id": conversation.id,
+            "entry_mode": conversation.entry_mode,
+            "interaction_mode": conversation.interaction_mode,
+            "state": conversation.state,
+            "latest_turn_no": conversation.latest_turn_no,
+            "last_message_seq": conversation.last_message_seq,
+            "turns": [
+                {
+                    "id": turn.id,
+                    "turn_no": turn.turn_no,
+                    "presentation_id": turn.presentation_id,
+                    "workflow_code": turn.workflow_code,
+                    "state": turn.state,
+                    "active_run_id": turn.active_run_id,
+                    "created_at": turn.created_at.isoformat(),
+                    "completed_at": turn.completed_at.isoformat() if turn.completed_at else None,
+                }
+                for turn in turns
+            ],
+            "messages": [message_dict(message) for message in messages],
+            "created_at": conversation.created_at.isoformat(),
+            "updated_at": conversation.updated_at.isoformat(),
+        }
+
+
 @app.post(f"{API}/presentations", status_code=202)
 async def create_presentation(body: CreatePresentationRequest, idempotency_key: str | None = Header(default=None, max_length=200)):
     request_hash = canonical_hash(body.model_dump())
     with session_scope() as db:
+        if body.entry_mode in {"design", "image"}:
+            fail("WORKFLOW_NOT_AVAILABLE", "该工作流尚未开放，当前可使用 Agent 模式或 PPT 生成", 409)
         if idempotency_key:
             prior = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.scope == "presentations.create", IdempotencyRecord.key == idempotency_key))
             if prior:
@@ -245,7 +339,18 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             "reasoning_effort": generation_settings.reasoning_effort,
             "resolved_routes": resolved_routes,
         }
-        presentation = Presentation(user_request=body.user_request, options_json=dumps(body.options.model_dump(exclude_none=True)), status="PLANNING", config_snapshot_json=dumps(snapshot))
+        conversation = Conversation(entry_mode=body.entry_mode, interaction_mode="single_turn", state="ACTIVE")
+        db.add(conversation)
+        db.flush()
+        presentation = Presentation(
+            user_request=body.user_request,
+            options_json=dumps(body.options.model_dump(exclude_none=True)),
+            status="PLANNING",
+            config_snapshot_json=dumps(snapshot),
+            conversation_id=conversation.id,
+            entry_mode=body.entry_mode,
+            workflow_code="ppt_create",
+        )
         db.add(presentation)
         db.flush()
         run = Run(presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED")
@@ -258,8 +363,43 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             model_id=scheduled_model_id(snapshot, "DIRECTOR"),
             status="QUEUED",
         ))
-        pid, rid = presentation.id, run.id
-        response = {"presentation_id": pid, "run_id": rid, "status": "PLANNING"}
+        turn = ConversationTurn(
+            conversation_id=conversation.id,
+            turn_no=1,
+            presentation_id=presentation.id,
+            workflow_code="ppt_create",
+            state="QUEUED",
+            active_run_id=run.id,
+        )
+        db.add(turn)
+        db.flush()
+        user_message = ConversationMessage(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            seq=1,
+            role="user",
+            kind="text",
+            status="READY",
+            body_text=body.user_request,
+            payload_json=dumps({"entry_mode": body.entry_mode, "language": body.options.language}),
+        )
+        activity_message = ConversationMessage(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            seq=2,
+            role="assistant",
+            kind="activity",
+            status="STREAMING",
+            body_text=None,
+            payload_json=dumps({"stage_code": "director", "label": "正在理解需求并整理大纲", "run_id": run.id}),
+        )
+        db.add_all([user_message, activity_message])
+        db.flush()
+        turn.input_message_id = user_message.id
+        conversation.last_message_seq = 2
+        conversation.latest_turn_no = 1
+        pid, rid, cid, tid = presentation.id, run.id, conversation.id, turn.id
+        response = {"presentation_id": pid, "conversation_id": cid, "turn_id": tid, "run_id": rid, "entry_mode": body.entry_mode, "status": "PLANNING"}
         if idempotency_key:
             db.add(IdempotencyRecord(scope="presentations.create", key=idempotency_key, request_hash=request_hash, response_json=dumps(response)))
     await emit_event(pid, "presentation.created", {"presentation_id": pid, "run_id": rid}, rid)
@@ -305,7 +445,8 @@ def get_presentation(presentation_id: str):
                 channel = payload.get("channel")
                 if channel in director_stream:
                     director_stream[channel] += payload.get("delta", "")
-        return {"presentation": presentation_dict(p), "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
+        conversation = conversation_projection(db, p, outline, runs)
+        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")
@@ -347,6 +488,13 @@ async def update_outline(presentation_id: str, body: UpdateOutlineRequest):
         outline = Outline(presentation_id=p.id, revision=old.revision+1, content_hash=canonical_hash(document), document_json=dumps(document))
         db.add(outline)
         db.flush()
+        if p.conversation_id:
+            card = db.scalar(select(ConversationMessage).where(
+                ConversationMessage.conversation_id == p.conversation_id,
+                ConversationMessage.kind == "outline_card",
+            ).order_by(ConversationMessage.seq.desc()))
+            if card:
+                card.payload_json = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "READY"})
         result = outline_dict(outline)
     await emit_event(presentation_id, "outline.updated", {"outline_id": result["id"], "content_hash": result["content_hash"]})
     return result
@@ -378,6 +526,39 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
             model_id=scheduled_model_id(snapshot, "GENERATION"),
             status="QUEUED",
         ))
+        if p.conversation_id:
+            conversation = db.get(Conversation, p.conversation_id)
+            turn = db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == p.id).order_by(ConversationTurn.turn_no.desc()))
+            if conversation and turn:
+                card = db.scalar(select(ConversationMessage).where(
+                    ConversationMessage.conversation_id == conversation.id,
+                    ConversationMessage.kind == "outline_card",
+                ).order_by(ConversationMessage.seq.desc()))
+                if card:
+                    card.payload_json = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "CONFIRMED"})
+                next_seq = conversation.last_message_seq + 1
+                db.add(ConversationMessage(
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    seq=next_seq,
+                    role="user",
+                    kind="action",
+                    status="READY",
+                    payload_json=dumps({"action": "confirm_outline", "outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash}),
+                ))
+                db.add(ConversationMessage(
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    seq=next_seq + 1,
+                    role="assistant",
+                    kind="generation_card",
+                    status="STREAMING",
+                    payload_json=dumps({"run_id": run.id, "outline_id": outline.id, "page_count": len(document["slides"]), "status": "QUEUED"}),
+                ))
+                conversation.last_message_seq = next_seq + 1
+                turn.active_run_id = run.id
+                turn.state = "GENERATING"
+                turn.completed_at = None
         rid, count = run.id, len(document["slides"])
     await emit_event(presentation_id, "generation.queued", {"run_id": rid, "page_count": count}, rid)
     await emit_event(presentation_id, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
@@ -401,6 +582,7 @@ async def retry_presentation(presentation_id: str):
                 kind="DIRECTOR",
                 model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
             ))
+            retry_kind = "activity"
         elif p.status in {"PARTIAL_FAILED", "CANCELLED"} and previous.kind == "GENERATION":
             run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")
             db.add(run)
@@ -415,8 +597,39 @@ async def retry_presentation(presentation_id: str):
                 kind="GENERATION",
                 model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
             ))
+            retry_kind = "generation_card"
         else:
             fail("INVALID_STATE", "当前没有可以重试的任务")
+        if p.conversation_id:
+            conversation = db.get(Conversation, p.conversation_id)
+            turn = db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == p.id).order_by(ConversationTurn.turn_no.desc()))
+            if conversation and turn:
+                seq = conversation.last_message_seq + 1
+                db.add(ConversationMessage(
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    seq=seq,
+                    role="user",
+                    kind="action",
+                    status="READY",
+                    payload_json=dumps({"action": "retry_run", "previous_run_id": previous.id, "run_id": run.id}),
+                ))
+                payload = {"run_id": run.id, "status": "QUEUED", "stage_code": "director", "label": "正在重试大纲生成"}
+                if retry_kind == "generation_card":
+                    payload = {"run_id": run.id, "status": "QUEUED", "page_count": db.query(PageTask).filter(PageTask.presentation_id == p.id).count()}
+                db.add(ConversationMessage(
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    seq=seq + 1,
+                    role="assistant",
+                    kind=retry_kind,
+                    status="STREAMING",
+                    payload_json=dumps(payload),
+                ))
+                conversation.last_message_seq = seq + 1
+                turn.active_run_id = run.id
+                turn.state = "PLANNING" if retry_kind == "activity" else "GENERATING"
+                turn.completed_at = None
         rid, kind = run.id, run.kind
     await emit_event(presentation_id, "run.queued", {"run_id": rid, "kind": kind}, rid)
     await emit_event(presentation_id, "job.waiting_scheduler", {"run_id": rid, "queue_reason": "SCHEDULER"}, rid)
@@ -460,6 +673,7 @@ async def cancel_run(run_id: str):
             status = run.status if run else "CANCELLED"
         return {"run_id": run_id, "status": status}
 
+    sync_conversation_run(run_id, "CANCELLED")
     await emit_event(presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
     return {"run_id": run_id, "status": "CANCELLED"}
 

@@ -16,7 +16,7 @@ os.environ.pop("DS_API_KEY", None)
 from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
-from backend.app.db import engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
+from backend.app.db import Conversation, ConversationMessage, engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -147,6 +147,34 @@ def test_end_to_end_and_idempotency(client):
     assert "sandbox" in response.headers["content-security-policy"]
     assert client.get("/api/v1/settings/llm/default").json()["credential_configured"]
     assert "secret" not in client.get("/api/v1/settings/llm/default").text
+
+
+def test_entry_modes_and_persisted_special_messages(client):
+    unavailable = client.post("/api/v1/presentations", json={"user_request": "Design a poster", "entry_mode": "design"})
+    assert unavailable.status_code == 409
+    assert unavailable.json()["detail"]["code"] == "WORKFLOW_NOT_AVAILABLE"
+    unavailable = client.post("/api/v1/presentations", json={"user_request": "Create an image", "entry_mode": "image"})
+    assert unavailable.status_code == 409
+
+    created = client.post("/api/v1/presentations", json={"user_request": "Create an agent deck", "entry_mode": "agent"})
+    assert created.status_code == 202
+    pid = created.json()["presentation_id"]
+    snapshot = wait_status(client, pid, {"WAITING_CONFIRMATION", "FAILED"})
+    assert snapshot["presentation"]["entry_mode"] == "agent"
+    assert snapshot["conversation"]["entry_mode"] == "agent"
+    assert [message["kind"] for message in snapshot["conversation"]["messages"]] == ["text", "activity", "outline_card"]
+    assert client.get(f"/api/v1/conversations/{snapshot['conversation']['id']}").json()["last_message_seq"] == 3
+
+    outline = snapshot["latest_outline"]
+    confirmed = client.post(f"/api/v1/presentations/{pid}/confirm", json={"outline_id": outline["id"], "content_hash": outline["content_hash"]})
+    assert confirmed.status_code == 202
+    snapshot = wait_status(client, pid, {"READY", "PARTIAL_FAILED"})
+    kinds = [message["kind"] for message in snapshot["conversation"]["messages"]]
+    assert kinds[-2:] == ["action", "generation_card"]
+    assert snapshot["conversation"]["messages"][-1]["status"] == "READY"
+    conversation = client.get(f"/api/v1/conversations/{snapshot['conversation']['id']}").json()
+    assert conversation["turns"][0]["state"] == "COMPLETED"
+    assert conversation["turns"][0]["completed_at"] is not None
 
 
 @pytest.mark.asyncio

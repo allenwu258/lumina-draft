@@ -99,6 +99,12 @@ test('Provider configuration, model discovery, routing and presentation generati
   await page.screenshot({ path: testInfo.outputPath('outline-full.png'), fullPage: true });
   await page.getByRole('button', { name: '确认并生成 1 页', exact: true }).click();
   await expect(page.getByText('页面已就绪', { exact: true })).toBeVisible();
+  const generationTab = page.getByRole('tab', { name: /页面生成/ });
+  await expect(generationTab).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: /大纲/ }).click();
+  await expect(page.locator('.outline-title-input').first()).toHaveAttribute('readonly', '');
+  await generationTab.click();
+  await expect(generationTab).toHaveAttribute('aria-selected', 'true');
   await page.getByRole('button', { name: '模型设置', exact: true }).click();
   await page.getByRole('button', { name: '调用记录', exact: true }).click();
   const calls = page.locator('.calls-card tbody');
@@ -112,6 +118,22 @@ test('Provider configuration, model discovery, routing and presentation generati
   await expect(detail.locator('pre')).not.toContainText('credential_ref');
   await detail.getByRole('button', { name: '关闭', exact: true }).click();
   expect(errors).toEqual([]);
+});
+
+test('Entry mode routing keeps unavailable workflows visible but blocked', async ({ page }) => {
+  await page.goto('/');
+  const mode = page.locator('.entry-mode-trigger');
+  await mode.click();
+  const menu = page.getByRole('menu', { name: '选择创作模式' });
+  await expect(menu.getByRole('menuitem', { name: /Agent 模式/ })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: /设计生成/ })).toHaveAttribute('aria-disabled', 'true');
+  await menu.getByRole('menuitem', { name: /Agent 模式/ }).click();
+  await expect(page.getByPlaceholder(/步骤化/)).toBeVisible();
+  await page.locator('.composer textarea').fill('用 Agent 方式梳理一个产品发布会');
+  await expect(page.getByRole('button', { name: '开始创作', exact: true })).toBeEnabled();
+  await mode.click();
+  await expect(menu.getByRole('menuitem', { name: /图片生成/ })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '开始创作', exact: true })).toBeEnabled();
 });
 
 test('API key input is write-only and cleared after save', async ({ page }) => {
@@ -218,7 +240,7 @@ for (const concurrency of [1, 20]) {
     await request.post('/api/v1/mock/html-capacity', { data: { hold: true } });
     try {
       await page.goto('/');
-      await page.getByRole('button', { name: '新建演示文稿' }).click();
+      await page.locator('.new-button').click();
       await page.locator('.composer textarea').fill('concurrency-check');
       await page.getByRole('button', { name: '生成说明书', exact: true }).click();
       await page.getByRole('button', { name: '确认并生成 20 页', exact: true }).click();
