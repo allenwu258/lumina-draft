@@ -3,3 +3,7 @@
 .generation-layout .canvas-column{min-width:0}.generation-layout .page-rail{position:relative}.rail-resize-handle{position:absolute;z-index:3;top:0;right:-17px;bottom:0;width:8px;cursor:col-resize;touch-action:none}.rail-resize-handle::after{content:"";position:absolute;top:0;bottom:0;left:3px;width:2px;background:transparent;transition:background .15s}.rail-resize-handle:hover::after,.rail-resize-handle:active::after{background:#8a77dc}
 @media(max-width:900px){.rail-resize-handle{display:none}}
 .composer{overflow:visible}
+.history-item .history-mode-icon{flex:0 0 20px}
+.generation-layout{min-width:0}
+.canvas-stage{min-width:0;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+.slide-viewport{min-width:0;min-height:0;contain:paint}

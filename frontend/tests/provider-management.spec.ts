@@ -99,8 +99,38 @@ test('Provider configuration, model discovery, routing and presentation generati
   await page.screenshot({ path: testInfo.outputPath('outline-full.png'), fullPage: true });
   await page.getByRole('button', { name: '确认并生成 1 页', exact: true }).click();
   await expect(page.getByText('页面已就绪', { exact: true })).toBeVisible();
+  const historyItem = page.locator('.history-item').first();
+  const historyIcon = await historyItem.locator('.history-mode-icon').boundingBox();
+  const historyTitle = await historyItem.locator('span').last().boundingBox();
+  expect(historyIcon).not.toBeNull();
+  expect(historyTitle).not.toBeNull();
+  expect(historyTitle!.x - (historyIcon!.x + historyIcon!.width)).toBeLessThanOrEqual(16);
   const generationTab = page.getByRole('tab', { name: /页面生成/ });
   await expect(generationTab).toHaveAttribute('aria-selected', 'true');
+  const slideFrame = page.locator('.canvas-stage iframe.slide-frame');
+  await expect(slideFrame).toBeVisible();
+  for (const viewport of [
+    { width: 1440, height: 1000 },
+    { width: 1793, height: 1100 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect
+      .poll(async () => {
+        const frame = await slideFrame.boundingBox();
+        const stage = await page.locator('.canvas-stage').boundingBox();
+        return Boolean(
+          frame &&
+            stage &&
+            frame.x >= stage.x - 1 &&
+            frame.y >= stage.y - 1 &&
+            frame.x + frame.width <= stage.x + stage.width + 1 &&
+            frame.y + frame.height <= stage.y + stage.height + 1,
+        );
+      })
+      .toBe(true);
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole('tab', { name: /大纲/ }).click();
   await expect(page.locator('.outline-title-input').first()).toHaveAttribute('readonly', '');
   await generationTab.click();
