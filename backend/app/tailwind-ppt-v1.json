@@ -1,0 +1,24 @@
+{
+  "profile": "tailwind-ppt-v1",
+  "classes": [
+    "absolute", "relative", "inset-0", "top-0", "right-0", "bottom-0", "left-0", "z-10",
+    "block", "inline-block", "inline-flex", "flex", "grid", "hidden", "flex-row", "flex-col", "flex-wrap",
+    "items-start", "items-center", "items-end", "justify-start", "justify-center", "justify-between", "justify-end",
+    "grid-cols-1", "grid-cols-2", "grid-cols-3", "grid-cols-4",
+    "gap-1", "gap-2", "gap-3", "gap-4", "gap-5", "gap-6", "gap-8", "gap-10", "gap-12",
+    "w-full", "w-1/2", "h-full", "h-1/2", "min-w-0", "max-w-full", "shrink-0",
+    "overflow-hidden", "overflow-auto",
+    "p-0", "p-1", "p-2", "p-3", "p-4", "p-5", "p-6", "p-8", "p-10",
+    "px-2", "px-3", "px-4", "px-5", "px-6", "py-1", "py-2", "py-3", "py-4", "py-5", "py-6",
+    "pt-2", "pt-3", "pt-4", "pb-2", "pb-3", "pb-4",
+    "mt-2", "mt-3", "mt-4", "mt-6", "mt-8", "mb-2", "mb-3", "mb-4", "mb-6", "mb-8", "ml-auto", "mx-auto",
+    "rounded-sm", "rounded-md", "rounded-lg", "rounded-xl", "rounded-full",
+    "border", "border-2", "border-transparent",
+    "text-left", "text-center", "text-right", "text-xs", "text-sm", "text-base", "text-lg", "text-xl", "text-2xl", "text-3xl", "text-4xl",
+    "text-ppt-title", "text-ppt-body", "text-ppt-caption",
+    "font-normal", "font-medium", "font-semibold", "font-bold", "font-ppt",
+    "leading-none", "leading-tight", "leading-snug", "leading-normal", "leading-relaxed",
+    "whitespace-nowrap", "whitespace-pre-wrap", "break-words", "uppercase", "tracking-wide", "opacity-50", "opacity-75", "shadow-sm", "shadow-md",
+    "bg-ppt-background", "bg-ppt-surface", "bg-ppt-primary", "text-ppt-text", "text-ppt-muted", "text-ppt-primary", "border-ppt-primary"
+  ]
+}

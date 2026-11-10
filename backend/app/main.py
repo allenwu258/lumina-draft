@@ -680,11 +680,18 @@ async def cancel_run(run_id: str):
 
 @app.get(f"{API}/page-tasks/{{task_id}}/html")
 def page_html(task_id: str):
+    return _page_html_response(task_id)
+
+
+def _page_html_response(task_id: str, *, include_tailwind: bool = False):
     with session_scope() as db:
         page = db.get(PageTask, task_id)
         if not page: fail("NOT_FOUND", "页面不存在", 404)
         if page.status != "SUCCEEDED" or not page.html: fail("PAGE_NOT_READY", "页面尚未完成")
         html = page.html
+    if include_tailwind:
+        from .tailwind_profile import preview_html
+        html = preview_html(html)
     return HTMLResponse(html, headers={"Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self' http://127.0.0.1:5173 http://localhost:5173", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
@@ -705,7 +712,7 @@ def preview(task_id: str, ticket: str):
     if not entry or entry[0] != task_id or entry[1] < time.time():
         TICKETS.pop(ticket, None)
         fail("INVALID_TICKET", "预览链接已过期", 403)
-    return page_html(task_id)
+    return _page_html_response(task_id, include_tailwind=True)
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/events")

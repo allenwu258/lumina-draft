@@ -95,7 +95,7 @@ async def fake_stream(**kwargs):
     elif kwargs.get("max_output_tokens"):
         text = "OK"
     else:
-        text = '<!doctype html><html><head><style>#ppt-page{width:800px;height:450px}</style></head><body><main id="ppt-page">Provider 验收完成</main></body></html>'
+        text = '<!doctype html><html><head><meta charset="utf-8"><style>#ppt-page{width:800px;height:450px;box-sizing:border-box;overflow:hidden;--ppt-background:#F8FAFC;--ppt-surface:#FFFFFF;--ppt-primary:#2563EB;--ppt-text:#1F2937;--ppt-muted:#64748B;--ppt-title-size:32px;--ppt-body-size:18px;--ppt-caption-size:12px;--ppt-font-family:Arial,sans-serif}</style></head><body><main id="ppt-page" data-css-profile="tailwind-ppt-v1" class="bg-ppt-background p-8"><div class="flex items-center gap-4 bg-ppt-surface p-4"><h1 id="tailwind-proof" class="font-ppt text-ppt-title font-semibold text-ppt-text">Provider 验收完成</h1></div></main></body></html>'
         _active_html += 1
         try:
             await _html_release.wait()

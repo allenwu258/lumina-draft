@@ -1,0 +1,13 @@
+@import "tailwindcss" source(none);
+
+@theme inline {
+  --color-ppt-background: var(--ppt-background);
+  --color-ppt-surface: var(--ppt-surface);
+  --color-ppt-primary: var(--ppt-primary);
+  --color-ppt-text: var(--ppt-text);
+  --color-ppt-muted: var(--ppt-muted);
+  --text-ppt-title: var(--ppt-title-size);
+  --text-ppt-body: var(--ppt-body-size);
+  --text-ppt-caption: var(--ppt-caption-size);
+  --font-ppt: var(--ppt-font-family);
+}

@@ -109,6 +109,15 @@ test('Provider configuration, model discovery, routing and presentation generati
   await expect(generationTab).toHaveAttribute('aria-selected', 'true');
   const slideFrame = page.locator('.canvas-stage iframe.slide-frame');
   await expect(slideFrame).toBeVisible();
+  const slide = await slideFrame.contentFrame();
+  await expect(slide!.locator('[data-tailwind-profile="tailwind-ppt-v1"]')).toBeAttached();
+  await expect
+    .poll(() => slide!.locator('#tailwind-proof').evaluate((element) => ({
+      display: getComputedStyle(element.parentElement!).display,
+      fontSize: getComputedStyle(element).fontSize,
+      color: getComputedStyle(element).color,
+    })))
+    .toEqual({ display: 'flex', fontSize: '32px', color: 'rgb(31, 41, 55)' });
   for (const viewport of [
     { width: 1440, height: 1000 },
     { width: 1793, height: 1100 },

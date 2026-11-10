@@ -16,6 +16,8 @@ os.environ.pop("DS_API_KEY", None)
 from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
+from backend.app.prompts import COMPOSER_PROMPT  # noqa: E402
+from backend.app.tailwind_profile import TAILWIND_CLASSES, TAILWIND_PROFILE, preview_html  # noqa: E402
 from backend.app.db import Conversation, ConversationMessage, engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
@@ -27,7 +29,11 @@ def close_database():
 
 
 def valid_html():
-    return '<!doctype html><html><head><style>#ppt-page{width:800px;height:450px}</style></head><body><main id="ppt-page">Hello</main></body></html>'
+    return f'''<!doctype html><html><head><meta charset="utf-8"><style>#ppt-page{{width:800px;height:450px;box-sizing:border-box;overflow:hidden;--ppt-background:#F8FAFC;--ppt-surface:#FFFFFF;--ppt-primary:#2563EB;--ppt-text:#1F2937;--ppt-muted:#64748B;--ppt-title-size:32px;--ppt-body-size:18px;--ppt-caption-size:12px;--ppt-font-family:Arial,sans-serif}}</style></head><body><main id="ppt-page" data-css-profile="{TAILWIND_PROFILE}" class="bg-ppt-background p-8"><div class="flex items-center gap-4 bg-ppt-surface p-4"><h1 id="tailwind-proof" class="font-ppt text-ppt-title font-semibold text-ppt-text">Hello</h1><p class="text-ppt-body text-ppt-muted">Utility rendering</p></div></main></body></html>'''
+
+
+def legacy_html():
+    return '<!doctype html><html><head><style>#ppt-page{width:800px;height:450px}</style></head><body><main id="ppt-page">Legacy page</main></body></html>'
 
 
 def test_html_contract_rejects_active_content():
@@ -37,6 +43,21 @@ def test_html_contract_rejects_active_content():
     assert not validate_html(valid_html().replace("Hello", '<svg><a xlink:href="https://example.com"/></svg>'))[0]
     assert not validate_html(valid_html().replace("450px", "449px"))[0]
     assert not validate_html('<main id="ppt-page">partial</main>')[0]
+    assert validate_html(legacy_html()) == (True, "ok")
+
+
+def test_tailwind_profile_is_enforced_and_shared_with_composer():
+    assert validate_html(valid_html()) == (True, "ok")
+    assert TAILWIND_PROFILE in COMPOSER_PROMPT
+    assert all(token in COMPOSER_PROMPT for token in ("bg-ppt-background", "flex", "text-ppt-title"))
+    assert len(TAILWIND_CLASSES) == len(set(TAILWIND_CLASSES))
+    assert not validate_html(valid_html().replace("items-center", "items-unregistered"))[0]
+    assert not validate_html(valid_html().replace(f'data-css-profile="{TAILWIND_PROFILE}"', 'data-css-profile="unknown"'))[0]
+    assert not validate_html(valid_html().replace("class=\"flex items-center gap-4 bg-ppt-surface p-4\"", 'style="display:flex"'))[0]
+    rendered = preview_html(valid_html())
+    assert 'data-tailwind-profile="tailwind-ppt-v1"' in rendered
+    assert ".flex{" in rendered
+    assert preview_html(legacy_html()) == legacy_html()
 
 
 def document():
