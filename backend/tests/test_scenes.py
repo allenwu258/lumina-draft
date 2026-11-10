@@ -100,7 +100,7 @@ def enqueue(client, page, retry=False):
         f"/api/v1/page-tasks/{page.id}/scene-conversions",
         json={"expected_html_hash": page.html_hash, "retry": retry},
     )
-    assert response.status_code == 202, response.text
+    assert response.status_code in {200, 202}, response.text
     return response.json()
 
 

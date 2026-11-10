@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
 const apiOrigin = `http://127.0.0.1:${process.env.E2E_API_PORT || '18000'}`;
 
 test('Provider configuration, model discovery, routing and presentation generation form a complete flow', async ({
@@ -184,6 +185,27 @@ test('Provider configuration, model discovery, routing and presentation generati
   await expect(sceneCanvas).toBeVisible();
   expect(await page.locator('.scene-viewport').getAttribute('data-scene-id')).toBe(sceneId);
   expect(rawHtmlRequests).toBe(0);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole('button', { name: '导出 PPTX', exact: true }).click();
+  const downloadLink = page.getByRole('link', { name: '下载 PPTX', exact: true });
+  await expect(downloadLink).toBeVisible({ timeout: 20000 });
+  const downloadUrl = await downloadLink.getAttribute('href');
+  expect(rawHtmlRequests).toBe(0);
+  await page.reload();
+  await expect(downloadLink).toBeVisible();
+  expect(await downloadLink.getAttribute('href')).toBe(downloadUrl);
+  const downloaded = page.waitForEvent('download');
+  await downloadLink.click();
+  const download = await downloaded;
+  expect(download.suggestedFilename()).toBe('Provider 验收作品.pptx');
+  const bytes = await readFile((await download.path())!);
+  expect(bytes.subarray(0, 2).toString()).toBe('PK');
+  expect(bytes.length).toBeGreaterThan(5000);
+  const repeatedDownload = await page.request.get(downloadUrl!);
+  expect(await repeatedDownload.body()).toEqual(bytes);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(downloadLink).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('pptx-download-mobile.png'), fullPage: true });
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole('tab', { name: /大纲/ }).click();
   await expect(page.locator('.outline-title-input').first()).toHaveAttribute('readonly', '');

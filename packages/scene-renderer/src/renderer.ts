@@ -236,17 +236,53 @@ export class SceneRenderer {
   }
   render() {
     if (!this.scene || this.disposed) return;
+    const scale =
+      Math.min(
+        this.width / this.scene.page.width,
+        this.height / this.scene.page.height,
+      ) * this.dpr;
+    this.paint(
+      this.canvas,
+      {
+        x: 0,
+        y: 0,
+        width: this.scene.page.width,
+        height: this.scene.page.height,
+      },
+      scale,
+      undefined,
+      true,
+    );
+  }
+  /** Transparent Scene-only composition. Ancestor clip/opacity is applied exactly once. */
+  renderRegion(bounds: Rect, nodeIds: string[], scale = 3): HTMLCanvasElement {
+    if (!this.scene || this.disposed) throw new Error("SCENE_NOT_LOADED");
+    const target = document.createElement("canvas");
+    target.width = Math.max(1, Math.ceil(bounds.width * scale));
+    target.height = Math.max(1, Math.ceil(bounds.height * scale));
+    if (target.width * target.height > 16_000_000)
+      throw new Error("RASTER_PIXEL_LIMIT");
+    this.paint(target, bounds, scale, new Set(nodeIds), false);
+    return target;
+  }
+  private paint(
+    target: HTMLCanvasElement,
+    bounds: Rect,
+    scale: number,
+    selected: Set<string> | undefined,
+    background: boolean,
+  ) {
+    if (!this.scene) return;
     const scene = this.scene,
       nodes = new Map(scene.nodes.map((n) => [n.id, n]));
-    const main = this.canvas.getContext("2d")!;
+    const main = target.getContext("2d")!;
     main.resetTransform();
-    main.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    const scale =
-      Math.min(this.width / scene.page.width, this.height / scene.page.height) *
-      this.dpr;
-    main.setTransform(scale, 0, 0, scale, 0, 0);
-    main.fillStyle = scene.page.background;
-    main.fillRect(0, 0, scene.page.width, scene.page.height);
+    main.clearRect(0, 0, target.width, target.height);
+    main.setTransform(scale, 0, 0, scale, -bounds.x * scale, -bounds.y * scale);
+    if (background) {
+      main.fillStyle = scene.page.background;
+      main.fillRect(0, 0, scene.page.width, scene.page.height);
+    }
     main.beginPath();
     main.rect(0, 0, scene.page.width, scene.page.height);
     main.clip();
@@ -265,7 +301,7 @@ export class SceneRenderer {
         const parent = ctx;
         let layer: OffscreenCanvas | null = null;
         if (n.opacity < 1) {
-          layer = new OffscreenCanvas(this.canvas.width, this.canvas.height);
+          layer = new OffscreenCanvas(target.width, target.height);
           ctx = layer.getContext("2d")!;
           ctx.setTransform(parent.getTransform());
           for (const clip of clips) {
@@ -295,7 +331,7 @@ export class SceneRenderer {
         }
         ctx = entry.parent;
         ctx.restore();
-      } else draw(ctx, n, this.images);
+      } else if (!selected || selected.has(n.id)) draw(ctx, n, this.images);
     }
   }
   dispose() {

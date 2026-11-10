@@ -1,0 +1,36 @@
+.presentation-export {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 280px;
+}
+.presentation-export a {
+  text-decoration: none;
+}
+.export-error {
+  color: #b42318;
+  overflow-wrap: anywhere;
+}
+.export-warning {
+  color: #8a611a;
+}
+.export-spinner {
+  animation: export-spin 1s linear infinite;
+}
+@keyframes export-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .export-spinner {
+    animation: none;
+  }
+}
+@media (max-width: 600px) {
+  .presentation-export {
+    max-width: 100%;
+    align-items: flex-start;
+  }
+}

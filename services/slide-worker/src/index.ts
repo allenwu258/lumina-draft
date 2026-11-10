@@ -4,6 +4,7 @@ import { resolve, relative, isAbsolute } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 import { CONVERTER_VERSION } from "@lumina/scene-core";
 import { canonical, convert } from "./capture.js";
+import { writePptx } from "./export/writer.js";
 
 const root = resolve(process.argv[2] || ".");
 const send = (v: unknown) => process.stdout.write(JSON.stringify(v) + "\n");
@@ -23,7 +24,8 @@ try {
 }
 send({
   type: "ready",
-  protocol: 1,
+  protocol: 2,
+  capabilities: ["parse", "export-pptx"],
   converterVersion: CONVERTER_VERSION,
   chromium: browser.version(),
 });
@@ -59,12 +61,26 @@ lines.on("line", async (line) => {
   }
   busy = true;
   const controller = new AbortController(),
-    timer = setTimeout(() => controller.abort(), 25000);
+    timer = setTimeout(
+      () => controller.abort(),
+      request.type === "export-pptx" ? 120000 : 25000,
+    );
   try {
-    if (request.type !== "parse") throw new Error("INVALID_PROTOCOL");
+    if (!["parse", "export-pptx"].includes(request.type))
+      throw new Error("INVALID_PROTOCOL");
     const input = JSON.parse(await readFile(within(request.input), "utf8")),
       output = within(request.output);
     await mkdir(output, { recursive: true });
+    if (request.type === "export-pptx") {
+      await writePptx(input, output, within, browser, controller.signal);
+      send({
+        type: "result",
+        request_id: request.request_id,
+        attempt_token: request.attempt_token,
+        file: "presentation.pptx",
+      });
+      return;
+    }
     const scene = await convert(
       input,
       { browser, outputDir: output },
@@ -85,11 +101,19 @@ lines.on("line", async (line) => {
       request_id: request.request_id,
       attempt_token: request.attempt_token,
       code: controller.signal.aborted
-        ? "CONVERSION_TIMEOUT"
+        ? request.type === "export-pptx"
+          ? "EXPORT_TIMEOUT"
+          : "CONVERSION_TIMEOUT"
         : !browser.isConnected()
           ? "BROWSER_CRASHED"
-          : "CONVERSION_CONTENT_ERROR",
+          : request.type === "export-pptx"
+            ? "EXPORT_CONTENT_ERROR"
+            : "CONVERSION_CONTENT_ERROR",
       message,
+      page_number:
+        e && typeof e === "object" && "pageNumber" in e
+          ? e.pageNumber
+          : undefined,
     });
   } finally {
     clearTimeout(timer);

@@ -17,7 +17,8 @@ import uuid
 
 from sqlalchemy import select
 
-from .db import PageTask, SceneConversionJob, session_scope, utcnow
+from .db import PageTask, PptxExport, SceneConversionJob, session_scope, utcnow
+from . import export_service
 from .rendering import validate_html
 from .scene_service import (
     ROOT,
@@ -36,8 +37,9 @@ HEALTH = {"status": "starting", "active_job_id": None, "error": None}
 
 
 class WorkerError(Exception):
-    def __init__(self, code, message=""):
+    def __init__(self, code, message="", page=None):
         self.code = code
+        self.page = page
         super().__init__(message or code)
 
 
@@ -171,7 +173,8 @@ class SceneWorker:
             )
             if (
                 ready.get("type") != "ready"
-                or ready.get("protocol") != 1
+                or ready.get("protocol") != 2
+                or "export-pptx" not in ready.get("capabilities", [])
                 or ready.get("converterVersion") != CONVERTER_VERSION
             ):
                 raise WorkerError(
@@ -192,7 +195,6 @@ class SceneWorker:
             ) from exc
 
     async def execute(self, job: SceneConversionJob, token: str, work: Path, cancelled):
-        await self.start()
         raw = canonical(
             {
                 "html": preview_html(job.source_html, css=job.css),
@@ -201,9 +203,19 @@ class SceneWorker:
             }
         )
         await asyncio.to_thread((work / "input.json").write_text, raw, encoding="utf-8")
+        return await self.request("parse", job.id, token, work, cancelled, 35)
+
+    async def export_pptx(self, record, token, work, staged, cancelled):
+        await asyncio.to_thread(
+            (work / "input.json").write_text, canonical(staged), encoding="utf-8"
+        )
+        return await self.request("export-pptx", record.id, token, work, cancelled, 125)
+
+    async def request(self, operation, request_id, token, work, cancelled, timeout):
+        await self.start()
         request = {
-            "type": "parse",
-            "request_id": job.id,
+            "type": operation,
+            "request_id": request_id,
             "attempt_token": token,
             "input": (work / "input.json").relative_to(SCENE_ROOT).as_posix(),
             "output": (work / "out").relative_to(SCENE_ROOT).as_posix(),
@@ -217,14 +229,14 @@ class SceneWorker:
             raise WorkerError("WORKER_DISCONNECTED", "转换 Worker 已断开") from exc
         read = asyncio.create_task(asyncio.to_thread(self._read, process))
         try:
-            for _ in range(175):
+            for _ in range(timeout * 5):
                 done, _pending = await asyncio.wait({read}, timeout=0.2)
                 if cancelled():
                     raise WorkerError("CONVERSION_CANCELLED")
                 if done:
                     result = read.result()
                     if (
-                        result.get("request_id") != job.id
+                        result.get("request_id") != request_id
                         or result.get("attempt_token") != token
                     ):
                         raise WorkerError("WORKER_RESULT_IDENTITY")
@@ -232,14 +244,19 @@ class SceneWorker:
                         raise WorkerError(
                             result.get("code", "CONVERSION_FAILED"),
                             result.get("message", ""),
+                            result.get("page_number"),
                         )
-                    if (
-                        result.get("type") != "result"
-                        or result.get("scene") != "scene.json"
+                    if result.get("type") != "result" or (
+                        result.get("scene") != "scene.json"
+                        if operation == "parse"
+                        else result.get("file") != "presentation.pptx"
                     ):
                         raise WorkerError("WORKER_PROTOCOL")
                     return work / "out"
-            raise WorkerError("CONVERSION_TIMEOUT", "页面转换超过 35 秒")
+            raise WorkerError(
+                "CONVERSION_TIMEOUT" if operation == "parse" else "EXPORT_TIMEOUT",
+                f"执行超过 {timeout} 秒",
+            )
         except BaseException:
             await self.close()
             raise
@@ -302,6 +319,20 @@ async def recover():
     abandoned = []
     async with EVENT_WRITE_LOCK:
         with session_scope() as db:
+            for record in db.scalars(
+                select(PptxExport).where(PptxExport.status == "RUNNING")
+            ):
+                if record.attempt_token:
+                    abandoned.append(
+                        SCENE_ROOT / ".work" / record.id / record.attempt_token
+                    )
+                record.status, record.attempt_token, record.queued_at = (
+                    "QUEUED",
+                    None,
+                    utcnow(),
+                )
+                presentations.add(record.presentation_id)
+                export_service.event_tx(db, record, "queued")
             for job in db.scalars(
                 select(SceneConversionJob).where(SceneConversionJob.status == "RUNNING")
             ):
@@ -343,14 +374,37 @@ async def scene_scheduler(stop: asyncio.Event):
             log.error("Scene worker unavailable: %s", exc)
         while not stop.is_set():
             WAKE.event.clear()
+            changed_presentations = set()
             async with EVENT_WRITE_LOCK:
                 with session_scope() as db:
+                    for pending in db.scalars(
+                        select(PptxExport).where(PptxExport.status == "PREPARING")
+                    ):
+                        old = (pending.status, pending.input_manifest_json)
+                        export_service.advance_tx(db, pending)
+                        if old != (pending.status, pending.input_manifest_json):
+                            changed_presentations.add(pending.presentation_id)
+                    db.flush()
                     current = db.scalar(
                         select(SceneConversionJob)
                         .where(SceneConversionJob.status == "QUEUED")
                         .order_by(SceneConversionJob.queued_at, SceneConversionJob.id)
                         .limit(1)
                     )
+                    export = db.scalar(
+                        select(PptxExport)
+                        .where(PptxExport.status == "QUEUED")
+                        .order_by(PptxExport.queued_at, PptxExport.id)
+                        .limit(1)
+                    )
+                    if export and (
+                        not current
+                        # SQLite reads UTC timestamps without tzinfo; freshly
+                        # prepared exports in this session still carry UTC tzinfo.
+                        or (export.queued_at.replace(tzinfo=None), export.id)
+                        < (current.queued_at.replace(tzinfo=None), current.id)
+                    ):
+                        current = export
                     if current:
                         current.status, current.attempt_token = "RUNNING", str(
                             uuid.uuid4()
@@ -359,17 +413,22 @@ async def scene_scheduler(stop: asyncio.Event):
                             current.attempt + 1,
                             utcnow(),
                         )
-                        append_event_tx(
-                            db,
-                            current.presentation_id,
-                            "page.scene.started",
-                            {
-                                "page_task_id": current.page_task_id,
-                                "job_id": current.id,
-                                "status": "RUNNING",
-                            },
-                            current.run_id,
-                        )
+                        if isinstance(current, PptxExport):
+                            export_service.event_tx(db, current, "started")
+                        else:
+                            append_event_tx(
+                                db,
+                                current.presentation_id,
+                                "page.scene.started",
+                                {
+                                    "page_task_id": current.page_task_id,
+                                    "job_id": current.id,
+                                    "status": "RUNNING",
+                                },
+                                current.run_id,
+                            )
+            for changed_id in changed_presentations:
+                await EVENT_BUS.notify(changed_id)
             if not current:
                 try:
                     await asyncio.wait_for(WAKE.event.wait(), 0.5)
@@ -380,8 +439,30 @@ async def scene_scheduler(stop: asyncio.Event):
             HEALTH["active_job_id"] = current.id
             await EVENT_BUS.notify(current.presentation_id)
             work = SCENE_ROOT / ".work" / current.id / token
-            work.mkdir(parents=True, exist_ok=True)
             try:
+                work.mkdir(parents=True, exist_ok=True)
+                if isinstance(current, PptxExport):
+                    staged = await asyncio.to_thread(
+                        export_service.stage_input, current, work
+                    )
+                    output = await worker.export_pptx(
+                        current,
+                        token,
+                        work,
+                        staged,
+                        lambda: stop.is_set()
+                        or not export_is_current(current.id, token),
+                    )
+                    installed = await asyncio.to_thread(
+                        export_service.install_result, current, token, output, staged
+                    )
+                    async with EVENT_WRITE_LOCK:
+                        with session_scope() as db:
+                            export_service.publish_tx(
+                                db, current.id, token, current.input_hash, installed
+                            )
+                    HEALTH.update(status="ready", error=None)
+                    continue
                 valid, reason = validate_html(current.source_html)
                 if not valid:
                     raise WorkerError("INVALID_SOURCE_HTML", reason)
@@ -417,6 +498,31 @@ async def scene_scheduler(stop: asyncio.Event):
                 code = getattr(exc, "code", "INVALID_SCENE")
                 async with EVENT_WRITE_LOCK:
                     with session_scope() as db:
+                        if isinstance(current, PptxExport):
+                            record = db.get(PptxExport, current.id)
+                            if (
+                                record
+                                and record.status == "RUNNING"
+                                and record.attempt_token == token
+                            ):
+                                if (
+                                    code
+                                    in {
+                                        "WORKER_DISCONNECTED",
+                                        "BROWSER_CRASHED",
+                                        "WORKER_START_FAILED",
+                                    }
+                                    and record.attempt < 2
+                                ):
+                                    (
+                                        record.status,
+                                        record.attempt_token,
+                                        record.queued_at,
+                                    ) = ("QUEUED", None, utcnow())
+                                    export_service.event_tx(db, record, "queued")
+                                else:
+                                    export_service.fail_tx(db, record, exc)
+                            continue
                         job = db.get(SceneConversionJob, current.id)
                         if (
                             job
@@ -472,3 +578,11 @@ async def scene_scheduler(stop: asyncio.Event):
         await recover()
         WAKE.event = None
         HEALTH.update(status="stopped", active_job_id=None)
+
+
+def export_is_current(export_id, token):
+    with session_scope() as db:
+        record = db.get(PptxExport, export_id)
+        return bool(
+            record and record.status == "RUNNING" and record.attempt_token == token
+        )

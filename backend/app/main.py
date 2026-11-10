@@ -23,7 +23,10 @@ from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettin
 from .secrets import read_secret
 from .scene_api import router as scene_router
 from .scene_runtime import HEALTH as SCENE_HEALTH, scene_scheduler
-from .scene_service import summary as scene_summary, cancel_conversions
+from .scene_service import summary as scene_summary, cancel_conversions, source_hash as page_source_hash
+from .export_api import router as export_router
+from . import export_service
+from .db import PptxExport
 
 
 @asynccontextmanager
@@ -47,6 +50,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lumina Draft API", version="0.1.0", lifespan=lifespan)
 app.include_router(scene_router)
+app.include_router(export_router)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
 API = "/api/v1"
 TICKETS: dict[str, tuple[str, float, str | None]] = {}
@@ -129,7 +133,7 @@ def job_dict(job: Job | None) -> dict | None:
 
 
 def page_dict(p: PageTask, db) -> dict:
-    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt, "scene": scene_summary(db, p)}
+    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": page_source_hash(db, p), "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt, "scene": scene_summary(db, p)}
 
 
 def conversation_projection(db, presentation: Presentation, outline: Outline | None, runs: list[Run]) -> dict:
@@ -455,7 +459,9 @@ def get_presentation(presentation_id: str):
                 if channel in director_stream:
                     director_stream[channel] += payload.get("delta", "")
         conversation = conversation_projection(db, p, outline, runs)
-        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
+        export_source = export_service.source_summary(db, p.id)
+        latest_export = db.scalar(select(PptxExport).where(PptxExport.presentation_id == p.id, PptxExport.source_hash == export_source["source_hash"]).order_by(PptxExport.created_at.desc()).limit(1)) if export_source["can_export"] else None
+        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq, "export_source": export_source, "latest_export": export_service.export_dict(latest_export) if latest_export else None}
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")

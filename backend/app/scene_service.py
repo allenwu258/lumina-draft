@@ -86,23 +86,127 @@ def environment_key() -> str:
     )
 
 
+def source_hash(db, page: PageTask) -> str | None:
+    """Read-only identity projection, including pre-Scene historical pages."""
+    if page.html_hash:
+        return page.html_hash
+    if page.html:
+        return digest(page.html)
+    scene = db.get(PageScene, page.current_scene_id) if page.current_scene_id else None
+    job = db.get(SceneConversionJob, scene.job_id) if scene else None
+    return job.html_hash if job and job.page_task_id == page.id else None
+
+
+def find_scene(db, page: PageTask) -> PageScene | None:
+    html_hash = source_hash(db, page)
+    if not html_hash or page.status != "SUCCEEDED":
+        return None
+    query = (
+        select(PageScene)
+        .join(SceneConversionJob, PageScene.job_id == SceneConversionJob.id)
+        .where(
+            PageScene.page_task_id == page.id,
+            PageScene.schema_version == "0.3.0",
+            SceneConversionJob.page_task_id == page.id,
+            SceneConversionJob.html_hash == html_hash,
+            SceneConversionJob.status == "SUCCEEDED",
+        )
+    )
+    if page.current_scene_id:
+        scene = db.scalar(query.where(PageScene.id == page.current_scene_id))
+        if scene:
+            return scene
+    return db.scalar(query.order_by(PageScene.created_at.desc(), PageScene.id).limit(1))
+
+
+def scene_ref(scene: PageScene, html_hash: str) -> dict:
+    return {
+        "page_task_id": scene.page_task_id,
+        "scene_id": scene.id,
+        "scene_hash": scene.scene_hash,
+        "schema_version": scene.schema_version,
+        "source_html_hash": html_hash,
+    }
+
+
 def summary(db, page: PageTask) -> dict:
     job = (
         db.get(SceneConversionJob, page.current_scene_job_id)
         if page.current_scene_job_id
         else None
     )
-    scene = db.get(PageScene, page.current_scene_id) if page.current_scene_id else None
+    html_hash = source_hash(db, page)
+    if job and job.html_hash != html_hash:
+        job = None
+    scene = find_scene(db, page)
+    if scene:
+        job = db.get(SceneConversionJob, scene.job_id)
     return {
-        "status": job.status if job else "NOT_REQUESTED",
+        "status": (
+            "SUCCEEDED"
+            if scene
+            else (job.status if job and job.status != "SUCCEEDED" else "NOT_REQUESTED")
+        ),
         "job_id": job.id if job else None,
         "scene_id": scene.id if scene else None,
         "scene_hash": scene.scene_hash if scene else None,
-        "source_html_hash": job.html_hash if job else page.html_hash,
+        "source_html_hash": html_hash,
+        "ref": scene_ref(scene, html_hash) if scene else None,
         "error_code": job.error_code if job else None,
         "error": job.error if job else None,
         "warning_count": scene.warning_count if scene else 0,
     }
+
+
+def ensure_page_scene(
+    db, page: PageTask, expected_source_hash: str, *, retry=False
+) -> dict:
+    """Shared preview/export/generation entry; caller owns the write transaction."""
+    actual = source_hash(db, page)
+    if actual != expected_source_hash:
+        raise ValueError("HTML_REVISION_CONFLICT")
+    if page.status != "SUCCEEDED" or not actual:
+        raise ValueError("PAGE_NOT_READY")
+    if not page.html_hash:
+        page.html_hash = actual
+    scene = find_scene(db, page)
+    if scene:
+        if digest(scene.scene_json) != scene.scene_hash:
+            raise ValueError("SCENE_CORRUPT")
+        page.current_scene_id, page.current_scene_job_id = scene.id, scene.job_id
+        return summary(db, page)
+    if not page.html:
+        raise ValueError("SOURCE_HTML_MISSING")
+    if digest(page.html) != actual:
+        raise ValueError("SOURCE_HASH_MISMATCH")
+    job = (
+        db.get(SceneConversionJob, page.current_scene_job_id)
+        if page.current_scene_job_id
+        else None
+    )
+    if job and job.page_task_id == page.id and job.html_hash == actual:
+        if job.status == "SUCCEEDED":
+            raise ValueError("SCENE_MISSING_OR_UNSUPPORTED")
+        if job.status in {"QUEUED", "RUNNING"} or (
+            job.status in {"FAILED", "CANCELLED"} and not retry
+        ):
+            return summary(db, page)
+        if retry and job.status in {"FAILED", "CANCELLED"}:
+            from .runtime import append_event_tx
+
+            job.status, job.attempt, job.attempt_token = "QUEUED", 0, None
+            job.error_code = job.error = job.started_at = job.finished_at = None
+            job.queued_at = utcnow()
+            append_event_tx(
+                db,
+                page.presentation_id,
+                "page.scene.queued",
+                {"page_task_id": page.id, "job_id": job.id, "status": "QUEUED"},
+                page.run_id,
+            )
+            return summary(db, page)
+    enqueue_tx(db, page, retry=retry)
+    return summary(db, page)
 
 
 def enqueue_tx(db, page: PageTask, *, retry: bool = False) -> SceneConversionJob:

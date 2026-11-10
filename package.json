@@ -19,6 +19,7 @@
     "pretest:e2e": "npm run build:scene"
   },
   "devDependencies": {
+    "@types/fontkit": "2.0.8",
     "@types/node": "22.15.21",
     "esbuild": "0.25.12",
     "pngjs": "7.0.0",

@@ -10,11 +10,12 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 - **大纲流式展示**：分栏显示供应商返回的 reasoning 文本或摘要与 JSON 正文；支持折叠查看、自动跟随滚动，手动向上滚动时暂停跟随。
 - **大纲编辑与确认**：完整 JSON 解析并通过结构校验后进入编辑；确认后才启动页面生成。
 - **页面并行生成**：结合全局规范、当前页任务与相邻页摘要生成独立 HTML；新页面使用受控的 Tailwind CSS v4 utility 子集，预览由后端注入本地编译样式，不依赖 CDN。按所选模型并发分配调用名额，等待页面与正在生成页面分开展示。
-- **页面查看**：默认由自研 Canvas 直接渲染持久化 SceneIR，另提供 HTML 预览和 HTML 源码；保留原始 HTML 作为生成来源与对照。当前画布只预览，不提供编辑或 PPTX 导出。
+- **页面查看**：默认由自研 Canvas 直接渲染持久化 SceneIR，另提供 HTML 预览和 HTML 源码；保留原始 HTML 作为生成来源与对照。当前画布只预览，不提供编辑。
+- **PPTX 导出**：完整作品可导出整本 PowerPoint。已有 SceneIR 直接复用，旧 HTML 按需补转换并保存；普通文字和图形可编辑，复杂裁剪、透明组合与阴影使用透明局部图片，并显示导出提示。任务持久化，刷新后继续查询和下载。
 - **恢复与重试**：作品、任务和 SSE 事件落库，支持浏览器刷新、断线回放、取消生成与失败重试。
 - **模型配置与统计**：独立 Provider 管理页，支持多连接、多模型、主动发现、思考档位、模型并发、业务 Override、模型测试与调用详情；作品按冻结配置生成。
 
-初版仅提供文字内容与 HTML/CSS、安全内联 SVG 排版，尚未实现配图、生图、附件、PPTX 导出、Tauri 客户端或多用户服务。
+初版提供文字内容与 HTML/CSS、安全内联 SVG 排版及 PPTX 导出，尚未实现配图、生图、附件、Tauri 客户端或多用户服务。
 
 ## 使用流程
 
@@ -24,6 +25,7 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 4. 等待完整说明书校验通过，检查并编辑逐页内容，再点击“确认并生成”。
 5. 查看各页的 HTML 生成与排队转换进度；默认进入新版 Canvas 预览，也可切换 HTML 预览和源码。转换失败只重试转换，不重新调用模型。
 6. 遇到失败可查看错误并重试。页面阶段重试保留成功页，仅重新执行未成功的页面。
+7. 全部页面内容完成后点击“导出 PPTX”，待准备及导出完成后下载；刷新后可再次下载同一文件。导出不调用模型。
 
 页数由 Director 根据内容自主确定，当前结构契约支持 **1–20 页**。创建接口没有 `page_count` 参数；当前提示词也不把用户文字中的指定页数作为约束或偏好。
 
@@ -76,11 +78,23 @@ HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。�
 
 当前覆盖受控 profile 中的布局、背景、圆角实线边框、中文/英文富文本、大小写、字距、基础表格、SVG、透明组和 overflow 裁剪。Box shadow 使用 Canvas 模糊近似并记录提示。合并表格、滤镜、渐变、伪元素文字、变换、复杂文字排版等尚未支持的内容会明确失败，可继续查看 HTML。当前以同一台机器的系统字体为准，字体宽度明显失配时不会发布成功首帧；跨机器字体分发和 Office 一致性留给后续。
 
-已有成功 HTML 页在第一次打开新版预览时按需转换，不批量迁移历史作品。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。未来 PPTX 导出从 SceneIR 构建 RenderPlan，本轮不引入导出专用持久模型。
+已有成功 HTML 页在第一次预览或导出时按需转换，不批量迁移历史作品。预览、生成完成钩子与导出共用 `ensure_page_scene`：先查询匹配来源的有效 Scene，命中后不因当前 CSS 或字体环境变化而隐式重转；缺失才进入转换队列。旧页缺少来源哈希时统一计算并登记。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。
 
 所有 npm 依赖都在仓库根目录安装，已移除前端单独的锁文件。全新安装或修改共享包后，启动后端前先运行 `npm run build:scene`；修改共享渲染器后需重新构建该包，Vite 会加载构建产物。Chromium 使用锁定的 Playwright 版本，通过 `npm run browser:install` 显式安装，不在请求时下载。依赖缺失的原因可在健康接口的 `scene_worker` 字段和转换错误中查看。
 
 默认资源在 `data/scenes/`，可用 `SCENE_DATA_DIR` 指定绝对目录。资源目录必须与 SQLite 一起备份；不要只复制数据库。Worker 无额外 HTTP 端口，通过带 request ID 和 attempt token 的 JSONL 与 Python 通信。Windows 使用 Job Object 约束并回收自己的 Worker/Chromium 进程树，不操作用户浏览器。仍只支持单后端进程。
+
+## SceneIR → PPTX
+
+导出只消费已保存 SceneIR 与其声明资产，不读取 HTML 排版。RenderPlan 在导出时按页生成，仅是可重新计算的内存结构；Canvas 预览继续直接消费 SceneIR。PptxGenJS 4.0.1 使用标准 `addText/addShape/addImage` 接口写出，800×450 对应 13⅓×7.5 英寸，统一 `inch = px/60`、`pt = px×1.2`。
+
+`pptx_exports` 一张表保存冻结页序、来源与最终 Scene 引用、状态、错误及文件结果。状态为 `PREPARING / QUEUED / RUNNING / SUCCEEDED / FAILED`。准备阶段复用 Scene 转换且不占执行槽；转换和整本导出共享一个 Node/Chromium 执行槽，不占 Provider 并发。准备期间缺 Scene 的页被重新生成会报告来源冲突；最终清单固定后，后续页面修改不会混入本次导出。重复点击复用等价任务，失败需显式重试，中断 RUNNING 在重启后重新排队并更换令牌。
+
+文字按保存的显示行/片段输出，关闭自动换行和缩放；根据本机安装字体选择有字形覆盖的候选，并校验宽度。字体度量不匹配、裁剪、透明组合和复杂图形使用共享 SceneRenderer 生成局部资产；不静默把整页替换为截图。表格第一版是固定单元格图形与文字，不是原生 PowerPoint table。不提供选页、导出设置、字体嵌入或跨机器像素一致性保证。
+
+候选文件先独立检查 ZIP/OPC、页序、文字、资源引用和几何，再原子保存并发布成功。默认文件在 `data/exports/`，可用 `PPTX_EXPORT_DIR` 指定绝对目录，与数据库和 Scene 资产一同备份。下载接口只读取成功文件；文件丢失/损坏明确报错，不在 GET 中重转或重建。
+
+开发时可用 `powershell.exe -NoProfile -STA -File services/slide-worker/scripts/check-office.ps1 -Pptx <绝对文件路径> -OutputDirectory <已存在的空目录>` 在本机 PowerPoint 中检查文字与页面 PNG。脚本只管理自己创建的 Office 实例；已有 PowerPoint 进程时停止该项检查。Office 不是导出运行依赖。
 
 ## 模型与 API 配置
 
@@ -211,7 +225,7 @@ frontend/
   package.json
 packages/scene-core/ # SceneIR 0.3 契约、类型与引用/几何校验
 packages/scene-renderer/ # 只消费 SceneIR 的 Canvas 2D 渲染器
-services/slide-worker/ # 常驻 Node/Chromium，DOM 测量、文字归属与 SceneIR 转换
+services/slide-worker/ # 常驻 Node/Chromium，SceneIR 转换与 PptxGenJS 导出
 package.json / package-lock.json # npm workspaces 与唯一安装锁文件
 data/              # 默认 SQLite 数据目录，运行时创建，不纳入版本控制
 ```
@@ -248,6 +262,9 @@ SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、�
 | POST | `/presentations/{id}/retry` | 重试失败或已取消的生成任务 |
 | GET | `/presentations/{id}/events` | SSE 订阅，支持 `after` 与 `Last-Event-ID` |
 | GET | `/presentations/{id}/usage` | 当前作品会话用量 |
+| POST | `/presentations/{id}/exports` | 创建/复用整本 PPTX 导出，提交 expected_source_hash 与可选 retry |
+| GET | `/exports/{id}` | 导出准备进度、状态、错误及下载地址 |
+| GET | `/exports/{id}/file` | 下载已成功的不可变 PPTX 文件 |
 | POST | `/runs/{id}/cancel` | 请求取消运行 |
 | POST | `/page-tasks/{id}/scene-conversions` | 幂等确保转换或显式重试，要求 expected_html_hash |
 | GET | `/scenes/{id}` | 获取指定不可变 SceneIR，支持 ETag |

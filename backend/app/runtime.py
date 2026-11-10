@@ -608,7 +608,7 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
         if not valid:
             raise ProviderError("INVALID_HTML", reason)
         digest = html_hash(html)
-        from .scene_service import enqueue_tx, WAKE
+        from .scene_service import ensure_page_scene, WAKE
         async with EVENT_WRITE_LOCK:
             with session_scope() as db:
                 task, run = db.get(PageTask, task_id), db.get(Run, run_id)
@@ -616,7 +616,7 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
                     raise asyncio.CancelledError()
                 task.status, task.html, task.html_hash, task.error, task.error_code = "SUCCEEDED", html, digest, None, None
                 append_event_tx(db, presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
-                enqueue_tx(db, task, retry=True)
+                ensure_page_scene(db, task, task.html_hash, retry=True)
         WAKE.set()
         await EVENT_BUS.notify(presentation_id)
     except asyncio.CancelledError:

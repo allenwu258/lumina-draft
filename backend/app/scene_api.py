@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .db import PageTask, PageScene, loads, session_scope
 from . import runtime
-from .scene_service import SCENE_ROOT, WAKE, enqueue_tx, summary
+from .scene_service import SCENE_ROOT, WAKE, ensure_page_scene
 
 router = APIRouter(prefix="/api/v1", tags=["scenes"])
 
@@ -18,7 +18,7 @@ class ConvertRequest(BaseModel):
 
 
 @router.post("/page-tasks/{task_id}/scene-conversions", status_code=202)
-async def ensure_scene(task_id: str, body: ConvertRequest):
+async def ensure_scene(task_id: str, body: ConvertRequest, response: Response):
     async with runtime.EVENT_WRITE_LOCK:
         with session_scope() as db:
             page = db.get(PageTask, task_id)
@@ -26,20 +26,19 @@ async def ensure_scene(task_id: str, body: ConvertRequest):
                 raise HTTPException(
                     404, detail={"code": "NOT_FOUND", "message": "页面不存在"}
                 )
-            if page.status != "SUCCEEDED" or not page.html:
-                raise HTTPException(
-                    409, detail={"code": "PAGE_NOT_READY", "message": "HTML 尚未完成"}
+            try:
+                result = ensure_page_scene(
+                    db, page, body.expected_html_hash, retry=body.retry
                 )
-            if body.expected_html_hash != page.html_hash:
+            except ValueError as exc:
                 raise HTTPException(
                     409,
                     detail={
-                        "code": "HTML_REVISION_CONFLICT",
-                        "message": "页面已更新，请刷新后重试",
+                        "code": str(exc),
+                        "message": "页面来源已更新、未完成或场景数据不可用，请刷新后重试",
                     },
-                )
-            enqueue_tx(db, page, retry=body.retry)
-            result = summary(db, page)
+                ) from exc
+            response.status_code = 200 if result["scene_id"] else 202
             presentation_id = page.presentation_id
     WAKE.set()
     await runtime.EVENT_BUS.notify(presentation_id)

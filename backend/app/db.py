@@ -306,6 +306,33 @@ class PageScene(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PptxExport(Base):
+    __tablename__ = "pptx_exports"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    export_version: Mapped[str] = mapped_column(String(80))
+    input_manifest_json: Mapped[str] = mapped_column(Text)
+    input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PREPARING", index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    output_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    byte_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    download_filename: Mapped[str] = mapped_column(String(240))
+    report_json: Mapped[str] = mapped_column(Text, default="{}")
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failed_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("presentation_id", "request_hash", name="uq_pptx_request"),)
+
+
 class Event(Base):
     __tablename__ = "events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
