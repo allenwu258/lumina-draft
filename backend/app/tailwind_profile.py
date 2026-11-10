@@ -19,13 +19,13 @@ def compiled_tailwind_css() -> str:
     return (_ROOT / "tailwind-ppt-v1.css").read_text(encoding="utf-8")
 
 
-def preview_html(html: str) -> str:
+def preview_html(html: str, *, css: str | None = None) -> str:
     soup = BeautifulSoup(html, "html.parser")
     root = soup.find("main", id="ppt-page")
     if root is None or root.get("data-css-profile") != TAILWIND_PROFILE:
         return html
 
     style = soup.new_tag("style", attrs={"data-tailwind-profile": TAILWIND_PROFILE})
-    style.string = compiled_tailwind_css()
+    style.string = compiled_tailwind_css() if css is None else css
     soup.head.insert(0, style)
     return str(soup)

@@ -1,6 +1,13 @@
 import { CheckCircle2, Clock3, LoaderCircle, ShieldCheck, X } from 'lucide-react';
 
-export function pageStatusLabel(status?: string): string {
+export function pageStatusLabel(status?: string, sceneStatus?: string): string {
+  if (status === 'SUCCEEDED') {
+    if (sceneStatus === 'QUEUED') return '等待转换';
+    if (sceneStatus === 'RUNNING') return '正在转换';
+    if (sceneStatus === 'FAILED') return '转换失败';
+    if (sceneStatus === 'CANCELLED') return '转换已取消';
+    if (sceneStatus === 'NOT_REQUESTED') return 'HTML 已就绪';
+  }
   switch (status) {
     case 'RUNNING':
       return '正在生成';
@@ -20,8 +27,12 @@ export function pageStatusLabel(status?: string): string {
   }
 }
 
-export function PageStatusIcon({ status }: { status?: string }) {
-  const label = pageStatusLabel(status);
+export function PageStatusIcon({ status, sceneStatus }: { status?: string; sceneStatus?: string }) {
+  const label = pageStatusLabel(status, sceneStatus);
+  if (status === 'SUCCEEDED' && ['QUEUED', 'RUNNING'].includes(sceneStatus || ''))
+    return <Clock3 size={14} aria-label={label} />;
+  if (status === 'SUCCEEDED' && ['FAILED', 'CANCELLED'].includes(sceneStatus || ''))
+    return <X size={14} aria-label={label} />;
   if (status === 'RUNNING') return <LoaderCircle size={14} className="spin" aria-label={label} />;
   if (status === 'SUCCEEDED') return <CheckCircle2 size={14} aria-label={label} />;
   if (status === 'FAILED' || status === 'CANCELLED') return <X size={14} aria-label={label} />;
@@ -29,7 +40,11 @@ export function PageStatusIcon({ status }: { status?: string }) {
   return <Clock3 size={14} aria-label={label} />;
 }
 
-export function GenerationProgress({ pages }: { pages: { status: string }[] }) {
+export function GenerationProgress({
+  pages,
+}: {
+  pages: { status: string; scene?: { status: string } }[];
+}) {
   const count = (statuses: string[]) =>
     pages.filter((page) => statuses.includes(page.status)).length;
   return (
@@ -41,6 +56,13 @@ export function GenerationProgress({ pages }: { pages: { status: string }[] }) {
       <span>
         校验 {count(['VALIDATING'])} · 完成 {count(['SUCCEEDED'])}
       </span>
+      {pages.some((p) => p.scene && ['QUEUED', 'RUNNING', 'FAILED'].includes(p.scene.status)) && (
+        <span>
+          转换中{' '}
+          {pages.filter((p) => p.scene && ['QUEUED', 'RUNNING'].includes(p.scene.status)).length} ·
+          转换失败 {pages.filter((p) => p.scene?.status === 'FAILED').length}
+        </span>
+      )}
     </span>
   );
 }

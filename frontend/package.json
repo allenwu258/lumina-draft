@@ -19,10 +19,12 @@
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "typescript": "5.8.3",
-    "vite": "6.3.5"
+    "vite": "6.3.5",
+    "@lumina/scene-core": "0.1.0",
+    "@lumina/scene-renderer": "0.1.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.65.0",
+    "@playwright/test": "1.65.0",
     "@tailwindcss/cli": "4.3.5",
     "@types/react": "19.1.6",
     "@types/react-dom": "19.1.6",

@@ -107,16 +107,35 @@ test('Provider configuration, model discovery, routing and presentation generati
   expect(historyTitle!.x - (historyIcon!.x + historyIcon!.width)).toBeLessThanOrEqual(16);
   const generationTab = page.getByRole('tab', { name: /页面生成/ });
   await expect(generationTab).toHaveAttribute('aria-selected', 'true');
+  const sceneCanvas = page.locator(
+    '.canvas-stage .scene-viewport[data-render-status="ready"] canvas',
+  );
+  await expect(sceneCanvas).toBeVisible();
+  await expect(page.getByRole('button', { name: '新版预览', exact: true })).toHaveClass('selected');
+  const sceneId = await page.locator('.scene-viewport').getAttribute('data-scene-id');
+  expect(sceneId).toBeTruthy();
+  const sceneResponse = await page.request.get(`/api/v1/scenes/${sceneId}`);
+  expect(sceneResponse.ok()).toBe(true);
+  const scene = await sceneResponse.json();
+  expect(scene.schemaVersion).toBe('0.3.0');
+  expect(
+    scene.nodes.some(
+      (n: any) => n.kind === 'text' && n.text.sourceText.includes('Provider 验收完成'),
+    ),
+  ).toBe(true);
+  await page.getByRole('button', { name: 'HTML 预览', exact: true }).click();
   const slideFrame = page.locator('.canvas-stage iframe.slide-frame');
   await expect(slideFrame).toBeVisible();
   const slide = await slideFrame.contentFrame();
   await expect(slide!.locator('[data-tailwind-profile="tailwind-ppt-v1"]')).toBeAttached();
   await expect
-    .poll(() => slide!.locator('#tailwind-proof').evaluate((element) => ({
-      display: getComputedStyle(element.parentElement!).display,
-      fontSize: getComputedStyle(element).fontSize,
-      color: getComputedStyle(element).color,
-    })))
+    .poll(() =>
+      slide!.locator('#tailwind-proof').evaluate((element) => ({
+        display: getComputedStyle(element.parentElement!).display,
+        fontSize: getComputedStyle(element).fontSize,
+        color: getComputedStyle(element).color,
+      })),
+    )
     .toEqual({ display: 'flex', fontSize: '32px', color: 'rgb(31, 41, 55)' });
   for (const viewport of [
     { width: 1440, height: 1000 },
@@ -130,15 +149,41 @@ test('Provider configuration, model discovery, routing and presentation generati
         const stage = await page.locator('.canvas-stage').boundingBox();
         return Boolean(
           frame &&
-            stage &&
-            frame.x >= stage.x - 1 &&
-            frame.y >= stage.y - 1 &&
-            frame.x + frame.width <= stage.x + stage.width + 1 &&
-            frame.y + frame.height <= stage.y + stage.height + 1,
+          stage &&
+          frame.x >= stage.x - 1 &&
+          frame.y >= stage.y - 1 &&
+          frame.x + frame.width <= stage.x + stage.width + 1 &&
+          frame.y + frame.height <= stage.y + stage.height + 1,
         );
       })
       .toBe(true);
   }
+  await page.getByRole('button', { name: 'HTML 源码', exact: true }).click();
+  await expect(page.locator('.source-view')).toContainText('data-css-profile="tailwind-ppt-v1"');
+  await page.getByRole('button', { name: '新版预览', exact: true }).click();
+  await expect(sceneCanvas).toBeVisible();
+  let rawHtmlRequests = 0;
+  await page.route('**/api/v1/page-tasks/*/html', (route) => {
+    rawHtmlRequests++;
+    return route.abort();
+  });
+  let allowScene = false;
+  await page.route(`**/api/v1/scenes/${sceneId}`, (route) =>
+    allowScene
+      ? route.continue()
+      : route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({ detail: { message: '场景加载暂时失败' } }),
+        }),
+  );
+  await page.reload();
+  await expect(page.getByRole('button', { name: '重试渲染', exact: true })).toBeVisible();
+  allowScene = true;
+  await page.getByRole('button', { name: '重试渲染', exact: true }).click();
+  await expect(sceneCanvas).toBeVisible();
+  expect(await page.locator('.scene-viewport').getAttribute('data-scene-id')).toBe(sceneId);
+  expect(rawHtmlRequests).toBe(0);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole('tab', { name: /大纲/ }).click();
   await expect(page.locator('.outline-title-input').first()).toHaveAttribute('readonly', '');
@@ -165,7 +210,10 @@ test('Entry mode routing keeps unavailable workflows visible but blocked', async
   await mode.click();
   const menu = page.getByRole('menu', { name: '选择创作模式' });
   await expect(menu.getByRole('menuitem', { name: /Agent 模式/ })).toBeVisible();
-  await expect(menu.getByRole('menuitem', { name: /设计生成/ })).toHaveAttribute('aria-disabled', 'true');
+  await expect(menu.getByRole('menuitem', { name: /设计生成/ })).toHaveAttribute(
+    'aria-disabled',
+    'true',
+  );
   await menu.getByRole('menuitem', { name: /Agent 模式/ }).click();
   await expect(page.getByPlaceholder(/步骤化/)).toBeVisible();
   await page.locator('.composer textarea').fill('用 Agent 方式梳理一个产品发布会');

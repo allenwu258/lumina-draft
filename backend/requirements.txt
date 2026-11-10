@@ -9,4 +9,5 @@ beautifulsoup4==4.13.4
 tinycss2==1.4.0
 pytest==8.4.1
 pytest-asyncio==1.0.0
+jsonschema==4.23.0
 

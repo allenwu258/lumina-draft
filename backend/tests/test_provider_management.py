@@ -61,6 +61,10 @@ def managed_client(tmp_path, monkeypatch):
         await stop.wait()
 
     monkeypatch.setattr(main, "scheduler", idle_scheduler)
+    # These tests run model orchestration on pytest's loop and HTTP on TestClient's
+    # loop. Keep both background queues idle; scene queue tests run on one loop.
+    monkeypatch.setattr(main, "scene_scheduler", idle_scheduler)
+    monkeypatch.setattr(runtime, "EVENT_WRITE_LOCK", asyncio.Lock())
 
     async def fake_stream(**kwargs):
         if (kwargs.get("json_schema") or {}).get("properties", {}).get("ok"):

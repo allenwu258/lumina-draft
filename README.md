@@ -10,7 +10,7 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 - **大纲流式展示**：分栏显示供应商返回的 reasoning 文本或摘要与 JSON 正文；支持折叠查看、自动跟随滚动，手动向上滚动时暂停跟随。
 - **大纲编辑与确认**：完整 JSON 解析并通过结构校验后进入编辑；确认后才启动页面生成。
 - **页面并行生成**：结合全局规范、当前页任务与相邻页摘要生成独立 HTML；新页面使用受控的 Tailwind CSS v4 utility 子集，预览由后端注入本地编译样式，不依赖 CDN。按所选模型并发分配调用名额，等待页面与正在生成页面分开展示。
-- **页面查看**：展示各页状态，提供 HTML 源码与通过校验的页面预览；保留原始 HTML，不转换成可编辑的结构化画布。
+- **页面查看**：默认由自研 Canvas 直接渲染持久化 SceneIR，另提供 HTML 预览和 HTML 源码；保留原始 HTML 作为生成来源与对照。当前画布只预览，不提供编辑或 PPTX 导出。
 - **恢复与重试**：作品、任务和 SSE 事件落库，支持浏览器刷新、断线回放、取消生成与失败重试。
 - **模型配置与统计**：独立 Provider 管理页，支持多连接、多模型、主动发现、思考档位、模型并发、业务 Override、模型测试与调用详情；作品按冻结配置生成。
 
@@ -22,21 +22,23 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 2. 输入主题、受众、目标和内容要求，点击“生成说明书”，也可使用 `Ctrl/Cmd + Enter`。
 3. 查看 Director 的 reasoning 与 JSON 正文流。流文本仅供查看，尚未完成的大纲不能确认。
 4. 等待完整说明书校验通过，检查并编辑逐页内容，再点击“确认并生成”。
-5. 查看各页的并行生成进度；完成的页面可切换预览与源码。
+5. 查看各页的 HTML 生成与排队转换进度；默认进入新版 Canvas 预览，也可切换 HTML 预览和源码。转换失败只重试转换，不重新调用模型。
 6. 遇到失败可查看错误并重试。页面阶段重试保留成功页，仅重新执行未成功的页面。
 
 页数由 Director 根据内容自主确定，当前结构契约支持 **1–20 页**。创建接口没有 `page_count` 参数；当前提示词也不把用户文字中的指定页数作为约束或偏好。
 
 ## 快速启动
 
-需要 Python 3.11+、Node.js 20+、npm，以及可用的系统凭据存储。以下命令在**仓库根目录**的 PowerShell 中运行。
+需要 Python 3.11+、Node.js 22.12+、npm，以及可用的系统凭据存储。以下命令在**仓库根目录**的 PowerShell 中运行。
 
 ### 安装依赖
 
 ```powershell
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r backend/requirements.txt
-npm --prefix frontend ci
+npm ci
+npm run build:scene
+npm run browser:install
 ```
 
 ### 启动后端
@@ -50,7 +52,7 @@ npm --prefix frontend ci
 在另一个终端中，从仓库根目录运行：
 
 ```powershell
-npm --prefix frontend run dev -- --port 5173
+npm run dev -- --port 5173
 ```
 
 | 服务 | 地址 |
@@ -63,6 +65,22 @@ npm --prefix frontend run dev -- --port 5173
 前端开发服务器将 `/api` 代理到 `http://127.0.0.1:8000`。请使用以上命令启动 Vite：直接在仓库根目录运行 Vite 且未指定前端根目录，会找不到正确的页面入口和代理配置。
 
 后端使用单 Uvicorn worker，服务绑定回环地址。当前队列和事件通知按本机单进程设计，不适用于多 worker、公网或多用户部署。
+
+## HTML → SceneIR → Canvas
+
+HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。独立的 SQLite FIFO 转换队列只有一个活动槽，不占模型并发额度。FastAPI 监督一个 Node 子进程和一个热 Chromium；每页使用新 BrowserContext，结束后释放。后端关闭或重启时，中断转换回到队列并更换执行令牌。浏览器崩溃等基础设施错误最多自动重试一次；内容错误需要显式重试。
+
+`scene_conversion_jobs` 保存冻结 HTML/CSS、来源哈希和执行状态；`page_scenes` 保存不可变 SceneIR JSON 与资源引用。PageTask 只指向当前任务和场景。旧任务必须同时匹配执行令牌、当前任务引用与 HTML 哈希，才能发布结果。资产先验证并安装，再提交场景、当前引用和事件。
+
+转换使用与 HTML 预览相同的本地 Tailwind CSS 字节，固定 800×450、DPR 1、zh-CN 和 Asia/Shanghai，阻断外部网络和作者脚本。浏览器计算 Flex/Grid；转换器读取实际几何、文本片段、绘制顺序和裁剪。Canvas 直接绘制 SceneIR，不读取 HTML、DOM 报告或 RenderPlan，也不重新换行。SVG 是 SceneIR 声明的透明 PNG 资产，页面的其余内容仍为结构化图元。
+
+当前覆盖受控 profile 中的布局、背景、圆角实线边框、中文/英文富文本、大小写、字距、基础表格、SVG、透明组和 overflow 裁剪。Box shadow 使用 Canvas 模糊近似并记录提示。合并表格、滤镜、渐变、伪元素文字、变换、复杂文字排版等尚未支持的内容会明确失败，可继续查看 HTML。当前以同一台机器的系统字体为准，字体宽度明显失配时不会发布成功首帧；跨机器字体分发和 Office 一致性留给后续。
+
+已有成功 HTML 页在第一次打开新版预览时按需转换，不批量迁移历史作品。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。未来 PPTX 导出从 SceneIR 构建 RenderPlan，本轮不引入导出专用持久模型。
+
+所有 npm 依赖都在仓库根目录安装，已移除前端单独的锁文件。全新安装或修改共享包后，启动后端前先运行 `npm run build:scene`；修改共享渲染器后需重新构建该包，Vite 会加载构建产物。Chromium 使用锁定的 Playwright 版本，通过 `npm run browser:install` 显式安装，不在请求时下载。依赖缺失的原因可在健康接口的 `scene_worker` 字段和转换错误中查看。
+
+默认资源在 `data/scenes/`，可用 `SCENE_DATA_DIR` 指定绝对目录。资源目录必须与 SQLite 一起备份；不要只复制数据库。Worker 无额外 HTTP 端口，通过带 request ID 和 attempt token 的 JSONL 与 Python 通信。Windows 使用 Job Object 约束并回收自己的 Worker/Chromium 进程树，不操作用户浏览器。仍只支持单后端进程。
 
 ## 模型与 API 配置
 
@@ -191,10 +209,14 @@ frontend/
     generation-settings.css
   vite.config.ts   # React 插件与 /api 开发代理
   package.json
+packages/scene-core/ # SceneIR 0.3 契约、类型与引用/几何校验
+packages/scene-renderer/ # 只消费 SceneIR 的 Canvas 2D 渲染器
+services/slide-worker/ # 常驻 Node/Chromium，DOM 测量、文字归属与 SceneIR 转换
+package.json / package-lock.json # npm workspaces 与唯一安装锁文件
 data/              # 默认 SQLite 数据目录，运行时创建，不纳入版本控制
 ```
 
-技术栈：Python / FastAPI / LangGraph / SQLAlchemy / Pydantic / httpx；React / TypeScript / Vite；SQLite 与系统 keyring。
+技术栈：Node.js / Playwright Chromium / Canvas 2D；Python / FastAPI / LangGraph / SQLAlchemy / Pydantic / httpx；React / TypeScript / Vite；SQLite 与系统 keyring。
 
 SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、持久化任务队列、SSE 事件、模型调用用量、供应商路由和生成设置。默认路径相对于后端启动时的工作目录，因此应始终从仓库根目录启动后端。
 
@@ -227,6 +249,9 @@ SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、�
 | GET | `/presentations/{id}/events` | SSE 订阅，支持 `after` 与 `Last-Event-ID` |
 | GET | `/presentations/{id}/usage` | 当前作品会话用量 |
 | POST | `/runs/{id}/cancel` | 请求取消运行 |
+| POST | `/page-tasks/{id}/scene-conversions` | 幂等确保转换或显式重试，要求 expected_html_hash |
+| GET | `/scenes/{id}` | 获取指定不可变 SceneIR，支持 ETag |
+| GET | `/scenes/{id}/assets/{asset_id}` | 获取该场景已声明的受控资产 |
 | GET | `/page-tasks/{id}/html` | 获取已成功页面的原始 HTML |
 | POST | `/page-tasks/{id}/preview-tickets` | 创建短期预览票据 |
 | GET | `/previews/{id}?ticket=...` | 使用票据预览页面 |
@@ -239,9 +264,10 @@ SQLite 保存作品、版本化大纲、运行记录、页面任务和 HTML、�
 
 ```powershell
 .venv/Scripts/python.exe -m pytest backend/tests -q
-npm --prefix frontend run build
-npm --prefix frontend exec -- playwright install chromium
-npm --prefix frontend run test:e2e
+npm run build
+npm run browser:install
+npm run test:scene
+npm run test:e2e
 npm --prefix frontend run format:providers:check
 git diff --check
 ```
@@ -250,9 +276,11 @@ git diff --check
 
 Provider 新模块格式化使用 `npm --prefix frontend run format:providers`；后端新模块使用 `black`，可通过 `.venv/Scripts/python.exe -m pip install -r backend/requirements-dev.txt` 安装开发依赖。
 
+Scene 专项测试使用真实 Chromium 与独立 HTML 截图比较，检查文字轮廓、形状、表格、SVG、DPR 与确定性；队列测试注入可控转换故障，验证单槽、幂等、恢复、取消与发布拦截。浏览器端到端覆盖默认 Canvas、HTML 对照、源码和刷新复用场景，不调用真实模型。
+
 ## 常见问题
 
-- **前端 404 或 API 代理失败**：使用 `npm --prefix frontend run dev -- --port 5173` 启动，确认后端位于 8000 端口。若修改端口，需同步调整开发代理与后端允许的前端来源。
+- **前端 404 或 API 代理失败**：使用 `npm run dev -- --port 5173` 启动，确认后端位于 8000 端口。若修改端口，需同步调整开发代理与后端允许的前端来源。
 - **找不到作品或生成设置恢复默认**：确认后端是否从仓库根目录启动，以及 `DATABASE_URL` 是否指向原来的数据库文件。
 - **模型配置不完整或凭据保存失败**：确认模型已启用、API Key 已保存，以及操作系统 keyring 可用；保存 API Key 不会写回明文配置文件。
 - **没有 reasoning 文本**：先确认供应商是否返回对应事件。模型支持推理力度，并不保证接口提供可见的 reasoning 增量。

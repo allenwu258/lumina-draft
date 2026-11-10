@@ -11,6 +11,7 @@ os.environ["DATABASE_URL"] = (
     "sqlite:///" + (Path(_temporary.name) / "test.db").as_posix()
 )
 os.environ["DS_API_FILE"] = str(Path(_temporary.name) / "missing.txt")
+os.environ["SCENE_DATA_DIR"] = str(Path(_temporary.name) / "scenes")
 os.environ.pop("DS_API_KEY", None)
 
 from backend.app import db, main, provider_api, runtime  # noqa: E402

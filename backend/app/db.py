@@ -260,11 +260,50 @@ class PageTask(Base):
     status: Mapped[str] = mapped_column(String(30), default="PENDING", index=True)
     html: Mapped[str | None] = mapped_column(Text, nullable=True)
     html_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_scene_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    current_scene_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class SceneConversionJob(Base):
+    __tablename__ = "scene_conversion_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    page_task_id: Mapped[str] = mapped_column(ForeignKey("page_tasks.id"), index=True)
+    presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"))
+    input_hash: Mapped[str] = mapped_column(String(64))
+    html_hash: Mapped[str] = mapped_column(String(64))
+    source_html: Mapped[str] = mapped_column(Text)
+    css: Mapped[str] = mapped_column(Text)
+    css_hash: Mapped[str] = mapped_column(String(64))
+    converter_version: Mapped[str] = mapped_column(String(80))
+    environment_key: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="QUEUED", index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("page_task_id", "input_hash", name="uq_scene_input"),)
+
+
+class PageScene(Base):
+    __tablename__ = "page_scenes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("scene_conversion_jobs.id"), unique=True)
+    page_task_id: Mapped[str] = mapped_column(ForeignKey("page_tasks.id"), index=True)
+    schema_version: Mapped[str] = mapped_column(String(20))
+    scene_hash: Mapped[str] = mapped_column(String(64))
+    warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    scene_json: Mapped[str] = mapped_column(Text)
+    asset_dir: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Event(Base):
@@ -557,7 +596,8 @@ def _upgrade_existing_schema() -> bool:
             "archived_at": "DATETIME NULL",
         },
         "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
-        "page_tasks": {"error_code": "VARCHAR(80) NULL"},
+        "page_tasks": {"error_code": "VARCHAR(80) NULL", "current_scene_job_id": "VARCHAR(36) NULL", "current_scene_id": "VARCHAR(36) NULL"},
+        "page_scenes": {"warning_count": "INTEGER NOT NULL DEFAULT 0"},
         "jobs": {
             "model_id": "VARCHAR(36) NULL",
             "error_code": "VARCHAR(80) NULL",

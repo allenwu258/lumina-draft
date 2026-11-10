@@ -1,0 +1,27 @@
+{
+  "name": "lumina-draft",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "packages/scene-core",
+    "packages/scene-renderer",
+    "services/slide-worker"
+  ],
+  "scripts": {
+    "build:scene": "npm run build -w @lumina/scene-core && npm run build -w @lumina/scene-renderer && npm run build -w @lumina/slide-worker",
+    "build": "npm run build:scene && npm run build -w lumina-draft-web",
+    "dev": "npm run dev -w lumina-draft-web --",
+    "browser:install": "playwright-core install chromium",
+    "test:scene": "npm run build:scene && node --test services/slide-worker/tests/*.test.mjs",
+    "test:e2e": "npm run test:e2e -w lumina-draft-web",
+    "predev": "npm run build:scene",
+    "pretest:e2e": "npm run build:scene"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.21",
+    "esbuild": "0.25.12",
+    "pngjs": "7.0.0",
+    "typescript": "5.8.3"
+  }
+}

@@ -14,13 +14,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm.exc import StaleDataError
 
-from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
+from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, PageScene, SceneConversionJob, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
 from .provider_management import ConfigurationError, resolve_all_routes, resolve_business_route, route_issues
 from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
 from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, finalize_cancelled_run, scheduler, sync_conversation_run
 from .schemas import ConfirmRequest, CreatePresentationRequest, GenerationSettingsUpdate, OutlineDocument, ProviderUpdate, RetryRequest, UpdateOutlineRequest
 from .secrets import read_secret
+from .scene_api import router as scene_router
+from .scene_runtime import HEALTH as SCENE_HEALTH, scene_scheduler
+from .scene_service import summary as scene_summary, cancel_conversions
 
 
 @asynccontextmanager
@@ -28,19 +31,25 @@ async def lifespan(app: FastAPI):
     init_db()
     stop = asyncio.Event()
     task = asyncio.create_task(scheduler(stop))
-    yield
-    stop.set()
+    scene_task = asyncio.create_task(scene_scheduler(stop))
     try:
-        await asyncio.wait_for(task, timeout=3)
-    except asyncio.TimeoutError:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        yield
+    finally:
+        stop.set()
+        scene_task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=3)
+        except asyncio.TimeoutError:
+            task.cancel()
+        finally:
+            await asyncio.gather(task, scene_task, return_exceptions=True)
 
 
 app = FastAPI(title="Lumina Draft API", version="0.1.0", lifespan=lifespan)
+app.include_router(scene_router)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
 API = "/api/v1"
-TICKETS: dict[str, tuple[str, float]] = {}
+TICKETS: dict[str, tuple[str, float, str | None]] = {}
 
 
 @app.exception_handler(RequestValidationError)
@@ -119,8 +128,8 @@ def job_dict(job: Job | None) -> dict | None:
     }
 
 
-def page_dict(p: PageTask) -> dict:
-    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt}
+def page_dict(p: PageTask, db) -> dict:
+    return {"id": p.id, "run_id": p.run_id, "slide_id": p.slide_id, "page_number": p.page_number, "title": p.title, "status": p.status, "html_hash": p.html_hash, "error": p.error, "error_code": getattr(p, "error_code", None), "attempt": p.attempt, "scene": scene_summary(db, p)}
 
 
 def conversation_projection(db, presentation: Presentation, outline: Outline | None, runs: list[Run]) -> dict:
@@ -168,7 +177,7 @@ def provider_dict(route, model, binding, endpoint, owner) -> dict:
 @app.get(f"{API}/health/live")
 @app.get(f"{API}/health/ready")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "scene_worker": dict(SCENE_HEALTH)}
 
 
 @app.get(f"{API}/settings/llm/default")
@@ -446,7 +455,7 @@ def get_presentation(presentation_id: str):
                 if channel in director_stream:
                     director_stream[channel] += payload.get("delta", "")
         conversation = conversation_projection(db, p, outline, runs)
-        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
+        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq}
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")
@@ -657,6 +666,7 @@ async def cancel_run(run_id: str):
                 page.status, page.error_code, page.error = "CANCELLED", "PAGE_CANCELLED", "页面生成已取消"
         elif not already_requested:
             run.status = "CANCEL_REQUESTED"
+    await cancel_conversions(run_id)
     active = ACTIVE_RUNS.get(run_id)
     if active:
         active.cancel()
@@ -683,26 +693,35 @@ def page_html(task_id: str):
     return _page_html_response(task_id)
 
 
-def _page_html_response(task_id: str, *, include_tailwind: bool = False):
+def _page_html_response(task_id: str, *, include_tailwind: bool = False, scene_id: str | None = None):
     with session_scope() as db:
         page = db.get(PageTask, task_id)
         if not page: fail("NOT_FOUND", "页面不存在", 404)
         if page.status != "SUCCEEDED" or not page.html: fail("PAGE_NOT_READY", "页面尚未完成")
         html = page.html
+        css = None
+        if scene_id:
+            scene = db.get(PageScene, scene_id)
+            job = db.get(SceneConversionJob, scene.job_id) if scene and scene.page_task_id == task_id else None
+            if not job: fail("SCENE_NOT_FOUND", "对应场景不存在", 404)
+            html, css = job.source_html, job.css
     if include_tailwind:
         from .tailwind_profile import preview_html
-        html = preview_html(html)
+        html = preview_html(html, css=css)
     return HTMLResponse(html, headers={"Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self' http://127.0.0.1:5173 http://localhost:5173", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 @app.post(f"{API}/page-tasks/{{task_id}}/preview-tickets")
-def create_ticket(task_id: str):
+def create_ticket(task_id: str, scene_id: str | None = None):
     with session_scope() as db:
         page = db.get(PageTask, task_id)
         if not page or page.status != "SUCCEEDED": fail("PAGE_NOT_READY", "页面尚未完成")
         digest = page.html_hash
+        if scene_id:
+            scene = db.get(PageScene, scene_id)
+            if not scene or scene.page_task_id != task_id: fail("SCENE_NOT_FOUND", "对应场景不存在", 404)
     ticket = secrets.token_urlsafe(32)
-    TICKETS[ticket] = (task_id, time.time() + 120)
+    TICKETS[ticket] = (task_id, time.time() + 120, scene_id)
     return {"preview_url": f"{API}/previews/{task_id}?ticket={ticket}", "html_hash": digest}
 
 
@@ -712,7 +731,7 @@ def preview(task_id: str, ticket: str):
     if not entry or entry[0] != task_id or entry[1] < time.time():
         TICKETS.pop(ticket, None)
         fail("INVALID_TICKET", "预览链接已过期", 403)
-    return _page_html_response(task_id, include_tailwind=True)
+    return _page_html_response(task_id, include_tailwind=True, scene_id=entry[2])
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/events")

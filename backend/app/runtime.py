@@ -372,11 +372,17 @@ class ProviderGateway:
         return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, run_id=run_id, business_code=business_code)
 
 
+def append_event_tx(db, presentation_id: str, event_type: str, payload: dict[str, Any], run_id: str | None = None) -> None:
+    """Caller holds EVENT_WRITE_LOCK; state and event commit together."""
+    current = db.scalar(select(Event.seq).where(Event.presentation_id == presentation_id).order_by(Event.seq.desc()).limit(1)) or 0
+    db.add(Event(presentation_id=presentation_id, seq=current + 1, run_id=run_id, type=event_type, payload_json=dumps(payload)))
+    db.flush()
+
+
 async def emit_event(presentation_id: str, event_type: str, payload: dict[str, Any], run_id: str | None = None) -> None:
     async with EVENT_WRITE_LOCK:
         with session_scope() as db:
-            current = db.scalar(select(Event.seq).where(Event.presentation_id == presentation_id).order_by(Event.seq.desc()).limit(1)) or 0
-            db.add(Event(presentation_id=presentation_id, seq=current + 1, run_id=run_id, type=event_type, payload_json=dumps(payload)))
+            append_event_tx(db, presentation_id, event_type, payload, run_id)
     await EVENT_BUS.notify(presentation_id)
 
 
@@ -413,6 +419,8 @@ async def finalize_cancelled_run(run_id: str) -> bool:
                 "PAGE_CANCELLED",
                 "页面生成已取消",
             )
+    from .scene_service import cancel_conversions
+    await cancel_conversions(run_id)
     await emit_event(
         presentation_id,
         "run.cancelled",
@@ -600,11 +608,17 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
         if not valid:
             raise ProviderError("INVALID_HTML", reason)
         digest = html_hash(html)
-        with session_scope() as db:
-            task = db.get(PageTask, task_id)
-            if task and task.run_id == run_id:
-                task.status, task.html, task.html_hash, task.error = "SUCCEEDED", html, digest, None
-        await emit_event(presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
+        from .scene_service import enqueue_tx, WAKE
+        async with EVENT_WRITE_LOCK:
+            with session_scope() as db:
+                task, run = db.get(PageTask, task_id), db.get(Run, run_id)
+                if not task or task.run_id != run_id or not run or run.status != "RUNNING":
+                    raise asyncio.CancelledError()
+                task.status, task.html, task.html_hash, task.error, task.error_code = "SUCCEEDED", html, digest, None, None
+                append_event_tx(db, presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
+                enqueue_tx(db, task, retry=True)
+        WAKE.set()
+        await EVENT_BUS.notify(presentation_id)
     except asyncio.CancelledError:
         with session_scope() as db:
             task = db.get(PageTask, task_id)
