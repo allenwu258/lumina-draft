@@ -5,7 +5,6 @@ import json
 import secrets
 import time
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +14,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm.exc import StaleDataError
 
 from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, PageScene, SceneConversionJob, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
-from .provider_management import ConfigurationError, resolve_all_routes, resolve_business_route, route_issues
+from .provider_management import ConfigurationError, resolve_workflow_routes, resolve_business_route, route_issues
+from .workflows import ENTRY_WORKFLOWS, WORKFLOWS, scheduled_model_id
 from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
 from .runtime import ACTIVE_RUNS, EVENT_BUS, canonical_hash, emit_event, finalize_cancelled_run, scheduler, sync_conversation_run
@@ -88,7 +88,9 @@ def fail(code: str, message: str, status: int = 409):
 
 
 def presentation_dict(p: Presentation) -> dict:
-    return {"id": p.id, "user_request": p.user_request, "options": loads(p.options_json), "status": p.status, "entry_mode": getattr(p, "entry_mode", "ppt"), "workflow_code": getattr(p, "workflow_code", "ppt_create"), "conversation_id": getattr(p, "conversation_id", None), "created_at": p.created_at.isoformat(), "updated_at": p.updated_at.isoformat()}
+    options = loads(p.options_json)
+    width, height = WORKFLOWS[p.workflow_code].canvas(options)
+    return {"id": p.id, "user_request": p.user_request, "options": options, "canvas": {"width": width, "height": height}, "status": p.status, "entry_mode": p.entry_mode, "workflow_code": p.workflow_code, "conversation_id": p.conversation_id, "created_at": p.created_at.isoformat(), "updated_at": p.updated_at.isoformat()}
 
 
 def message_dict(message: ConversationMessage) -> dict:
@@ -166,12 +168,6 @@ def conversation_projection(db, presentation: Presentation, outline: Outline | N
             "generation": confirmed and has_generation,
         },
     }
-
-
-def scheduled_model_id(snapshot: dict[str, Any], kind: str) -> str | None:
-    route_code = "ppt_outline" if kind == "DIRECTOR" else "ppt_html"
-    route = (snapshot.get("resolved_routes") or {}).get(route_code) or {}
-    return route.get("model_id") or snapshot.get("model_id")
 
 
 def provider_dict(route, model, binding, endpoint, owner) -> dict:
@@ -309,16 +305,17 @@ def get_conversation(conversation_id: str):
 @app.post(f"{API}/presentations", status_code=202)
 async def create_presentation(body: CreatePresentationRequest, idempotency_key: str | None = Header(default=None, max_length=200)):
     request_hash = canonical_hash(body.model_dump())
+    workflow = ENTRY_WORKFLOWS.get(body.entry_mode)
+    if not workflow:
+        fail("WORKFLOW_NOT_AVAILABLE", "图片生成尚未开放", 409)
     with session_scope() as db:
-        if body.entry_mode in {"design", "image"}:
-            fail("WORKFLOW_NOT_AVAILABLE", "该工作流尚未开放，当前可使用 Agent 模式或 PPT 生成", 409)
         if idempotency_key:
             prior = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.scope == "presentations.create", IdempotencyRecord.key == idempotency_key))
             if prior:
                 if prior.request_hash != request_hash: fail("IDEMPOTENCY_CONFLICT", "幂等键已用于其他请求")
                 return loads(prior.response_json)
         try:
-            resolved_routes = resolve_all_routes(db)
+            resolved_routes = resolve_workflow_routes(db, workflow)
         except ConfigurationError as exc:
             fail(exc.code, str(exc), exc.status_code)
         route, model, binding, endpoint, owner = resolve_default(db)
@@ -362,7 +359,7 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             config_snapshot_json=dumps(snapshot),
             conversation_id=conversation.id,
             entry_mode=body.entry_mode,
-            workflow_code="ppt_create",
+            workflow_code=workflow.code,
         )
         db.add(presentation)
         db.flush()
@@ -373,14 +370,14 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             run_id=run.id,
             presentation_id=presentation.id,
             kind="DIRECTOR",
-            model_id=scheduled_model_id(snapshot, "DIRECTOR"),
+            model_id=scheduled_model_id(snapshot, "DIRECTOR", workflow.code),
             status="QUEUED",
         ))
         turn = ConversationTurn(
             conversation_id=conversation.id,
             turn_no=1,
             presentation_id=presentation.id,
-            workflow_code="ppt_create",
+            workflow_code=workflow.code,
             state="QUEUED",
             active_run_id=run.id,
         )
@@ -413,6 +410,8 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         conversation.latest_turn_no = 1
         pid, rid, cid, tid = presentation.id, run.id, conversation.id, turn.id
         response = {"presentation_id": pid, "conversation_id": cid, "turn_id": tid, "run_id": rid, "entry_mode": body.entry_mode, "status": "PLANNING"}
+        width, height = workflow.canvas(body.options.model_dump())
+        response.update(workflow_code=workflow.code, canvas={"width": width, "height": height})
         if idempotency_key:
             db.add(IdempotencyRecord(scope="presentations.create", key=idempotency_key, request_hash=request_hash, response_json=dumps(response)))
     await emit_event(pid, "presentation.created", {"presentation_id": pid, "run_id": rid}, rid)
@@ -538,7 +537,7 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
             run_id=run.id,
             presentation_id=p.id,
             kind="GENERATION",
-            model_id=scheduled_model_id(snapshot, "GENERATION"),
+            model_id=scheduled_model_id(snapshot, "GENERATION", p.workflow_code),
             status="QUEUED",
         ))
         if p.conversation_id:
@@ -595,7 +594,7 @@ async def retry_presentation(presentation_id: str):
                 run_id=run.id,
                 presentation_id=p.id,
                 kind="DIRECTOR",
-                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
+                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind, p.workflow_code),
             ))
             retry_kind = "activity"
         elif p.status in {"PARTIAL_FAILED", "CANCELLED"} and previous.kind == "GENERATION":
@@ -610,7 +609,7 @@ async def retry_presentation(presentation_id: str):
                 run_id=run.id,
                 presentation_id=p.id,
                 kind="GENERATION",
-                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind),
+                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind, p.workflow_code),
             ))
             retry_kind = "generation_card"
         else:

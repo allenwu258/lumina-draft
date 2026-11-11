@@ -4,10 +4,11 @@ import type {
   GroupNode,
   TextStyle,
   Rect,
+  CanvasSize,
 } from "@lumina/scene-core";
 
 /** Runs in the isolated page. No imports/closures: all author text is visited exactly once. */
-export async function extractDOM(): Promise<{
+export async function extractDOM({ width, height }: CanvasSize): Promise<{
   nodes: SceneNode[];
   paintOps: SceneIR["paintOps"];
   textInventory: SceneIR["textInventory"];
@@ -31,8 +32,8 @@ export async function extractDOM(): Promise<{
 }> {
   const root = document.querySelector<HTMLElement>("#ppt-page")!;
   const origin = root.getBoundingClientRect();
-  if (Math.abs(origin.width - 800) > 0.1 || Math.abs(origin.height - 450) > 0.1)
-    throw new Error("UNSUPPORTED_CANVAS: expected 800x450");
+  if (Math.abs(origin.width - width) > 0.1 || Math.abs(origin.height - height) > 0.1)
+    throw new Error(`UNSUPPORTED_CANVAS: expected ${width}x${height}`);
   const nodes: SceneNode[] = [],
     paintOps: SceneIR["paintOps"] = [],
     textInventory: SceneIR["textInventory"] = [],
@@ -669,12 +670,12 @@ export async function extractDOM(): Promise<{
       n.kind !== "table" &&
       (n.frame.x < 0 ||
         n.frame.y < 0 ||
-        n.frame.x + n.frame.width > 800 ||
-        n.frame.y + n.frame.height > 450)
+        n.frame.x + n.frame.width > width ||
+        n.frame.y + n.frame.height > height)
     ) {
       const outside =
-        n.frame.x >= 800 ||
-        n.frame.y >= 450 ||
+        n.frame.x >= width ||
+        n.frame.y >= height ||
         n.frame.x + n.frame.width <= 0 ||
         n.frame.y + n.frame.height <= 0;
       diagnostics.push({

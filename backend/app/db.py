@@ -12,6 +12,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings, _read_key_file
 from .secrets import save_secret
+from .workflows import ROUTE_LABELS
 
 
 def utcnow() -> datetime:
@@ -280,6 +281,8 @@ class SceneConversionJob(Base):
     source_html: Mapped[str] = mapped_column(Text)
     css: Mapped[str] = mapped_column(Text)
     css_hash: Mapped[str] = mapped_column(String(64))
+    canvas_width: Mapped[int] = mapped_column(Integer, default=800)
+    canvas_height: Mapped[int] = mapped_column(Integer, default=450)
     converter_version: Mapped[str] = mapped_column(String(80))
     environment_key: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="QUEUED", index=True)
@@ -465,7 +468,7 @@ def init_db() -> None:
             db.commit()
         default_route = db.get(BusinessRoute, "default")
         generation = db.get(GenerationSettingsRecord, "default")
-        for route_code in ("ppt_outline", "ppt_html"):
+        for route_code in ROUTE_LABELS.keys() - {"default"}:
             if db.get(BusinessRouteOverride, route_code) is None:
                 db.add(BusinessRouteOverride(code=route_code))
         for model in db.scalars(select(LogicalModel)).all():
@@ -625,6 +628,10 @@ def _upgrade_existing_schema() -> bool:
         "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
         "page_tasks": {"error_code": "VARCHAR(80) NULL", "current_scene_job_id": "VARCHAR(36) NULL", "current_scene_id": "VARCHAR(36) NULL"},
         "page_scenes": {"warning_count": "INTEGER NOT NULL DEFAULT 0"},
+        "scene_conversion_jobs": {
+            "canvas_width": "INTEGER NOT NULL DEFAULT 800",
+            "canvas_height": "INTEGER NOT NULL DEFAULT 450",
+        },
         "jobs": {
             "model_id": "VARCHAR(36) NULL",
             "error_code": "VARCHAR(80) NULL",
@@ -672,13 +679,20 @@ def _upgrade_existing_schema() -> bool:
                 """UPDATE jobs
                 SET model_id = (
                     SELECT COALESCE(
-                        CASE WHEN jobs.kind = 'DIRECTOR'
+                        CASE WHEN presentations.workflow_code = 'design_create' AND jobs.kind = 'DIRECTOR'
+                            THEN json_extract(presentations.config_snapshot_json,
+                                '$.resolved_routes.design_outline.model_id')
+                            WHEN presentations.workflow_code = 'design_create'
+                            THEN json_extract(presentations.config_snapshot_json,
+                                '$.resolved_routes.design_html.model_id')
+                            WHEN jobs.kind = 'DIRECTOR'
                             THEN json_extract(presentations.config_snapshot_json,
                                 '$.resolved_routes.ppt_outline.model_id')
                             ELSE json_extract(presentations.config_snapshot_json,
                                 '$.resolved_routes.ppt_html.model_id')
                         END,
-                        json_extract(presentations.config_snapshot_json, '$.model_id')
+                        CASE WHEN presentations.workflow_code = 'ppt_create'
+                            THEN json_extract(presentations.config_snapshot_json, '$.model_id') END
                     )
                     FROM presentations
                     WHERE presentations.id = jobs.presentation_id

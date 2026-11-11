@@ -174,7 +174,9 @@ def test_upgrade_preserves_routes_credentials_and_snapshots(
                 == original_snapshot
             )
             assert db.get(Job, "old-job").model_id == "model"
-            assert len(db.scalars(select(BusinessRouteOverride)).all()) == 2
+            assert {r.code for r in db.scalars(select(BusinessRouteOverride))} == {
+                "ppt_outline", "ppt_html", "design_outline", "design_html",
+            }
             assert len(db.scalars(select(SchemaMigration)).all()) == 2
             assert len(db.scalars(select(ApiProvider)).all()) == 1
             if source != "legacy_only":

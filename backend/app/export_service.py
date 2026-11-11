@@ -25,6 +25,7 @@ from .db import (
     loads,
     utcnow,
 )
+from .workflows import PPT
 from .scene_service import (
     ROOT,
     SCENE_TARGET,
@@ -52,6 +53,8 @@ def source_manifest(db, presentation_id: str) -> dict:
     presentation = db.get(Presentation, presentation_id)
     if not presentation:
         raise ExportError("NOT_FOUND", "作品不存在")
+    if presentation.workflow_code != PPT.code:
+        raise ExportError("EXPORT_NOT_SUPPORTED", "设计作品暂不支持 PPTX 导出")
     outline = db.scalar(
         select(Outline)
         .where(Outline.presentation_id == presentation_id)

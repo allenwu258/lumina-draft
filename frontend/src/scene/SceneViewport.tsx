@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { SceneRenderer, decodeAsset } from '@lumina/scene-renderer';
+import type { CanvasSize } from '@lumina/scene-core';
+import { fitCanvas } from './fitCanvas';
 import { ensureScene, fetchScene, type SceneSummary } from './scene-api';
 import './scene.css';
 
@@ -8,9 +10,10 @@ type Props = {
   htmlHash: string;
   scene?: SceneSummary;
   number: number;
+  expectedCanvas: CanvasSize;
   onScene: (scene: SceneSummary) => void;
 };
-export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Props) {
+export function SceneViewport({ pageId, htmlHash, scene, number, expectedCanvas, onScene }: Props) {
   const host = useRef<HTMLDivElement>(null),
     canvas = useRef<HTMLCanvasElement>(null);
   const callback = useRef(onScene);
@@ -38,9 +41,18 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
       container = host.current;
     setPhase('loading');
     setError('');
+    let page: CanvasSize = expectedCanvas;
     const resize = () => {
-      const scale = Math.min(container.clientWidth / 800, container.clientHeight / 450);
-      renderer.resize(800 * scale, 450 * scale, window.devicePixelRatio || 1);
+      const scale = fitCanvas(container.clientWidth, container.clientHeight, page);
+      // Bound the backing store even on very dense displays and large windows.
+      const width = Math.max(1, page.width * scale);
+      const height = Math.max(1, page.height * scale);
+      const dpr = Math.min(
+        window.devicePixelRatio || 1,
+        2,
+        Math.sqrt(8_294_400 / (width * height)),
+      );
+      renderer.resize(width, height, dpr);
     };
     const observer = new ResizeObserver(resize);
     observer.observe(container);
@@ -48,6 +60,10 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
     resize();
     fetchScene(scene.scene_id, controller.signal)
       .then(async (data) => {
+        if (data.page.width !== expectedCanvas.width || data.page.height !== expectedCanvas.height)
+          throw new Error('场景尺寸与作品画布不一致');
+        page = data.page;
+        resize();
         await renderer.load(
           data,
           async (asset) => {
@@ -87,7 +103,7 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
       window.removeEventListener('resize', resize);
       renderer.dispose();
     };
-  }, [scene?.scene_id, renderAttempt]);
+  }, [scene?.scene_id, renderAttempt, expectedCanvas.width, expectedCanvas.height]);
   async function retry() {
     if (scene?.up_to_date) {
       setRenderAttempt((n) => n + 1);

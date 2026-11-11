@@ -7,6 +7,11 @@ import {
   assertScene,
   CONVERTER_VERSION,
   SCENE_VERSION,
+  DESIGN_CONVERTER_VERSION,
+  DESIGN_SCENE_VERSION,
+  PPT_CANVAS,
+  isDesignCanvas,
+  type CanvasSize,
   type SceneIR,
 } from "@lumina/scene-core";
 import { extractDOM } from "./extract.js";
@@ -23,12 +28,26 @@ export const canonical = (v: unknown): string =>
       : value,
   );
 export async function convert(
-  input: { html: string; htmlHash: string; cssHash: string },
+  input: {
+    html: string;
+    htmlHash: string;
+    cssHash: string;
+    converterVersion?: string;
+    canvas?: CanvasSize;
+  },
   runtime: { browser: Browser; outputDir: string },
   signal?: AbortSignal,
 ): Promise<SceneIR> {
+  const converterVersion = input.converterVersion ?? CONVERTER_VERSION;
+  const isDesign = converterVersion === DESIGN_CONVERTER_VERSION;
+  const canvas = input.canvas ?? (isDesign ? undefined : PPT_CANVAS);
+  if (!canvas || (isDesign ? !isDesignCanvas(canvas) :
+      converterVersion !== CONVERTER_VERSION ||
+      canvas.width !== PPT_CANVAS.width || canvas.height !== PPT_CANVAS.height))
+    throw new Error("INVALID_CAPTURE_CANVAS");
+  const { width, height } = canvas;
   const context = await runtime.browser.newContext({
-    viewport: { width: 800, height: 450 },
+    viewport: { width, height },
     deviceScaleFactor: 1,
     locale: "zh-CN",
     timezoneId: "Asia/Shanghai",
@@ -92,7 +111,7 @@ export async function convert(
       }
       throw new Error("LAYOUT_UNSTABLE");
     });
-    const data = await page.evaluate(extractDOM);
+    const data = await page.evaluate(extractDOM, { width, height });
     data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
     await mkdir(runtime.outputDir, { recursive: true });
     const assets: SceneIR["assets"] = [];
@@ -136,11 +155,11 @@ export async function convert(
       });
     }, data.fonts);
     const scene: SceneIR = {
-      schemaVersion: SCENE_VERSION,
+      schemaVersion: isDesign ? DESIGN_SCENE_VERSION : SCENE_VERSION,
       source: {
         htmlHash: input.htmlHash,
         cssHash: input.cssHash,
-        converterVersion: CONVERTER_VERSION,
+        converterVersion,
       },
       environment: {
         chromium: runtime.browser.version(),
@@ -150,7 +169,7 @@ export async function convert(
         dpr: 1,
         fontSignature: hash(canonical(fontMetrics)),
       },
-      page: { width: 800, height: 450, background: "white" },
+      page: { width, height, background: "white" },
       nodes: data.nodes,
       paintOps: data.paintOps,
       assets,

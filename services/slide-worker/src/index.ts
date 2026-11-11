@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { resolve, relative, isAbsolute } from "node:path";
 import { chromium, type Browser } from "playwright-core";
-import { CONVERTER_VERSION } from "@lumina/scene-core";
+import { CONVERTER_VERSION, DESIGN_CONVERTER_VERSION } from "@lumina/scene-core";
 import { canonical, convert } from "./capture.js";
 import { writePptx } from "./export/writer.js";
 
@@ -27,6 +27,7 @@ send({
   protocol: 2,
   capabilities: ["parse", "export-pptx"],
   converterVersion: CONVERTER_VERSION,
+  converterVersions: [CONVERTER_VERSION, DESIGN_CONVERTER_VERSION],
   chromium: browser.version(),
 });
 let busy = false;

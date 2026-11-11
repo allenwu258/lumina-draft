@@ -172,9 +172,8 @@ def test_end_to_end_and_idempotency(client):
 
 
 def test_entry_modes_and_persisted_special_messages(client):
-    unavailable = client.post("/api/v1/presentations", json={"user_request": "Design a poster", "entry_mode": "design"})
-    assert unavailable.status_code == 409
-    assert unavailable.json()["detail"]["code"] == "WORKFLOW_NOT_AVAILABLE"
+    missing_canvas = client.post("/api/v1/presentations", json={"user_request": "Design a poster", "entry_mode": "design"})
+    assert missing_canvas.status_code == 422
     unavailable = client.post("/api/v1/presentations", json={"user_request": "Create an image", "entry_mode": "image"})
     assert unavailable.status_code == 409
 

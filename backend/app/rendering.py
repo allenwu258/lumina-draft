@@ -5,6 +5,7 @@ import re
 from bs4 import BeautifulSoup
 import tinycss2
 from .tailwind_profile import TAILWIND_CLASS_SET, TAILWIND_PROFILE
+from .workflows import PPT_CANVAS
 
 
 MAX_HTML_BYTES = 256 * 1024
@@ -14,7 +15,9 @@ def html_hash(html: str) -> str:
     return hashlib.sha256(html.encode("utf-8")).hexdigest()
 
 
-def validate_html(html: str) -> tuple[bool, str]:
+def validate_html(
+    html: str, *, canvas: tuple[int, int] = PPT_CANVAS, require_profile: bool = False
+) -> tuple[bool, str]:
     if not html or len(html.encode("utf-8")) > MAX_HTML_BYTES:
         return False, "HTML 为空或超过 256 KiB"
     if "```" in html or re.search(r"^\s*(Here|说明|解释)[:：]", html, re.I):
@@ -27,10 +30,12 @@ def validate_html(html: str) -> tuple[bool, str]:
         return False, "必须有唯一 id=ppt-page 的主画布"
     root = roots[0]
     profile = root.get("data-css-profile")
+    if require_profile and (profile != TAILWIND_PROFILE or root.name != "main" or root.parent != soup.body):
+        return False, "设计页面必须使用受控 CSS profile，并以 main#ppt-page 作为主画布"
     if profile and profile != TAILWIND_PROFILE:
         return False, "不支持的页面 CSS profile"
     if profile == TAILWIND_PROFILE:
-        valid, reason = validate_tailwind_page(soup, root)
+        valid, reason = validate_tailwind_page(soup, root, canvas)
         if not valid:
             return valid, reason
     if soup.find(["script", "iframe", "object", "embed", "form", "base", "link", "img", "audio", "video", "source", "foreignobject", "animate", "set", "use"]):
@@ -49,12 +54,13 @@ def validate_html(html: str) -> tuple[bool, str]:
     if not safe_css(styles):
         return False, "CSS 包含不允许的资源或表达式"
     combined = styles + " " + str(root.get("style", ""))
-    if not re.search(r"width\s*:\s*800px\b", combined, re.I) or not re.search(r"height\s*:\s*450px\b", combined, re.I):
-        return False, "画布必须声明 width:800px 和 height:450px"
+    width, height = canvas
+    if not re.search(rf"width\s*:\s*{width}px\b", combined, re.I) or not re.search(rf"height\s*:\s*{height}px\b", combined, re.I):
+        return False, f"画布必须声明 width:{width}px 和 height:{height}px"
     return True, "ok"
 
 
-def validate_tailwind_page(soup, root) -> tuple[bool, str]:
+def validate_tailwind_page(soup, root, canvas: tuple[int, int] = PPT_CANVAS) -> tuple[bool, str]:
     classes = [token for element in soup.find_all(True) for token in element.get("class", [])]
     if not classes:
         return False, "Tailwind 页面必须使用受控 utility class"
@@ -74,13 +80,13 @@ def validate_tailwind_page(soup, root) -> tuple[bool, str]:
         return False, "Tailwind 画布规则格式无效"
     values = {item.lower_name: tinycss2.serialize(item.value).strip() for item in declarations}
     required = {
-        "width": "800px",
-        "height": "450px",
+        "width": f"{canvas[0]}px",
+        "height": f"{canvas[1]}px",
         "box-sizing": "border-box",
         "overflow": "hidden",
     }
     if any(values.get(name) != value for name, value in required.items()):
-        return False, "Tailwind 画布尺寸必须为 800x450 CSS 像素"
+        return False, f"Tailwind 画布尺寸必须为 {canvas[0]}x{canvas[1]} CSS 像素，且为 border-box、overflow:hidden"
     colors = ["--ppt-background", "--ppt-surface", "--ppt-primary", "--ppt-text", "--ppt-muted"]
     if any(not re.fullmatch(r"#[0-9a-fA-F]{6}", values.get(name, "")) for name in colors):
         return False, "Tailwind 配色变量必须使用六位十六进制颜色"

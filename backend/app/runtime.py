@@ -19,6 +19,7 @@ from .provider_management import MODEL_LIMITER, ConfigurationError, configuratio
 from .rendering import html_hash, validate_html
 from .schemas import OutlineDocument
 from .secrets import read_secret
+from .workflows import DESIGN, PPT, WORKFLOWS, WorkflowSpec, scheduled_model_id
 
 
 def canonical_hash(value: object) -> str:
@@ -51,19 +52,22 @@ async def run_graph(graph, state):
     return await graph.ainvoke(state)
 
 
-def build_director_graph():
+def build_director_graph(workflow: WorkflowSpec, node: str):
     async def generate(state: DirectorState):
         prompt = f"用户需求：\n{state['user_request']}\n\n附加选项：{json.dumps(state.get('options', {}), ensure_ascii=False)}\n请严格按系统要求输出结构化说明书。"
-        output = await ProviderGateway().complete_json(prompt, state["presentation_id"], "director", state["run_id"], "ppt_outline")
+        output = await ProviderGateway().complete_json(
+            prompt, state["presentation_id"], "director", state["run_id"],
+            workflow.outline_route, instructions=workflow.outline_instructions,
+        )
         return {"result": output}
     graph = StateGraph(DirectorState)
-    graph.add_node("generate", generate)
-    graph.add_edge(START, "generate")
-    graph.add_edge("generate", END)
+    graph.add_node(node, generate)
+    graph.add_edge(START, node)
+    graph.add_edge(node, END)
     return graph.compile()
 
 
-def build_page_graph():
+def build_page_graph(workflow: WorkflowSpec, node: str):
     async def compose(state: PageState):
         with session_scope() as db:
             task = db.get(PageTask, state["task_id"])
@@ -75,6 +79,7 @@ def build_page_graph():
             slide = loads(task.brief_json)
             slides = document["slides"]
             number = task.page_number
+            canvas = workflow.canvas(loads(presentation.options_json))
             prev = slides[number - 2] if number > 1 else None
             nxt = slides[number] if number < len(slides) else None
             prompt = "\n".join([
@@ -86,12 +91,15 @@ def build_page_graph():
             ])
         if state.get("error"):
             prompt += "\n上一次输出未通过校验：" + state["error"] + "。请完整重写并确保符合所有输出合同。"
-        html = await ProviderGateway().complete_html(prompt, task.presentation_id, task.id, "ppt_html", run_id=state["run_id"])
+        html = await ProviderGateway().complete_html(
+            prompt, task.presentation_id, task.id, workflow.page_route,
+            run_id=state["run_id"], instructions=workflow.page_instructions(canvas),
+        )
         return {"result": html}
     graph = StateGraph(PageState)
-    graph.add_node("compose", compose)
-    graph.add_edge(START, "compose")
-    graph.add_edge("compose", END)
+    graph.add_node(node, compose)
+    graph.add_edge(START, node)
+    graph.add_edge(node, END)
     return graph.compile()
 
 
@@ -113,6 +121,8 @@ class ProviderGateway:
             presentation = db.get(Presentation, presentation_id) if presentation_id else None
             snapshot = loads(presentation.config_snapshot_json) if presentation else {}
             config = resolved_config or (snapshot.get("resolved_routes") or {}).get(business_code)
+            if not config and presentation and presentation.workflow_code == DESIGN.code:
+                raise ProviderError("CONFIG_NOT_READY", "设计作品缺少已冻结的模型配置")
             if not config and snapshot.get("model_id"):
                 try:
                     config = resolve_model_config(db, snapshot["model_id"], "off", business_code)
@@ -360,16 +370,16 @@ class ProviderGateway:
             raise ProviderError(error_code or "MODEL_INCOMPLETE", error or "模型未完成输出")
         return final_text if final_text is not None else "".join(output)
 
-    async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None, business_code: str = "ppt_outline") -> dict[str, Any]:
+    async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None, business_code: str = "ppt_outline", *, instructions: str | None = None) -> dict[str, Any]:
         schema = OutlineDocument.model_json_schema()
-        text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id, business_code=business_code)
+        text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id, business_code=business_code, instructions=instructions)
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise ProviderError("INVALID_MODEL_JSON", "Director 返回的 JSON 无法解析") from exc
 
-    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str, business_code: str = "ppt_html", *, run_id: str | None = None) -> str:
-        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, run_id=run_id, business_code=business_code)
+    async def complete_html(self, prompt: str, presentation_id: str, page_task_id: str, business_code: str = "ppt_html", *, run_id: str | None = None, instructions: str | None = None) -> str:
+        return await self._stream(prompt, presentation_id, "page_composer", None, page_task_id, run_id=run_id, business_code=business_code, instructions=instructions)
 
 
 def append_event_tx(db, presentation_id: str, event_type: str, payload: dict[str, Any], run_id: str | None = None) -> None:
@@ -523,8 +533,14 @@ class EventBus:
 EVENT_BUS = EventBus()
 EVENT_WRITE_LOCK = asyncio.Lock()
 ACTIVE_RUNS: dict[str, asyncio.Task] = {}
-DIRECTOR_GRAPH = build_director_graph()
-PAGE_GRAPH = build_page_graph()
+OUTLINE_GRAPHS = {
+    PPT.code: build_director_graph(PPT, "generate"),
+    DESIGN.code: build_director_graph(DESIGN, "design_planner"),
+}
+PAGE_GRAPHS = {
+    PPT.code: build_page_graph(PPT, "compose"),
+    DESIGN.code: build_page_graph(DESIGN, "design_page_composer"),
+}
 
 
 async def run_director(presentation_id: str, run_id: str) -> None:
@@ -538,13 +554,19 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         run.status = "RUNNING"
         presentation.status = "PLANNING"
         request, options = presentation.user_request, loads(presentation.options_json)
+        workflow_code = presentation.workflow_code
     sync_conversation_run(run_id, "RUNNING")
     await emit_event(presentation_id, "director.stream.reset", {"run_id": run_id}, run_id)
     await emit_event(presentation_id, "director.started", {"run_id": run_id}, run_id)
     try:
-        result = await run_graph(DIRECTOR_GRAPH, {"presentation_id": presentation_id, "run_id": run_id, "user_request": request, "options": options})
+        result = await run_graph(OUTLINE_GRAPHS[workflow_code], {"presentation_id": presentation_id, "run_id": run_id, "user_request": request, "options": options})
         doc = OutlineDocument.model_validate(result["result"])
         normalized = doc.model_dump()
+        if workflow_code == DESIGN.code:
+            expected_count = options.get("page_count")
+            if expected_count is not None and len(doc.slides) != expected_count:
+                raise ProviderError("DESIGN_PAGE_COUNT_MISMATCH", f"大纲应包含 {expected_count} 页，实际生成 {len(doc.slides)} 页")
+            normalized["slides"].sort(key=lambda slide: slide["page_number"])
         normalized["slides"] = [s | {"slide_id": str(uuid.uuid4())} for s in normalized["slides"]]
         digest = canonical_hash(normalized)
         with session_scope() as db:
@@ -588,6 +610,10 @@ async def run_director(presentation_id: str, run_id: str) -> None:
 
 async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
     try:
+        with session_scope() as db:
+            presentation = db.get(Presentation, presentation_id)
+            workflow = WORKFLOWS[presentation.workflow_code]
+            canvas = workflow.canvas(loads(presentation.options_json))
         reason = ""
         for attempt_number in range(1, 3):
             with session_scope() as db:
@@ -598,9 +624,9 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
                 task.status = "WAITING_MODEL_CAPACITY"
                 number = task.page_number
             await emit_event(presentation_id, "page.queued", {"page_task_id": task_id, "page_number": number, "queue_reason": "MODEL_CAPACITY"}, run_id)
-            result = await run_graph(PAGE_GRAPH, {"task_id": task_id, "run_id": run_id, "error": reason})
+            result = await run_graph(PAGE_GRAPHS[workflow.code], {"task_id": task_id, "run_id": run_id, "error": reason})
             html = result["result"]
-            valid, reason = validate_html(html)
+            valid, reason = validate_html(html, canvas=canvas, require_profile=workflow == DESIGN)
             if valid:
                 break
             if attempt_number < 2:
@@ -683,11 +709,9 @@ async def scheduler(stop: asyncio.Event) -> None:
             end = end.replace(tzinfo=timezone.utc)
         return (end - start).total_seconds()
 
-    def job_key(job: Job, snapshot_json: str | None) -> str:
+    def job_key(job: Job, snapshot_json: str | None, workflow_code: str | None) -> str:
         snapshot = loads(snapshot_json) if snapshot_json else {}
-        routes = snapshot.get("resolved_routes") or {}
-        route = routes.get("ppt_outline" if job.kind == "DIRECTOR" else "ppt_html") or {}
-        model_id = job.model_id or route.get("model_id") or snapshot.get("model_id")
+        model_id = job.model_id or scheduled_model_id(snapshot, job.kind, workflow_code or PPT.code)
         return str(model_id or f"unknown:{job.presentation_id}")
 
     async def execute(job_id: str, run_id: str, presentation_id: str, kind: str) -> None:
@@ -753,15 +777,15 @@ async def scheduler(stop: asyncio.Event) -> None:
 
         with session_scope() as db:
             queued_rows = db.execute(
-                select(Job, Presentation.config_snapshot_json)
+                select(Job, Presentation.config_snapshot_json, Presentation.workflow_code)
                 .outerjoin(Presentation, Presentation.id == Job.presentation_id)
                 .where(Job.status == "QUEUED")
                 .order_by(Job.queued_at, Job.created_at)
             ).all()
             queued = [row[0] for row in queued_rows]
             model_keys = {
-                job.id: job_key(job, snapshot_json)
-                for job, snapshot_json in queued_rows
+                job.id: job_key(job, snapshot_json, workflow_code)
+                for job, snapshot_json, workflow_code in queued_rows
             }
             now = utcnow()
             model_ids = set(model_keys.values()) | set(active_model_keys.values())

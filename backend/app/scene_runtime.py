@@ -24,12 +24,17 @@ from .scene_service import (
     ROOT,
     SCENE_ROOT,
     CONVERTER_VERSION,
+    DESIGN_CONVERTER_VERSION,
+    SUPPORTED_CONVERTERS,
     WAKE,
     canonical,
     digest,
     publish_tx,
     enqueue_tx,
     validate_scene,
+    job_canvas,
+    matches_target,
+    page_target,
 )
 from .tailwind_profile import preview_html
 
@@ -39,6 +44,7 @@ HEALTH = {
     "active_job_id": None,
     "error": None,
     "converter_version": CONVERTER_VERSION,
+    "converter_versions": SUPPORTED_CONVERTERS,
 }
 
 
@@ -182,6 +188,7 @@ class SceneWorker:
                 or ready.get("protocol") != 2
                 or "export-pptx" not in ready.get("capabilities", [])
                 or ready.get("converterVersion") != CONVERTER_VERSION
+                or not set(SUPPORTED_CONVERTERS).issubset(ready.get("converterVersions", []))
             ):
                 raise WorkerError(
                     "WORKER_HANDSHAKE", "转换 Worker 版本不匹配，请重新构建"
@@ -206,6 +213,8 @@ class SceneWorker:
                 "html": preview_html(job.source_html, css=job.css),
                 "htmlHash": job.html_hash,
                 "cssHash": job.css_hash,
+                "converterVersion": job.converter_version,
+                "canvas": {"width": job.canvas_width, "height": job.canvas_height},
             }
         )
         await asyncio.to_thread((work / "input.json").write_text, raw, encoding="utf-8")
@@ -297,8 +306,12 @@ class SceneWorker:
                 await asyncio.to_thread(process.wait, 3)
             except subprocess.TimeoutExpired:
                 process.kill()
-            process.stdin.close()
-            process.stdout.close()
+            for pipe in (process.stdin, process.stdout):
+                try:
+                    pipe.close()
+                except OSError:
+                    # Broken Windows pipes must not mask the worker diagnostic.
+                    pass
         if self.errors:
             self.errors.close()
             self.errors = None
@@ -315,6 +328,7 @@ def is_current(job_id, token):
             and page
             and page.current_scene_job_id == job.id
             and page.html_hash == job.html_hash
+            and matches_target(job, page_target(db, page))
         )
 
 
@@ -365,7 +379,8 @@ async def recover():
                 if job.attempt_token:
                     abandoned.append(SCENE_ROOT / ".work" / job.id / job.attempt_token)
                 presentations.add(job.presentation_id)
-                if job.converter_version != CONVERTER_VERSION:
+                page = db.get(PageTask, job.page_task_id)
+                if not page or not matches_target(job, page_target(db, page)):
                     job.status, job.attempt_token, job.finished_at = (
                         "CANCELLED",
                         None,
@@ -388,7 +403,6 @@ async def recover():
                         },
                         job.run_id,
                     )
-                    page = db.get(PageTask, job.page_task_id)
                     if (
                         page
                         and page.current_scene_job_id == job.id
@@ -524,7 +538,10 @@ async def scene_scheduler(stop: asyncio.Event):
                             )
                     HEALTH.update(status="ready", error=None)
                     continue
-                valid, reason = validate_html(current.source_html)
+                valid, reason = validate_html(
+                    current.source_html, canvas=job_canvas(current),
+                    require_profile=current.converter_version == DESIGN_CONVERTER_VERSION,
+                )
                 if not valid:
                     raise WorkerError("INVALID_SOURCE_HTML", reason)
                 output = await worker.execute(

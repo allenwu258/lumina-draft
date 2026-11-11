@@ -9,6 +9,14 @@ import {
 } from './provider-api';
 import { Notice } from './SettingsNotice';
 
+const routeDescriptions: Record<BusinessRoute['code'], string> = {
+  default: '未单独配置的业务使用此模型与思考预算',
+  ppt_outline: 'Director · 生成 PPT 结构化作品说明书',
+  ppt_html: 'Page Composer · 逐页生成 PPT HTML 内容',
+  design_outline: 'DesignPlanner · 生成设计大纲和视觉规范',
+  design_html: 'DesignPageComposer · 按作品尺寸逐页生成设计 HTML',
+};
+
 export function RoutingSettings({
   providers,
   routes,
@@ -80,20 +88,14 @@ function RouteEditor({
     }
   }
   return (
-    <article className="settings-card route-card">
+    <article className="settings-card route-card" data-route-code={route.code}>
       <header>
         <div className={'route-icon ' + (route.code === 'default' ? 'global' : '')}>
           <GitBranch size={20} />
         </div>
         <div>
           <h2>{route.label}</h2>
-          <p>
-            {route.code === 'default'
-              ? '未单独配置的业务使用此模型与思考预算'
-              : route.code === 'ppt_outline'
-                ? 'Director · 生成结构化作品说明书'
-                : 'Page Composer · 逐页生成 HTML 内容'}
-          </p>
+          <p>{routeDescriptions[route.code]}</p>
         </div>
         <span className="settings-badge">
           {route.code === 'default' ? '全局配置' : modelId || tier ? '独立覆盖' : '跟随默认'}

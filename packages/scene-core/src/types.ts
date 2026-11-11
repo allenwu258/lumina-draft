@@ -64,8 +64,19 @@ export type ShapeNode = BaseNode & {
 export type TextNode = BaseNode & { kind: "text"; text: TextContent };
 export type ImageNode = BaseNode & { kind: "image"; assetId: string };
 export type SceneNode = GroupNode | ShapeNode | TextNode | ImageNode;
+export type CanvasSize = { width: number; height: number };
+export const PPT_CANVAS: Readonly<CanvasSize> = { width: 800, height: 450 };
+export const DESIGN_CANVAS_LIMITS = { minSide: 320, maxSide: 1920, maxPixels: 2_073_600 };
+export function isDesignCanvas(value: unknown): value is CanvasSize {
+  if (!value || typeof value !== "object") return false;
+  const { width, height } = value as CanvasSize;
+  const { minSide, maxSide, maxPixels } = DESIGN_CANVAS_LIMITS;
+  return Number.isInteger(width) && Number.isInteger(height) &&
+    width >= minSide && width <= maxSide && height >= minSide &&
+    height <= maxSide && width * height <= maxPixels;
+}
 export type SceneIR = {
-  schemaVersion: "0.3.0" | "0.4.0";
+  schemaVersion: "0.3.0" | "0.4.0" | "0.5.0";
   source: { htmlHash: string; cssHash: string; converterVersion: string };
   environment: {
     chromium: string;
@@ -111,4 +122,6 @@ export type SceneIR = {
 };
 export const SCENE_VERSION = "0.4.0" as const;
 export const CONVERTER_VERSION = "dom-canvas-0.4.0";
+export const DESIGN_SCENE_VERSION = "0.5.0" as const;
+export const DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.0";
 export const EMU_PER_SCENE_PX = 15240;

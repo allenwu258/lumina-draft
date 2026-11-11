@@ -61,7 +61,7 @@ export type ModelFields = Pick<
   | 'model_concurrency'
 >;
 export type ModelCandidate = ModelFields & { metadata_source: string; already_added: boolean };
-export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html';
+export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html' | 'design_outline' | 'design_html';
 export type ResolvedRoute = {
   provider_id: string;
   provider_name: string;
@@ -214,7 +214,9 @@ export function modelAvailability(
   if (code) {
     const checks = model.last_test?.stale ? [] : model.last_test?.checks || [];
     const required =
-      code === 'ppt_outline' ? ['streaming_text', 'structured_output'] : ['streaming_text'];
+      code === 'ppt_outline' || code === 'design_outline'
+        ? ['streaming_text', 'structured_output']
+        : ['streaming_text'];
     if (
       required.some(
         (name) => !checks.some((check) => check.name === name && check.status === 'passed'),

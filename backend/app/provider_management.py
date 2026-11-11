@@ -24,6 +24,7 @@ from .db import (
     resolve_default,
     session_scope,
 )
+from .workflows import OUTLINE_ROUTES, PPT, WorkflowSpec
 
 
 class ConfigurationError(ValueError):
@@ -166,10 +167,10 @@ def resolve_business_route(db, business_code: str) -> dict[str, Any]:
     return result
 
 
-def resolve_all_routes(db) -> dict[str, dict[str, Any]]:
+def resolve_workflow_routes(db, workflow: WorkflowSpec = PPT) -> dict[str, dict[str, Any]]:
     return {
         code: resolve_business_route(db, code)
-        for code in ("default", "ppt_outline", "ppt_html")
+        for code in ("default", workflow.outline_route, workflow.page_route)
     }
 
 
@@ -250,7 +251,7 @@ def route_issues(db, config: dict[str, Any], *, require_test: bool = True) -> li
         }
         required = (
             ["streaming_text", "structured_output"]
-            if config["business_code"] == "ppt_outline"
+            if config["business_code"] in OUTLINE_ROUTES
             else ["streaming_text"]
         )
         if (

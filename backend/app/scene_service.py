@@ -18,12 +18,22 @@ from bs4 import BeautifulSoup
 from jsonschema import Draft7Validator
 from sqlalchemy import select
 
-from .db import PageTask, PageScene, SceneConversionJob, utcnow
+from .db import PageTask, PageScene, Presentation, SceneConversionJob, loads, utcnow
+from .schemas import DesignCanvas
 from .tailwind_profile import TAILWIND_PROFILE, compiled_tailwind_css
+from .workflows import DESIGN, PPT, WORKFLOWS, PPT_CANVAS
 
 ROOT = Path(__file__).resolve().parents[2]
 CONVERTER_VERSION = "dom-canvas-0.4.0"
 SCENE_VERSION = "0.4.0"
+DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.0"
+DESIGN_SCENE_VERSION = "0.5.0"
+SUPPORTED_CONVERTERS = (CONVERTER_VERSION, DESIGN_CONVERTER_VERSION)
+SCENE_VERSIONS = {
+    "dom-canvas-0.3.0": "0.3.0",
+    CONVERTER_VERSION: SCENE_VERSION,
+    DESIGN_CONVERTER_VERSION: DESIGN_SCENE_VERSION,
+}
 SCENE_TARGET = {"schema_version": SCENE_VERSION, "converter_version": CONVERTER_VERSION}
 SCENE_ROOT = Path(os.getenv("SCENE_DATA_DIR", ROOT / "data" / "scenes")).resolve()
 VALIDATORS = {
@@ -34,8 +44,23 @@ VALIDATORS = {
             ).read_text(encoding="utf-8")
         )
     )
-    for version in ("0.3.0", SCENE_VERSION)
+    for version in SCENE_VERSIONS.values()
 }
+
+
+def page_target(db, page: PageTask) -> tuple[str, tuple[int, int]]:
+    presentation = db.get(Presentation, page.presentation_id)
+    workflow = WORKFLOWS[presentation.workflow_code] if presentation else PPT
+    canvas = workflow.canvas(loads(presentation.options_json) if presentation else {})
+    return (DESIGN_CONVERTER_VERSION if workflow == DESIGN else CONVERTER_VERSION, canvas)
+
+
+def job_canvas(job: SceneConversionJob) -> tuple[int, int]:
+    return job.canvas_width, job.canvas_height
+
+
+def matches_target(job: SceneConversionJob, target: tuple[str, tuple[int, int]]) -> bool:
+    return (job.converter_version, job_canvas(job)) == target
 
 
 class QueueSignal:
@@ -66,8 +91,8 @@ def canonical(value) -> str:
     )
 
 
-@lru_cache(maxsize=1)
-def environment_key() -> str:
+@lru_cache(maxsize=32)
+def environment_key(canvas: tuple[int, int] = PPT_CANVAS) -> str:
     fonts = []
     if os.name == "nt":
         for folder in [
@@ -86,7 +111,7 @@ def environment_key() -> str:
                 "platform": platform.platform(),
                 "fonts": sorted(fonts),
                 "playwright": "1.65.0",
-                "viewport": [800, 450, 1],
+                "viewport": [*canvas, 1],
                 "locale": "zh-CN",
                 "timezone": "Asia/Shanghai",
             }
@@ -109,21 +134,26 @@ def find_scene(db, page: PageTask, *, current_target=False) -> PageScene | None:
     html_hash = source_hash(db, page)
     if not html_hash or page.status != "SUCCEEDED":
         return None
+    converter, (width, height) = page_target(db, page)
+    versions = (SCENE_VERSIONS[converter],)
+    if converter == CONVERTER_VERSION and not current_target:
+        versions = ("0.3.0", SCENE_VERSION)
     query = (
         select(PageScene)
         .join(SceneConversionJob, PageScene.job_id == SceneConversionJob.id)
         .where(
             PageScene.page_task_id == page.id,
-            PageScene.schema_version.in_(VALIDATORS),
+            PageScene.schema_version.in_(versions),
             SceneConversionJob.page_task_id == page.id,
             SceneConversionJob.html_hash == html_hash,
             SceneConversionJob.status == "SUCCEEDED",
+            SceneConversionJob.canvas_width == width,
+            SceneConversionJob.canvas_height == height,
         )
     )
-    if current_target:
+    if current_target or converter == DESIGN_CONVERTER_VERSION:
         query = query.where(
-            PageScene.schema_version == SCENE_VERSION,
-            SceneConversionJob.converter_version == CONVERTER_VERSION,
+            SceneConversionJob.converter_version == converter,
         )
     if page.current_scene_id:
         scene = db.scalar(query.where(PageScene.id == page.current_scene_id))
@@ -141,6 +171,7 @@ def scene_ref(scene: PageScene, html_hash: str) -> dict:
         "converter_version": {
             "0.3.0": "dom-canvas-0.3.0",
             SCENE_VERSION: CONVERTER_VERSION,
+            DESIGN_SCENE_VERSION: DESIGN_CONVERTER_VERSION,
         }[scene.schema_version],
         "source_html_hash": html_hash,
     }
@@ -173,7 +204,7 @@ def summary(db, page: PageTask) -> dict:
         if job
         else None
     )
-    target_job = job and job.converter_version == CONVERTER_VERSION
+    target_job = job and matches_target(job, page_target(db, page))
     status = (
         "SUCCEEDED"
         if up_to_date or missing_source
@@ -239,7 +270,7 @@ def ensure_page_scene(
         job
         and job.page_task_id == page.id
         and job.html_hash == actual
-        and job.converter_version == CONVERTER_VERSION
+        and matches_target(job, page_target(db, page))
     ):
         if job.status == "SUCCEEDED":
             raise ValueError("SCENE_MISSING_OR_UNSUPPORTED")
@@ -296,9 +327,12 @@ def enqueue_tx(
             else ""
         )
     css_hash = digest(css)
-    identity = digest(
-        canonical([page.html_hash, css_hash, CONVERTER_VERSION, environment_key()])
-    )
+    converter, canvas = page_target(db, page)
+    environment = environment_key() if converter == CONVERTER_VERSION else environment_key(canvas)
+    identity_parts = [page.html_hash, css_hash, converter, environment]
+    if converter == DESIGN_CONVERTER_VERSION:
+        identity_parts.append(canvas)
+    identity = digest(canonical(identity_parts))
     job = db.scalar(
         select(SceneConversionJob).where(
             SceneConversionJob.page_task_id == page.id,
@@ -317,8 +351,10 @@ def enqueue_tx(
             source_html=page.html,
             css=css,
             css_hash=css_hash,
-            converter_version=CONVERTER_VERSION,
-            environment_key=environment_key(),
+            converter_version=converter,
+            environment_key=environment,
+            canvas_width=canvas[0],
+            canvas_height=canvas[1],
             status="QUEUED",
             attempt=0,
         )
@@ -360,10 +396,7 @@ def validate_scene(scene: dict, job: SceneConversionJob, output: Path) -> str:
     validator = VALIDATORS.get(scene.get("schemaVersion"))
     if not validator:
         raise ValueError("SCENE_UNSUPPORTED_VERSION")
-    expected_schema = {
-        "dom-canvas-0.3.0": "0.3.0",
-        CONVERTER_VERSION: SCENE_VERSION,
-    }.get(job.converter_version)
+    expected_schema = SCENE_VERSIONS.get(job.converter_version)
     if scene.get("schemaVersion") != expected_schema:
         raise ValueError("SCENE_CONVERTER_VERSION")
     error = next(validator.iter_errors(scene), None)
@@ -371,6 +404,11 @@ def validate_scene(scene: dict, job: SceneConversionJob, output: Path) -> str:
         raise ValueError(
             f"SCENE_SCHEMA: {'/'.join(map(str, error.absolute_path))} ({error.validator})"
         )
+    width, height = scene["page"]["width"], scene["page"]["height"]
+    if (width, height) != job_canvas(job):
+        raise ValueError("SCENE_CANVAS_MISMATCH")
+    if expected_schema == DESIGN_SCENE_VERSION:
+        DesignCanvas(width=width, height=height)
     if scene["source"] != {
         "htmlHash": job.html_hash,
         "cssHash": job.css_hash,
@@ -465,7 +503,7 @@ def validate_scene(scene: dict, job: SceneConversionJob, output: Path) -> str:
     for item in inventory.values():
         if item["nodeId"] and item["nodeId"] not in nodes:
             raise ValueError("SCENE_INVENTORY_REFERENCE")
-    if scene["schemaVersion"] == SCENE_VERSION:
+    if scene["schemaVersion"] != "0.3.0":
         for item in inventory.values():
             target = item["target"]
             if target["kind"] == "hidden":
@@ -557,12 +595,13 @@ def publish_tx(
     page = db.get(PageTask, job.page_task_id) if job else None
     if (
         not job
-        or job.converter_version != CONVERTER_VERSION
+        or job.converter_version not in SUPPORTED_CONVERTERS
         or job.status != "RUNNING"
         or job.attempt_token != token
         or not page
         or page.current_scene_job_id != job.id
         or page.html_hash != job.html_hash
+        or not matches_target(job, page_target(db, page))
     ):
         return False
     result = PageScene(

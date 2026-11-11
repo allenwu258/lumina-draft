@@ -1,0 +1,164 @@
+.design-options {
+  margin: 0 16px 12px;
+  padding: 10px 12px;
+  border: 1px solid #e6e2f2;
+  border-radius: 8px;
+  background: #faf9fe;
+  color: #514879;
+  font-size: 12px;
+}
+.design-options legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+.design-option-fields {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px 14px;
+  flex-wrap: wrap;
+}
+.design-option-fields label {
+  display: grid;
+  gap: 4px;
+}
+.design-option-fields select,
+.design-option-fields input {
+  min-height: 30px;
+  border: 1px solid #ddd8e9;
+  border-radius: 5px;
+  padding: 4px 7px;
+  background: #fff;
+  color: #3d355d;
+}
+.design-option-fields input {
+  width: 85px;
+}
+.design-option-fields input[aria-invalid='true'] {
+  border-color: #c05252;
+}
+.design-options small {
+  display: block;
+  margin-top: 8px;
+  color: #655d7d;
+  line-height: 1.45;
+}
+.entry-mode-pill.design,
+.design-spec {
+  color: #6941a5;
+  background: #f1eafa;
+}
+.design-spec {
+  display: inline-block;
+  padding: 4px 8px;
+  margin-top: 8px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+.design-outline-note {
+  display: grid;
+  gap: 5px;
+  margin-top: 9px;
+  font-size: 11px;
+  color: #655d7d;
+}
+.design-outline-note textarea {
+  width: 100%;
+  min-height: 45px;
+  border: 1px solid #e6e2f2;
+  border-radius: 5px;
+  padding: 5px 7px;
+  resize: vertical;
+  color: inherit;
+  background: #faf9fe;
+}
+.canvas-stage.design-stage {
+  height: clamp(320px, 65dvh, 800px);
+  min-height: 0;
+  max-height: none;
+  aspect-ratio: auto;
+}
+.design-stage .source-view {
+  min-height: 0;
+}
+.design-workbench .canvas-toolbar {
+  height: auto;
+  min-height: 45px;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 5px 0;
+}
+.history-item .history-mode-icon {
+  flex: none;
+}
+.outline-bullets {
+  overflow: hidden;
+}
+@media (max-width: 900px) {
+  .sidebar {
+    transition: none !important;
+  }
+  .topbar {
+    flex: none;
+    gap: 6px;
+  }
+  .topbar .breadcrumbs {
+    min-width: 0;
+    gap: 5px;
+  }
+  .topbar .breadcrumbs > strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .entry-mode-pill,
+  .state-pill {
+    flex: none;
+    white-space: nowrap;
+  }
+  .ppt-view-switcher button {
+    white-space: nowrap;
+  }
+  .outline-card {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+  .outline-card-tail {
+    display: none;
+  }
+  .welcome {
+    overflow: auto;
+  }
+  .design-workbench .canvas-controls {
+    flex-wrap: wrap;
+  }
+}
+@media (max-width: 600px) {
+  .topbar .breadcrumbs > span:first-child,
+  .topbar .crumb-slash,
+  .topbar .provider-chip {
+    display: none;
+  }
+  .design-workbench .canvas-controls .icon-button {
+    width: 24px;
+  }
+  .design-workbench .canvas-controls .segmented button {
+    padding-inline: 5px;
+  }
+  .planning-panel {
+    padding: 24px 12px;
+    min-height: 240px;
+  }
+  .planning-visual {
+    display: none;
+  }
+  .planning-content,
+  .progress-track {
+    width: 100%;
+    min-width: 0;
+  }
+  .design-options {
+    margin-inline: 10px;
+  }
+  .design-option-fields select {
+    max-width: 100%;
+  }
+}

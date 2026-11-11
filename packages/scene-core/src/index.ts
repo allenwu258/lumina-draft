@@ -1,11 +1,12 @@
 import { Ajv } from "ajv";
 import schema from "../contracts/scene-ir/0.3.0.schema.json" with { type: "json" };
 import schema4 from "../contracts/scene-ir/0.4.0.schema.json" with { type: "json" };
-import type { SceneIR } from "./types.js";
+import schema5 from "../contracts/scene-ir/0.5.0.schema.json" with { type: "json" };
+import { DESIGN_SCENE_VERSION, isDesignCanvas, type SceneIR } from "./types.js";
 export * from "./types.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
-const checks = { "0.3.0": ajv.compile(schema), "0.4.0": ajv.compile(schema4) };
+const checks = { "0.3.0": ajv.compile(schema), "0.4.0": ajv.compile(schema4), "0.5.0": ajv.compile(schema5) };
 export function assertScene(value: unknown): asserts value is SceneIR {
   const version = (value as SceneIR)?.schemaVersion;
   const check = checks[version];
@@ -15,6 +16,8 @@ export function assertScene(value: unknown): asserts value is SceneIR {
       `SCENE_SCHEMA: ${JSON.stringify(check.errors)?.slice(0, 1200)}`,
     );
   const s = value as SceneIR;
+  if (s.schemaVersion === DESIGN_SCENE_VERSION && !isDesignCanvas(s.page))
+    throw new Error("SCENE_CANVAS_LIMIT");
   const nodes = new Map(s.nodes.map((n) => [n.id, n]));
   if (nodes.size !== s.nodes.length) throw new Error("SCENE_DUPLICATE_ID");
   const assets = new Map(s.assets.map((a) => [a.id, a]));
@@ -96,7 +99,7 @@ export function assertScene(value: unknown): asserts value is SceneIR {
       !assets.get(n.assetId)?.coveredNodeIds.includes(n.id)
     )
       throw new Error("SCENE_ASSET_OWNERSHIP");
-  if (s.schemaVersion === "0.4.0")
+  if (s.schemaVersion !== "0.3.0")
     for (const item of s.textInventory) {
       const t = item.target!;
       if (t.kind === "hidden") {

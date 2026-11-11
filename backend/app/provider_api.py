@@ -44,6 +44,7 @@ from .provider_management import (
 )
 from .providers import ProviderError, validate_endpoint
 from .secrets import delete_secret, read_secret, save_secret
+from .workflows import ROUTE_LABELS
 
 
 router = APIRouter(prefix="/api/v1/settings/llm", tags=["provider-management"])
@@ -795,7 +796,7 @@ def update_reasoning_tiers(model_id: str, body: TierUpdate):
         _check_revision(model.revision, body.expected_revision)
         incoming = {tier.code: tier for tier in body.tiers}
         existing = {tier.code: tier for tier in get_model_tiers(db, model.id)}
-        for code in ("default", "ppt_outline", "ppt_html"):
+        for code in ROUTE_LABELS:
             try:
                 config = resolve_business_route(db, code)
             except ConfigurationError:
@@ -862,11 +863,7 @@ def update_reasoning_tiers(model_id: str, body: TierUpdate):
 def list_business_routes():
     with session_scope() as db:
         routes = []
-        for code, label in (
-            ("default", "全局默认"),
-            ("ppt_outline", "PPT 大纲生成"),
-            ("ppt_html", "PPT 内容 HTML 生成"),
-        ):
+        for code, label in ROUTE_LABELS.items():
             if code == "default":
                 route, _, _, _, _ = resolve_default(db)
                 routes.append(
@@ -919,7 +916,7 @@ def list_business_routes():
 
 @router.get("/business-routes/{code}/resolved")
 def get_resolved_route(code: str):
-    if code not in {"default", "ppt_outline", "ppt_html"}:
+    if code not in ROUTE_LABELS:
         api_error("UNKNOWN_BUSINESS_ROUTE", "业务路由不存在", 404)
     with session_scope() as db:
         try:
@@ -939,7 +936,7 @@ def get_resolved_route(code: str):
 
 @router.put("/business-routes/{code}")
 def update_business_route(code: str, body: RouteUpdate):
-    if code not in {"default", "ppt_outline", "ppt_html"}:
+    if code not in ROUTE_LABELS:
         api_error("UNKNOWN_BUSINESS_ROUTE", "业务路由不存在", 404)
     with session_scope() as db:
         if code == "default":

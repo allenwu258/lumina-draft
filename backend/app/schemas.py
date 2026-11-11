@@ -10,10 +10,27 @@ class CreateOptions(BaseModel):
     style_hint: str | None = Field(default=None, max_length=500)
 
 
+class DesignCanvas(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    width: int = Field(strict=True, ge=320, le=1920)
+    height: int = Field(strict=True, ge=320, le=1920)
+
+    @model_validator(mode="after")
+    def bounded_area(self):
+        if self.width * self.height > 2_073_600:
+            raise ValueError("画布面积不能超过 2,073,600 像素")
+        return self
+
+
+class DesignOptions(CreateOptions):
+    canvas: DesignCanvas
+    page_count: int | None = Field(default=None, strict=True, ge=1, le=20)
+
+
 class CreatePresentationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_request: str = Field(min_length=1, max_length=20_000)
-    options: CreateOptions = Field(default_factory=CreateOptions)
+    options: CreateOptions | DesignOptions = Field(default_factory=CreateOptions)
     entry_mode: Literal["agent", "ppt", "design", "image"] = "ppt"
 
     @field_validator("user_request")
@@ -23,6 +40,14 @@ class CreatePresentationRequest(BaseModel):
         if not value:
             raise ValueError("需求不能为空")
         return value
+
+    @model_validator(mode="after")
+    def match_options_to_mode(self):
+        if self.entry_mode == "design" and not isinstance(self.options, DesignOptions):
+            raise ValueError("设计生成需要指定画布宽高")
+        if self.entry_mode != "design" and isinstance(self.options, DesignOptions):
+            raise ValueError("只有设计生成支持自定义画布和页数")
+        return self
 
 
 class Brief(BaseModel):

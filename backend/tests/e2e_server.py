@@ -3,6 +3,8 @@
 import json
 import asyncio
 import os
+import re
+from html import escape
 import tempfile
 from pathlib import Path
 
@@ -103,6 +105,15 @@ async def fake_stream(**kwargs):
             await _html_release.wait()
         finally:
             _active_html -= 1
+    if "DesignPlanner" in kwargs.get("instructions", ""):
+        doc = json.loads(text)
+        doc["slides"] = [dict(doc["slides"][0], page_number=n, title=f"设计 {n}") for n in (1, 2)]
+        text = json.dumps(doc, ensure_ascii=False)
+    elif "DesignPageComposer" in kwargs.get("instructions", ""):
+        width, height = re.search(r"固定画布 (\d+)×(\d+)", kwargs["instructions"]).groups()
+        title = json.loads(kwargs["prompt"].split("当前页面：\n", 1)[1].splitlines()[0])["title"]
+        text = text.replace("800px", width + "px").replace("450px", height + "px")
+        text = text.replace("Provider 验收完成", escape(title))
     if schema and "concurrency-check" in kwargs.get("prompt", ""):
         doc = json.loads(text)
         doc["slides"] = [

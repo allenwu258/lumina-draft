@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { chromium } from "playwright-core";
 import { build } from "esbuild";
 import { PNG } from "pngjs";
-import { assertScene } from "@lumina/scene-core";
+import { assertScene, DESIGN_CONVERTER_VERSION } from "@lumina/scene-core";
 import { convert, canonical, hash } from "../dist/capture.js";
 import { css, fixture, tailwind } from "./fixtures.mjs";
 
@@ -32,6 +32,52 @@ after(async () => {
   await rm(temp, { recursive: true, force: true });
 });
 const input = (html) => ({ html, htmlHash: hash(html), cssHash: hash(css) });
+for (const [width, height] of [[1080, 1920], [900, 1200], [1080, 1080], [1280, 720]]) {
+  test(`Design ${width}x${height} captures the intrinsic canvas and renders at reduced size`, async () => {
+    const html = tailwind('<div class="h-full flex flex-col justify-between"><h1 class="text-ppt-title">Design viewport</h1><div class="bg-ppt-primary h-16 w-full"></div></div>')
+      .replace("width:800px;height:450px", `width:${width}px;height:${height}px`);
+    const result = await convert({
+      ...input(html), canvas: { width, height }, converterVersion: DESIGN_CONVERTER_VERSION,
+    }, { browser, outputDir: join(temp, `design-${width}-${height}`) });
+    assertScene(result);
+    assert.equal(result.schemaVersion, "0.5.0");
+    assert.equal(result.page.width, width);
+    assert.equal(result.page.height, height);
+    assert.ok(result.nodes.some(n => n.kind === "text" && n.text.sourceText === "Design viewport"));
+    const page = await browser.newPage({ viewport: { width, height } });
+    try {
+      await page.setContent(html);
+      const expected = PNG.sync.read(await page.locator("#ppt-page").screenshot());
+      await page.setContent('<html><body style="margin:0"><canvas></canvas></body></html>');
+      await page.addScriptTag({ content: bundle });
+      await page.evaluate(async ({ scene, width, height }) => {
+        const renderer = new window.SceneRenderer(document.querySelector("canvas"));
+        await renderer.load(scene, async () => { throw new Error("Unexpected asset"); },
+          async (style, sample) => { await document.fonts.load(`${style.fontSize}px ${style.fontFamily}`, sample); });
+        renderer.resize(width / 2, height / 2, 2);
+        renderer.render();
+      }, { scene: result, width, height });
+      const actual = PNG.sync.read(await page.locator("canvas").screenshot({ scale: "device" }));
+      assert.equal(actual.width, width / 2);
+      assert.equal(actual.height, height / 2);
+      for (const [x, y] of [[100, 100], [width / 2, height - 50], [width / 2, height / 2]]) {
+        const e = (y * expected.width + x) * 4;
+        const a = (Math.floor(y / 2) * actual.width + Math.floor(x / 2)) * 4;
+        assert.deepEqual(actual.data.subarray(a, a + 4), expected.data.subarray(e, e + 4));
+      }
+    } finally { await page.close(); }
+    await assert.rejects(convert({
+      ...input(html), canvas: { width: 800, height: 450 }, converterVersion: DESIGN_CONVERTER_VERSION,
+    }, { browser, outputDir: join(temp, "wrong-size") }), /UNSUPPORTED_CANVAS/);
+  });
+}
+test("Design rejects unbounded dimensions and PPT rejects custom capture dimensions", async () => {
+  for (const canvas of [{ width: 319, height: 450 }, { width: 1920, height: 1920 }, { width: 1080.5, height: 1920 }])
+    await assert.rejects(convert({ ...input(fixture), canvas, converterVersion: DESIGN_CONVERTER_VERSION },
+      { browser, outputDir: join(temp, "invalid") }), /INVALID_CAPTURE_CANVAS/);
+  await assert.rejects(convert({ ...input(fixture), canvas: { width: 1080, height: 1920 } },
+    { browser, outputDir: join(temp, "invalid-ppt") }), /INVALID_CAPTURE_CANVAS/);
+});
 test("real Chromium capture preserves text, table, SVG and deterministic identity", async () => {
   const results = [];
   for (let i = 0; i < 3; i++)

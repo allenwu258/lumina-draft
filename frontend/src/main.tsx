@@ -6,6 +6,9 @@ import './generation-settings.css';
 import './chat-ui.css';
 import { ProviderSettings, type SettingsTab } from './ProviderSettings';
 import { GenerationProgress, PageStatusIcon, pageStatusLabel } from './PageStatus';
+import type { CanvasSize } from '@lumina/scene-core';
+import { canvasRatio, defaultDesignDraft, designOptions, DesignOptions } from './DesignOptions';
+import { fitCanvas } from './scene/fitCanvas';
 import { SceneViewport } from './scene/SceneViewport';
 import type { SceneSummary } from './scene/scene-api';
 import { PresentationExport, type ExportSource, type ExportSummary } from './export/PresentationExport';
@@ -17,7 +20,7 @@ type JobState = { id:string; status:string; queue_reason:string|null; queue_dura
 type DirectorStream = {reasoning:string;output:string};
 type EntryMode = 'agent' | 'ppt' | 'design' | 'image';
 type ConversationMessage = {id:string;seq:number;role:string;kind:string;status:string;body_text:string|null;payload:Record<string,unknown>;created_at:string};
-type Snapshot = { presentation:{id:string;user_request:string;status:string;entry_mode:EntryMode;workflow_code:string;conversation_id:string|null;created_at:string}; conversation?:{id:string|null;entry_mode:EntryMode;interaction_mode:string;state:string;messages:ConversationMessage[];allowed_actions:Record<string,boolean>;allowed_views:{outline:boolean;generation:boolean}}; latest_outline:{id:string;revision:number;content_hash:string;confirmed:boolean;document:Document}|null; pages:Page[]; active_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; active_job:JobState|null; latest_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; latest_job:JobState|null; active_streams:Record<string,string>; director_stream:DirectorStream|null; last_event_seq:number; export_source?:ExportSource; latest_export?:ExportSummary|null };
+type Snapshot = { presentation:{id:string;user_request:string;status:string;entry_mode:EntryMode;workflow_code:string;canvas:CanvasSize;conversation_id:string|null;created_at:string}; conversation?:{id:string|null;entry_mode:EntryMode;interaction_mode:string;state:string;messages:ConversationMessage[];allowed_actions:Record<string,boolean>;allowed_views:{outline:boolean;generation:boolean}}; latest_outline:{id:string;revision:number;content_hash:string;confirmed:boolean;document:Document}|null; pages:Page[]; active_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; active_job:JobState|null; latest_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; latest_job:JobState|null; active_streams:Record<string,string>; director_stream:DirectorStream|null; last_event_seq:number; export_source?:ExportSource; latest_export?:ExportSummary|null };
 type SessionUsage = {presentation_id:string;call_count:number;input_tokens:number|null;output_tokens:number|null;total_tokens:number|null;input_unreported_calls:number;output_unreported_calls:number;total_unreported_calls:number};
 type Provider = {name:string;base_url:string;model:string;enabled:boolean;revision:number;credential_configured:boolean};
 const api = async <T,>(path:string, init?:RequestInit):Promise<T> => { const response=await fetch(`/api/v1${path}`,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})}}); const data=await response.json(); if(!response.ok) throw new Error(data?.detail?.message||data?.detail||'请求失败'); return data as T; };
@@ -25,9 +28,17 @@ const api = async <T,>(path:string, init?:RequestInit):Promise<T> => { const res
 const ENTRY_MODES: Array<{code:EntryMode; label:string; description:string; enabled:boolean; icon:typeof Bot}> = [
   {code:'agent', label:'Agent 模式', description:'对话式创作，展示完整工作过程', enabled:true, icon:Bot},
   {code:'ppt', label:'PPT 生成', description:'生成大纲并预览演示页面', enabled:true, icon:LayoutTemplate},
-  {code:'design', label:'设计生成', description:'工作流尚未开放', enabled:false, icon:Palette},
+  {code:'design', label:'设计生成', description:'生成海报、社交卡片等多尺寸设计', enabled:true, icon:Palette},
   {code:'image', label:'图片生成', description:'工作流尚未开放', enabled:false, icon:Image},
 ];
+
+const PPT_CANVAS: CanvasSize = { width: 800, height: 450 };
+const MODE_LABELS = Object.fromEntries(ENTRY_MODES.map(mode => [mode.code, mode.label]));
+const modeIcon = (mode: EntryMode) => mode === 'agent' ? Bot : mode === 'design' ? Palette : LayoutTemplate;
+function ModeIcon({ mode, size }: { mode: EntryMode; size: number }) {
+  const Icon = modeIcon(mode);
+  return <Icon size={size}/>;
+}
 
 function EntryModeMenu({value,onChange}:{value:EntryMode;onChange:(value:EntryMode)=>void}){
   const [open,setOpen]=useState(false);
@@ -57,10 +68,11 @@ function OutlineBulletsInput({ value, onChange, readOnly = false }: { value: str
     };
     fitContent();
 
-    let width = container.getBoundingClientRect().width;
-    const observer = new ResizeObserver(([entry]) => {
-      if (Math.abs(entry.contentRect.width - width) < 1) return;
-      width = entry.contentRect.width;
+    let width = input.clientWidth;
+    const observer = new ResizeObserver(() => {
+      const nextWidth = input.clientWidth;
+      if (nextWidth === width) return;
+      width = nextWidth;
       fitContent();
     });
     observer.observe(container);
@@ -84,6 +96,11 @@ function App(){
   const [presentations,setPresentations]=useState<any[]>([]); const [activeId,setActiveId]=useState<string|null>(()=>sessionStorage.getItem('lumina.activePresentation')); const [snapshot,setSnapshot]=useState<Snapshot|null>(null);
   const [prompt,setPrompt]=useState(''); const [loading,setLoading]=useState(false); const [error,setError]=useState('');
   const [entryMode,setEntryMode]=useState<EntryMode>('ppt');
+  const [designDraft,setDesignDraft]=useState(defaultDesignDraft);
+  const { canvas: requestedCanvas, page_count, canvasValid, pagesValid } = designOptions(designDraft);
+  const creatingDesign = entryMode === 'design';
+  const canCreate = Boolean(prompt.trim()) && !loading && entryMode !== 'image' &&
+    (!creatingDesign || (canvasValid && pagesValid));
   const [provider,setProvider]=useState<Provider|null>(null);
   const [settingsPage,setSettingsPage]=useState<SettingsTab|null>(()=>settingsTabFromPath());
   const navigateSettings=useCallback((tab:SettingsTab|null)=>{window.history.pushState({},'',tab ? '/settings/'+tab : '/');setSettingsPage(tab);},[]);
@@ -117,7 +134,7 @@ function App(){
     ['export.preparing','export.queued','export.started','export.completed','export.failed','page.scene.queued','page.scene.started','page.scene.completed','page.scene.failed','page.scene.cancelled','presentation.created','director.started','director.stream.reset','director.stream.delta','outline.ready','outline.updated','generation.queued','generation.started','page.queued','page.started','page.validating','page.html.delta','page.retrying','page.completed','page.failed','run.completed','run.failed','run.cancelled','run.queued','job.waiting_scheduler','job.started','job.queue_timeout','llm.queued','llm.started','call.queue_timeout','llm.usage.updated'].forEach(type=>source.addEventListener(type,handle as EventListener));
     source.onerror=()=>{}; return()=>{source.close();if(refreshTimer)clearTimeout(refreshTimer);};
   },[activeId,snapshot?.last_event_seq,loadSnapshot,loadUsage,refreshList]);
-  const create=async()=>{if(!prompt.trim()||loading||entryMode==='design'||entryMode==='image')return;setLoading(true);setError('');try{const res=await api<{presentation_id:string;entry_mode:EntryMode}>('/presentations',{method:'POST',headers:{'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({user_request:prompt,entry_mode:entryMode,options:{language:'zh-CN'}})});setPrompt('');await refreshList();setActiveId(res.presentation_id);}catch(e){setError(String(e));}finally{setLoading(false)}};
+  const create=async()=>{if(!canCreate)return;setLoading(true);setError('');try{const res=await api<{presentation_id:string;entry_mode:EntryMode}>('/presentations',{method:'POST',headers:{'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({user_request:prompt,entry_mode:entryMode,options:creatingDesign?{language:'zh-CN',canvas:requestedCanvas,page_count}:{language:'zh-CN'}})});setPrompt('');await refreshList();setActiveId(res.presentation_id);}catch(e){setError(String(e));}finally{setLoading(false)}};
   const confirm=async()=>{if(!snapshot?.latest_outline||!doc)return;try{let outline=snapshot.latest_outline;if(JSON.stringify(doc)!==JSON.stringify(outline.document)){outline=await api<any>(`/presentations/${snapshot.presentation.id}/outline`,{method:'PUT',body:JSON.stringify({outline_id:outline.id,content_hash:outline.content_hash,document:doc})});}await api(`/presentations/${snapshot.presentation.id}/confirm`,{method:'POST',body:JSON.stringify({outline_id:outline.id,content_hash:outline.content_hash})});setWorkspaceView('generation');await loadSnapshot(snapshot.presentation.id)}catch(e){setError(String(e))}};
   const saveOutline=async()=>{if(!snapshot?.latest_outline||!doc)return;try{const updated=await api<any>(`/presentations/${snapshot.presentation.id}/outline`,{method:'PUT',body:JSON.stringify({outline_id:snapshot.latest_outline.id,content_hash:snapshot.latest_outline.content_hash,document:doc})});setSnapshot(s=>s?({...s,latest_outline:updated}):s)}catch(e){setError(String(e))}};
   const updateSlide=(index:number,patch:Partial<Slide>)=>setDoc(d=>d?({...d,slides:d.slides.map((s,i)=>i===index?({...s,...patch}):s)}):d);
@@ -126,6 +143,9 @@ function App(){
   const endRailResize=()=>{railResizeRef.current=null;};
   const choose=(id:string)=>{navigateSettings(null);setSnapshot(null);setDoc(null);setStreamHtml({});setDirectorStream({reasoning:'',output:''});setWorkspaceView('outline');loadedPresentationRef.current=null;followAgentTail.current=true;setActiveId(id);setError('');};
   const waitingScheduler=snapshot?.active_job?.status==='QUEUED'; const status=waitingScheduler?'WAITING_SCHEDULER':snapshot?.presentation.status||''; const isPlanning=status==='PLANNING'||(waitingScheduler&&snapshot?.active_run?.kind==='DIRECTOR'); const waiting=status==='WAITING_CONFIRMATION'; const generating=status==='GENERATING'||(waitingScheduler&&snapshot?.active_run?.kind==='GENERATION'); const isAgent=snapshot?.presentation.entry_mode==='agent'; const generationAvailable=Boolean(snapshot?.latest_outline?.confirmed&&snapshot?.pages.length); const outlineEditing=waiting;
+  const isDesign = snapshot?.presentation.workflow_code === 'design_create';
+  const canvas = snapshot?.presentation.canvas || PPT_CANVAS;
+  const canvasLabel = `${canvas.width} × ${canvas.height}`;
   const currentSlide=doc?.slides[selectedPage]; const currentTask=snapshot?.pages.find(p=>p.page_number===selectedPage+1); const previewHtml=currentTask?.status==='SUCCEEDED'?`/api/v1/page-tasks/${currentTask.id}/html`:streamHtml[currentTask?.id||''];
   const displayHtml=typeof previewHtml==='string'&&previewHtml.startsWith('/')?previewHtml:null;
   useEffect(()=>{const controller=new AbortController();setSourceHtml('');if(view==='source'&&displayHtml)fetch(displayHtml,{signal:controller.signal}).then(r=>r.text()).then(text=>{if(!controller.signal.aborted)setSourceHtml(text)}).catch(()=>{if(!controller.signal.aborted)setSourceHtml('无法读取 HTML')});return()=>controller.abort()},[view,displayHtml]);
@@ -133,28 +153,28 @@ function App(){
   return <div className="app-shell">
     <aside className={`sidebar ${sidebarOpen?'':'collapsed'}`}>
       <div className="brand-row"><div className="brand-mark"><Layers3 size={17}/></div>{sidebarOpen&&<><span className="brand-name">lumina<span>draft</span></span><button className="icon-button sidebar-toggle" title="收起侧栏" onClick={()=>setSidebarOpen(false)}><PanelLeftClose size={16}/></button></>}</div>
-      {sidebarOpen&&<><button className="new-button" onClick={()=>{navigateSettings(null);setActiveId(null);setSnapshot(null);setDoc(null);setEntryMode('ppt');setWorkspaceView('outline');loadedPresentationRef.current=null;followAgentTail.current=true;setError('')}}><Plus size={16}/> 新建演示文稿</button>
+      {sidebarOpen&&<><button className="new-button" onClick={()=>{navigateSettings(null);setActiveId(null);setSnapshot(null);setDoc(null);setEntryMode('ppt');setWorkspaceView('outline');loadedPresentationRef.current=null;followAgentTail.current=true;setError('')}}><Plus size={16}/> 新建作品</button>
         <div className="side-label">工作区</div><button className={"side-item "+(!settingsPage?"active":"")} onClick={()=>navigateSettings(null)}><Sparkles size={15}/>创作工作台</button><button className={"side-item "+(settingsPage?"active":"")} onClick={()=>navigateSettings('providers')}><Settings2 size={15}/>模型与 API</button>
-        <div className="side-label history-label">最近创作 <span>{presentations.length}</span></div><div className="history-list">{presentations.map(p=><button key={p.id} className={`history-item ${activeId===p.id?'selected':''}`} onClick={()=>choose(p.id)}><span className="history-mode-icon">{p.entry_mode==='agent'?<Bot size={14}/>:<LayoutTemplate size={14}/>}</span><span>{p.user_request.slice(0,26)||'未命名演示文稿'}</span><i className={`status-dot ${p.status.toLowerCase()}`}/></button>)}</div>
+        <div className="side-label history-label">最近创作 <span>{presentations.length}</span></div><div className="history-list">{presentations.map(p=><button key={p.id} className={`history-item ${activeId===p.id?'selected':''}`} onClick={()=>choose(p.id)}><span className="history-mode-icon"><ModeIcon mode={p.entry_mode} size={14}/></span><span>{p.user_request.slice(0,26)||'未命名演示文稿'}</span><i className={`status-dot ${p.status.toLowerCase()}`}/></button>)}</div>
         <div className="sidebar-footer"><div className="avatar">L</div><div><strong>本地工作区</strong><small>单用户 · SQLite</small></div><CircleHelp size={16}/></div>
       </>}{!sidebarOpen&&<button className="icon-button expand-button" title="展开侧栏" onClick={()=>setSidebarOpen(true)}><ArrowRight size={17}/></button>}
     </aside>
     <main className="main-area">
-      <header className="topbar"><div className="breadcrumbs"><span>工作区</span><span className="crumb-slash">/</span><strong>{snapshot?.latest_outline?.document.brief.title||'创作工作台'}</strong>{snapshot&&<><span className={`entry-mode-pill ${snapshot.presentation.entry_mode}`}><span>{snapshot.presentation.entry_mode==='agent'?<Bot size={12}/>:<LayoutTemplate size={12}/>}</span>{snapshot.presentation.entry_mode==='agent'?'Agent 模式':'PPT 生成'}</span><span className={`state-pill ${status.toLowerCase()}`}><i/>{statusLabel(status)}</span></>}</div><div className="top-actions"><button className="provider-chip" onClick={()=>navigateSettings('providers')}><span className="provider-indicator"/>{provider?.model||'配置模型'}<ChevronDown size={14}/></button><button className="icon-button" title="模型设置" onClick={()=>navigateSettings('providers')}><Settings2 size={17}/></button></div></header>
-      {settingsPage ? <ProviderSettings tab={settingsPage} onNavigate={navigateSettings} onClose={()=>navigateSettings(null)} onChanged={refreshProvider}/> : !snapshot?<section className="welcome"><div className="welcome-kicker"><span/> PRESENTATION STUDIO</div><h1>把想法，变成<br/><em>清晰有力的演示。</em></h1><p>选择创作模式，描述主题、受众和目标。先共同确认内容结构，再逐页生成可预览的演示页面。</p>
-        <div className="composer"><textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')create()}} placeholder={entryMode==='agent'?'告诉我你想完成什么，我会用步骤化的创作过程协助你…':'例如：为创业团队制作一份关于 AI 产品市场进入策略的路演，突出客户问题、市场机会和 90 天计划…'}/><div className="composer-bottom"><div className="composer-options"><EntryModeMenu value={entryMode} onChange={setEntryMode}/><span className="composer-divider"/><span><span className="color-dot"/>中文</span></div><button className="send-button" disabled={!prompt.trim()||loading||entryMode==='design'||entryMode==='image'} onClick={create}>{loading?<LoaderCircle className="spin" size={16}/>:<Send size={15}/>}<span>{entryMode==='agent'?'开始创作':'生成说明书'}</span></button></div>
+      <header className="topbar"><div className="breadcrumbs"><span>工作区</span><span className="crumb-slash">/</span><strong>{snapshot?.latest_outline?.document.brief.title||'创作工作台'}</strong>{snapshot&&<><span className={`entry-mode-pill ${snapshot.presentation.entry_mode}`}><span><ModeIcon mode={snapshot.presentation.entry_mode} size={12}/></span>{MODE_LABELS[snapshot.presentation.entry_mode]}</span><span className={`state-pill ${status.toLowerCase()}`}><i/>{statusLabel(status)}</span></>}</div><div className="top-actions"><button className="provider-chip" onClick={()=>navigateSettings('providers')}><span className="provider-indicator"/>{provider?.model||'配置模型'}<ChevronDown size={14}/></button><button className="icon-button" title="模型设置" onClick={()=>navigateSettings('providers')}><Settings2 size={17}/></button></div></header>
+      {settingsPage ? <ProviderSettings tab={settingsPage} onNavigate={navigateSettings} onClose={()=>navigateSettings(null)} onChanged={refreshProvider}/> : !snapshot?<section className="welcome"><div className="welcome-kicker"><span/> {creatingDesign?'DESIGN STUDIO':'PRESENTATION STUDIO'}</div><h1>把想法，变成<br/><em>{creatingDesign?'有目的的设计。':'清晰有力的演示。'}</em></h1><p>{creatingDesign?'描述用途、内容和风格，选择画布规格。确认大纲后，即可逐页预览成品。':'选择创作模式，描述主题、受众和目标。先共同确认内容结构，再逐页生成可预览的演示页面。'}</p>
+        <div className="composer"><textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')create()}} placeholder={entryMode==='agent'?'告诉我你想完成什么，我会用步骤化的创作过程协助你…':creatingDesign?'例如：为周末社区市集做一张海报，突出日期、地点和报名入口，使用温暖的橙色…':'例如：为创业团队制作一份关于 AI 产品市场进入策略的路演，突出客户问题、市场机会和 90 天计划…'}/>{creatingDesign&&<DesignOptions draft={designDraft} onChange={setDesignDraft}/>}<div className="composer-bottom"><div className="composer-options"><EntryModeMenu value={entryMode} onChange={setEntryMode}/><span className="composer-divider"/><span><span className="color-dot"/>中文</span></div><button className="send-button" disabled={!canCreate} onClick={create}>{loading?<LoaderCircle className="spin" size={16}/>:<Send size={15}/>}<span>{entryMode==='agent'?'开始创作':creatingDesign?'生成设计大纲':'生成说明书'}</span></button></div>
           {error&&<div className="inline-error"><X size={14}/>{error}{error.includes('配置')&&<button onClick={()=>navigateSettings('providers')}>去配置</button>}</div>}
         </div><div className="trust-line"><ShieldCheck size={14}/> {entryMode==='agent'?'Agent 模式会展示真实生成流程的阶段卡，不会自动调用额外工具。':'由你确认每页结构后，才开始生成页面'}</div>
-        <div className="example-row"><span>试试这些主题</span>{['产品发布路演','季度业务复盘','新员工培训'].map(x=><button key={x} onClick={()=>setPrompt(`制作一份关于${x}的演示文稿，结构清晰、观点具体、视觉简洁专业。`)}>{x}<ArrowRight size={12}/></button>)}</div>
-        </section>:<section ref={workbenchRef} onScroll={event=>{const element=event.currentTarget;followAgentTail.current=element.scrollHeight-element.scrollTop-element.clientHeight<48}} className={`workbench ${isAgent?'agent-workbench':''}`}>
+        <div className="example-row"><span>试试这些主题</span>{(creatingDesign?['市集活动海报','新品社交卡片','展览导览图']:['产品发布路演','季度业务复盘','新员工培训']).map(x=><button key={x} onClick={()=>setPrompt(`制作一份关于${x}的${creatingDesign?'视觉设计，突出主题和关键信息，留出清晰的阅读空间。':'演示文稿，结构清晰、观点具体、视觉简洁专业。'}`)}>{x}<ArrowRight size={12}/></button>)}</div>
+        </section>:<section ref={workbenchRef} onScroll={event=>{const element=event.currentTarget;followAgentTail.current=element.scrollHeight-element.scrollTop-element.clientHeight<48}} className={`workbench ${isAgent?'agent-workbench':isDesign?'design-workbench':''}`}>
          {isAgent&&<div className="agent-mode-banner"><Bot size={16}/><div><strong>Agent 模式</strong><span>以对话和阶段卡呈现本次 PPT 创作流程</span></div><span className="agent-mode-chip">对话式工作流</span></div>}
-         <div className="work-heading"><div><div className="eyebrow">{waiting?'内容说明书':generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':'任务进度'}</div><h1>{doc?.brief.title||'正在理解你的需求'}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p></div><div className="work-heading-actions">{snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
-         {doc&&<div className="ppt-view-switcher" role="tablist" aria-label="工作区视图"><button role="tab" aria-selected={workspaceView==='outline'} className={workspaceView==='outline'?'active':''} onClick={()=>setWorkspaceView('outline')}><LayoutTemplate size={14}/>大纲{snapshot.latest_outline?.confirmed&&<small>只读</small>}</button><button role="tab" aria-selected={workspaceView==='generation'} disabled={!generationAvailable} className={workspaceView==='generation'?'active':''} onClick={()=>generationAvailable&&setWorkspaceView('generation')}><Layers3 size={14}/>页面生成{generationAvailable&&<small>{snapshot.pages.filter(page=>page.status==='SUCCEEDED').length}/{snapshot.pages.length}</small>}</button></div>}
+         <div className="work-heading"><div><div className="eyebrow">{waiting?(isDesign?'设计大纲':'内容说明书'):generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':'任务进度'}</div><h1>{doc?.brief.title||'正在理解你的需求'}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p>{isDesign&&<span className="design-spec">{canvasLabel} px · {canvasRatio(canvas)}</span>}</div><div className="work-heading-actions">{!isDesign&&snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
+         {doc&&<div className="ppt-view-switcher" role="tablist" aria-label="工作区视图"><button role="tab" aria-selected={workspaceView==='outline'} className={workspaceView==='outline'?'active':''} onClick={()=>setWorkspaceView('outline')}><LayoutTemplate size={14}/>{isDesign?'设计大纲':'大纲'}{snapshot.latest_outline?.confirmed&&<small>只读</small>}</button><button role="tab" aria-selected={workspaceView==='generation'} disabled={!generationAvailable} className={workspaceView==='generation'?'active':''} onClick={()=>generationAvailable&&setWorkspaceView('generation')}><Layers3 size={14}/>{isDesign?'设计预览':'页面生成'}{generationAvailable&&<small>{snapshot.pages.filter(page=>page.status==='SUCCEEDED').length}/{snapshot.pages.length}</small>}</button></div>}
         {usage?.presentation_id===snapshot.presentation.id&&<div className="usage-bar" aria-label="当前作品会话 token 用量"><Activity size={14}/><span>会话用量</span><span title={usage.input_unreported_calls?`${usage.input_unreported_calls} 次调用未返回输入用量`:undefined}>输入 <strong>{formatUsage(usage.input_tokens,usage.input_unreported_calls)}</strong></span><span title={usage.output_unreported_calls?`${usage.output_unreported_calls} 次调用未返回输出用量`:undefined}>输出 <strong>{formatUsage(usage.output_tokens,usage.output_unreported_calls)}</strong></span><span title={usage.total_unreported_calls?`${usage.total_unreported_calls} 次调用未返回总用量`:undefined}>合计 <strong>{formatUsage(usage.total_tokens,usage.total_unreported_calls)}</strong></span><span>{usage.call_count} 次调用</span></div>}
         {error&&<div className="inline-error"><X size={14}/>{error}<button onClick={()=>setError('')}>关闭</button></div>}
           {isAgent&&<ConversationFeed messages={snapshot.conversation?.messages||[]} onViewOutline={()=>setWorkspaceView('outline')} onViewGeneration={()=>generationAvailable&&setWorkspaceView('generation')}/>}
          {isAgent&&<div className="agent-flow-strip"><div className="agent-flow-step active"><span>1</span><div><strong>理解需求</strong><small>Director 正在整理创作目标</small></div></div><div className="agent-flow-line"/><div className={`agent-flow-step ${waiting||generating||status==='READY'?'active':''}`}><span>2</span><div><strong>确认大纲</strong><small>先确认内容结构，再生成页面</small></div></div><div className="agent-flow-line"/><div className={`agent-flow-step ${generating||status==='READY'?'active':''}`}><span>3</span><div><strong>生成页面</strong><small>按页制作可预览 HTML</small></div></div></div>}
-        {isPlanning&&!doc?<div className="planning-panel"><div className="planning-visual"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><Sparkles size={25}/></div><div className="planning-content"><h2>正在梳理内容结构</h2><p>Director 正在确定叙事主线、页面大纲与全局视觉规范。</p><div className="progress-track"><i/></div><small>说明书完成后，你可以逐页编辑和确认</small><DirectorStreamView stream={directorStream} active={isPlanning}/></div></div>:null}
+        {isPlanning&&!doc?<div className="planning-panel"><div className="planning-visual"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><Sparkles size={25}/></div><div className="planning-content"><h2>{isDesign?'正在规划设计大纲':'正在梳理内容结构'}</h2><p>{isDesign?'正在确定每页目标、信息层级和视觉方向。':'Director 正在确定叙事主线、页面大纲与全局视觉规范。'}</p><div className="progress-track"><i/></div><small>说明书完成后，你可以逐页编辑和确认</small><DirectorStreamView stream={directorStream} active={isPlanning}/></div></div>:null}
         {snapshot.director_stream&&(waiting||generating||status==='READY'||status==='PARTIAL_FAILED'||status==='CANCELLED'||(status==='FAILED'&&snapshot.latest_run?.kind==='DIRECTOR'))&&<DirectorStreamView stream={directorStream} active={false} defaultOpen={false}/>}
         {status==='FAILED'&&<div className="inline-error"><X size={14}/>{snapshot.latest_run?.error||'生成失败，请检查模型配置后重试。'}</div>}
         {doc && workspaceView === 'outline' && (
@@ -163,9 +183,9 @@ function App(){
               <div className="section-heading">
                 <div>
                   <span className="section-index">01</span>
-                  <h2>叙事结构</h2>
+                  <h2>{isDesign?'页面构思':'叙事结构'}</h2>
                 </div>
-                <span>{doc.slides.length} 页 · 可编辑</span>
+                <span>{doc.slides.length} 页 · {outlineEditing?'可编辑':'只读'}</span>
               </div>
               <div className="slide-outline-list">
                 {doc.slides.map((slide, index) => (
@@ -182,6 +202,7 @@ function App(){
                       </div>
                       <input
                         className="outline-title-input"
+                        aria-label={`第 ${index + 1} 页标题`}
                         value={slide.title}
                         readOnly={!outlineEditing}
                         onChange={(event) => updateSlide(index, { title: event.target.value })}
@@ -203,6 +224,13 @@ function App(){
                           })
                         }
                       />
+                      {isDesign && (
+                        <label className="design-outline-note">
+                          版式说明
+                          <textarea rows={2} value={slide.design_notes} readOnly={!outlineEditing}
+                            onChange={(event) => updateSlide(index, { design_notes: event.target.value })} />
+                        </label>
+                      )}
                     </div>
                     <div className="outline-card-tail">
                       <span>{slide.content_outline.length} 个要点</span>
@@ -217,9 +245,9 @@ function App(){
             {doc.brief.assumptions.length>0&&<div className="assumption-note"><CircleHelp size={14}/><span>{doc.brief.assumptions.join('；')}</span></div>}
           </aside></div>)}
         {doc&&workspaceView==='generation'&&generationAvailable&&<div className={`generation-layout ${previewOpen?'':'preview-hidden'}`} style={previewOpen?{gridTemplateColumns:`${pageRailWidth}px minmax(0,1fr)`}:undefined}><aside className="page-rail"><div className="section-heading compact"><div><span className="section-index">02</span><h2>页面</h2></div><span>{snapshot.pages.filter(p=>p.status==='SUCCEEDED').length}/{snapshot.pages.length}</span></div><div className="page-rail-list">{doc.slides.map((s,i)=>{const p=snapshot.pages.find(x=>x.page_number===i+1);return <button key={s.slide_id} className={`page-thumb ${i===selectedPage?'active':''}`} onClick={()=>setSelectedPage(i)}><span className="thumb-number">{String(i+1).padStart(2,'0')}</span><span className="thumb-title">{s.title}</span><span className={`thumb-state ${p?.status?.toLowerCase()||'pending'}`}><PageStatusIcon status={p?.status} sceneStatus={p?.scene?.status}/></span></button>})}</div><div className="rail-footer"><Activity size={14}/>{generating||snapshot.pages.some(p=>p.scene&&['QUEUED','RUNNING','FAILED'].includes(p.scene.status))?<GenerationProgress pages={snapshot.pages}/>:status==='CANCELLED'?'已取消':'生成完成'}</div><div className="rail-resize-handle" role="separator" aria-label="调整页面列表宽度" onPointerDown={startRailResize} onPointerMove={moveRailResize} onPointerUp={endRailResize} onPointerCancel={endRailResize}/></aside>
-          <div className="canvas-column"><div className="canvas-toolbar"><div className="canvas-page-label"><strong>{String(selectedPage+1).padStart(2,'0')}</strong><span>/</span>{String(doc.slides.length).padStart(2,'0')}<i/>{currentSlide?.title}</div><div className="canvas-controls"><div className="segmented"><button className={view==='scene'?'selected':''} onClick={()=>setView('scene')}>新版预览</button><button className={view==='preview'?'selected':''} onClick={()=>setView('preview')}>HTML 预览</button><button className={view==='source'?'selected':''} onClick={()=>setView('source')}>HTML 源码</button></div><span className="canvas-size">800 × 450</span><button className="icon-button" title="上一页" disabled={selectedPage===0} onClick={()=>setSelectedPage(x=>Math.max(0,x-1))}><ArrowLeft size={15}/></button><button className="icon-button" title="下一页" disabled={selectedPage===doc.slides.length-1} onClick={()=>setSelectedPage(x=>Math.min(doc.slides.length-1,x+1))}><ArrowRight size={15}/></button><button className="icon-button" title="隐藏预览" onClick={()=>setPreviewOpen(false)}><PanelRightClose size={15}/></button></div></div>
-            <div className="canvas-stage">{currentTask?.status==='SUCCEEDED'&&currentTask.html_hash&&view==='scene'?<SceneViewport key={currentTask.id+'/'+(currentTask.scene?.scene_id||'pending')} pageId={currentTask.id} htmlHash={currentTask.html_hash} scene={currentTask.scene} number={selectedPage+1} onScene={scene=>setSnapshot(prev=>prev?({...prev,pages:prev.pages.map(p=>p.id===currentTask.id?({...p,scene}):p)}):prev)}/>:currentTask?.status==='SUCCEEDED'&&displayHtml&&view==='preview'?<SlideFrame url={displayHtml} number={selectedPage+1} sceneId={currentTask.scene?.scene_id}/>:view==='source'?<pre className="source-view">{displayHtml?sourceHtml||'正在读取 HTML…':typeof previewHtml==='string'?previewHtml:'等待页面生成…'}</pre>:<div className="empty-canvas">{currentTask?.status==='WAITING_MODEL_CAPACITY'||currentTask?.status==='WAITING_CAPACITY'||currentTask?.status==='VALIDATING'?<><PageStatusIcon status={currentTask.status}/><span>{pageStatusLabel(currentTask.status)}</span></>:currentTask?.status==='RUNNING'?<><LoaderCircle className="spin" size={20}/><span>正在创作第 {selectedPage+1} 页</span><small>页面完成后会自动显示</small></>:currentTask?.status==='FAILED'?<><X size={20}/><span>这一页生成失败</span><small>{currentTask.error}</small></>:<><div className="empty-page-icon"><FileText size={21}/></div><span>等待这一页开始生成</span></>}</div>}</div>
-             <div className="canvas-footer"><div className="render-status"><i className={currentTask?.status==='SUCCEEDED'?'success':''}/>{pageStatusLabel(currentTask?.status,currentTask?.scene?.status)}</div><span>固定画布 · 16:9</span></div></div></div>}
+          <div className="canvas-column"><div className="canvas-toolbar"><div className="canvas-page-label"><strong>{String(selectedPage+1).padStart(2,'0')}</strong><span>/</span>{String(doc.slides.length).padStart(2,'0')}<i/>{currentSlide?.title}</div><div className="canvas-controls"><div className="segmented"><button className={view==='scene'?'selected':''} onClick={()=>setView('scene')}>{isDesign?'画布预览':'新版预览'}</button><button className={view==='preview'?'selected':''} onClick={()=>setView('preview')}>HTML 预览</button><button className={view==='source'?'selected':''} onClick={()=>setView('source')}>HTML 源码</button></div><span className="canvas-size">{canvasLabel}</span><button className="icon-button" title="上一页" disabled={selectedPage===0} onClick={()=>setSelectedPage(x=>Math.max(0,x-1))}><ArrowLeft size={15}/></button><button className="icon-button" title="下一页" disabled={selectedPage===doc.slides.length-1} onClick={()=>setSelectedPage(x=>Math.min(doc.slides.length-1,x+1))}><ArrowRight size={15}/></button><button className="icon-button" title="隐藏预览" onClick={()=>setPreviewOpen(false)}><PanelRightClose size={15}/></button></div></div>
+            <div className={`canvas-stage ${isDesign?'design-stage':''}`}>{currentTask?.status==='SUCCEEDED'&&currentTask.html_hash&&view==='scene'?<SceneViewport key={currentTask.id+'/'+(currentTask.scene?.scene_id||'pending')} pageId={currentTask.id} htmlHash={currentTask.html_hash} scene={currentTask.scene} expectedCanvas={canvas} number={selectedPage+1} onScene={scene=>setSnapshot(prev=>prev?({...prev,pages:prev.pages.map(p=>p.id===currentTask.id?({...p,scene}):p)}):prev)}/>:currentTask?.status==='SUCCEEDED'&&displayHtml&&view==='preview'?<SlideFrame canvas={canvas} url={displayHtml} number={selectedPage+1} sceneId={currentTask.scene?.scene_id}/>:view==='source'?<pre className="source-view">{displayHtml?sourceHtml||'正在读取 HTML…':typeof previewHtml==='string'?previewHtml:'等待页面生成…'}</pre>:<div className="empty-canvas">{currentTask?.status==='WAITING_MODEL_CAPACITY'||currentTask?.status==='WAITING_CAPACITY'||currentTask?.status==='VALIDATING'?<><PageStatusIcon status={currentTask.status}/><span>{pageStatusLabel(currentTask.status)}</span></>:currentTask?.status==='RUNNING'?<><LoaderCircle className="spin" size={20}/><span>正在创作第 {selectedPage+1} 页</span><small>页面完成后会自动显示</small></>:currentTask?.status==='FAILED'?<><X size={20}/><span>这一页生成失败</span><small>{currentTask.error}</small></>:<><div className="empty-page-icon"><FileText size={21}/></div><span>等待这一页开始生成</span></>}</div>}</div>
+             <div className="canvas-footer"><div className="render-status"><i className={currentTask?.status==='SUCCEEDED'?'success':''}/>{pageStatusLabel(currentTask?.status,currentTask?.scene?.status)}</div><span>画布比例 · {canvasRatio(canvas)}</span></div></div></div>}
         {doc&&workspaceView==='generation'&&generationAvailable&&!previewOpen&&<button className="preview-restore-button" onClick={()=>setPreviewOpen(true)}><PanelRightOpen size={15}/>显示预览</button>}
       </section>}
     </main>
@@ -271,6 +299,38 @@ function StreamText({text,code=false}:{text:string;code?:boolean}){
   return <pre ref={ref} className={code?'stream-code':''} onScroll={event=>{const element=event.currentTarget;followTail.current=element.scrollHeight-element.scrollTop-element.clientHeight<28}}>{text}</pre>
 }
 
-function SlideFrame({url,number,sceneId}:{url:string;number:number;sceneId?:string|null}){const ref=useRef<HTMLDivElement>(null);const [scale,setScale]=useState(1);const [ticketUrl,setTicketUrl]=useState('');useEffect(()=>{const element=ref.current;if(!element)return;const observer=new ResizeObserver(()=>setScale(Math.min(element.clientWidth/800,element.clientHeight/450)));observer.observe(element);return()=>observer.disconnect()},[]);useEffect(()=>{let live=true;setTicketUrl('');const id=url.split('/').at(-2);api<{preview_url:string}>(`/page-tasks/${id}/preview-tickets${sceneId?'?scene_id='+encodeURIComponent(sceneId):''}`,{method:'POST'}).then(result=>{if(live)setTicketUrl(result.preview_url)}).catch(()=>{});return()=>{live=false}},[url,sceneId]);return <div ref={ref} className="slide-viewport">{ticketUrl&&<iframe className="slide-frame" title={`第 ${number} 页预览`} src={ticketUrl} sandbox="" style={{transform:`scale(${scale})`}}/>}</div>}
+function SlideFrame({url, number, sceneId, canvas}: {
+  url:string; number:number; sceneId?:string|null; canvas:CanvasSize;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(0);
+  const [preview, setPreview] = useState({ request: '', url: '' });
+  const { width, height } = canvas;
+  const request = `${url}:${sceneId || ''}`;
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const resize = () => setScale(fitCanvas(element.clientWidth, element.clientHeight, { width, height }));
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    resize();
+    return () => observer.disconnect();
+  }, [width, height]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const id = url.split('/').at(-2);
+    api<{preview_url:string}>(`/page-tasks/${id}/preview-tickets${sceneId?'?scene_id='+encodeURIComponent(sceneId):''}`,
+      {method:'POST', signal:controller.signal})
+      .then(result => { if (!controller.signal.aborted) setPreview({ request, url: result.preview_url }); })
+      .catch(() => { if (!controller.signal.aborted) setPreview({ request, url: '' }); });
+    return () => controller.abort();
+  }, [request, url, sceneId]);
+  return <div ref={ref} className="slide-viewport">
+    {preview.request === request && (preview.url
+      ? <iframe className="slide-frame" title={`第 ${number} 页预览`} src={preview.url} sandbox=""
+          style={{ width, height, transform: `translate(-50%, -50%) scale(${scale})` }}/>
+      : <div className="empty-canvas scene-message" role="status">无法加载 HTML 预览</div>)}
+  </div>;
+}
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);

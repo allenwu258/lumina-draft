@@ -88,13 +88,19 @@ test('Provider configuration, model discovery, routing and presentation generati
     { width: 390, height: 844 },
   ]) {
     await page.setViewportSize(viewport);
-    const dimensions = await outlineBullets.evaluate((element: HTMLTextAreaElement) => ({
-      scrollHeight: element.scrollHeight,
-      clientHeight: element.clientHeight,
-      overflowY: getComputedStyle(element).overflowY,
-    }));
-    expect(dimensions.scrollHeight - dimensions.clientHeight).toBeLessThanOrEqual(1);
-    expect(dimensions.overflowY).toBe('hidden');
+    const readDimensions = () =>
+      outlineBullets.evaluate((element: HTMLTextAreaElement) => ({
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight,
+        overflowY: getComputedStyle(element).overflowY,
+      }));
+    await expect
+      .poll(async () => {
+        const { scrollHeight, clientHeight } = await readDimensions();
+        return scrollHeight - clientHeight;
+      })
+      .toBeLessThanOrEqual(1);
+    expect((await readDimensions()).overflowY).toBe('hidden');
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.screenshot({ path: testInfo.outputPath('outline-full.png'), fullPage: true });
@@ -234,7 +240,7 @@ test('Entry mode routing keeps unavailable workflows visible but blocked', async
   await expect(menu.getByRole('menuitem', { name: /Agent 模式/ })).toBeVisible();
   await expect(menu.getByRole('menuitem', { name: /设计生成/ })).toHaveAttribute(
     'aria-disabled',
-    'true',
+    'false',
   );
   await menu.getByRole('menuitem', { name: /Agent 模式/ }).click();
   await expect(page.getByPlaceholder(/步骤化/)).toBeVisible();
