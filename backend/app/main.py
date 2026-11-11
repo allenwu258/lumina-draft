@@ -460,7 +460,7 @@ def get_presentation(presentation_id: str):
                     director_stream[channel] += payload.get("delta", "")
         conversation = conversation_projection(db, p, outline, runs)
         export_source = export_service.source_summary(db, p.id)
-        latest_export = db.scalar(select(PptxExport).where(PptxExport.presentation_id == p.id, PptxExport.source_hash == export_source["source_hash"]).order_by(PptxExport.created_at.desc()).limit(1)) if export_source["can_export"] else None
+        latest_export = db.scalar(select(PptxExport).where(PptxExport.presentation_id == p.id, PptxExport.request_hash == export_service.request_identity(p.id, export_source["source_hash"])).order_by(PptxExport.created_at.desc()).limit(1)) if export_source["can_export"] else None
         return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq, "export_source": export_source, "latest_export": export_service.export_dict(latest_export) if latest_export else None}
 
 

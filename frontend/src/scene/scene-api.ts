@@ -1,5 +1,19 @@
 import type { SceneIR } from '@lumina/scene-core';
 export type SceneSummary = {
+  up_to_date: boolean;
+  display_scene: {
+    scene_id: string;
+    scene_hash: string;
+    schema_version: string;
+    converter_version: string;
+  } | null;
+  conversion: {
+    job_id: string;
+    status: string;
+    target_converter: string;
+    error_code: string | null;
+    error: string | null;
+  } | null;
   status: string;
   job_id: string | null;
   scene_id: string | null;

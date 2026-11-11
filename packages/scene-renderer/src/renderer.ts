@@ -7,22 +7,66 @@ import {
 } from "@lumina/scene-core";
 
 type Context = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+export type DrawableAsset = { source: CanvasImageSource; dispose: () => void };
 export type AssetResolver = (
   asset: SceneIR["assets"][number],
   signal?: AbortSignal,
-) => Promise<ImageBitmap>;
+) => Promise<DrawableAsset | ImageBitmap>;
 export type FontResolver = (
   style: TextStyle,
   sample: string,
   signal?: AbortSignal,
 ) => Promise<void>;
+/** Keep SVG as a decoded vector source so resizing/DPR does not magnify a 1x bitmap. */
+export async function decodeAsset(
+  bytes: BlobPart,
+  mediaType: string,
+  signal?: AbortSignal,
+): Promise<DrawableAsset> {
+  const blob = new Blob([bytes], { type: mediaType });
+  if (mediaType === "image/png") {
+    const source = await createImageBitmap(blob);
+    if (signal?.aborted) {
+      source.close();
+      throw new DOMException("Aborted", "AbortError");
+    }
+    return { source, dispose: () => source.close() };
+  }
+  if (mediaType !== "image/svg+xml")
+    throw new Error("UNSUPPORTED_ASSET_FORMAT");
+  const url = URL.createObjectURL(blob),
+    source = new Image();
+  const abort = () => {
+    source.src = "";
+    URL.revokeObjectURL(url);
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    source.src = url;
+    await source.decode();
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    return { source, dispose: abort };
+  } catch (error) {
+    abort();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
 const font = (s: TextStyle) =>
   `${s.fontStyle} ${s.fontWeight} ${s.fontSize}px ${s.fontFamily}`;
 function rounded(ctx: Context, r: Rect, radii: number[]) {
   ctx.beginPath();
   ctx.roundRect(r.x, r.y, r.width, r.height, radii);
 }
-function draw(ctx: Context, n: SceneNode, images: Map<string, ImageBitmap>) {
+function draw(
+  ctx: Context,
+  n: SceneNode,
+  images: Map<string, DrawableAsset>,
+  shadowOnly = false,
+  fragments?: Set<string>,
+) {
   if (n.kind === "shape") {
     for (const shadow of n.shadows) {
       ctx.save();
@@ -48,6 +92,7 @@ function draw(ctx: Context, n: SceneNode, images: Map<string, ImageBitmap>) {
       ctx.fill();
       ctx.restore();
     }
+    if (shadowOnly) return;
     rounded(ctx, n.frame, n.radii);
     ctx.fillStyle = n.fill;
     ctx.fill();
@@ -113,8 +158,9 @@ function draw(ctx: Context, n: SceneNode, images: Map<string, ImageBitmap>) {
     );
     ctx.textBaseline = "alphabetic";
     ctx.textAlign = "left";
-    for (const line of n.text.lines)
-      for (const f of line.fragments) {
+    for (const [li, line] of n.text.lines.entries())
+      for (const [fi, f] of line.fragments.entries()) {
+        if (fragments && !fragments.has(`${n.id}/${li}/${fi}`)) continue;
         const s = runs.get(f.runId)!.style;
         ctx.font = font(s);
         ctx.fillStyle = s.color;
@@ -140,14 +186,20 @@ function draw(ctx: Context, n: SceneNode, images: Map<string, ImageBitmap>) {
   } else if (n.kind === "image") {
     const image = images.get(n.assetId);
     if (!image) throw new Error("场景图片尚未就绪");
-    ctx.drawImage(image, n.frame.x, n.frame.y, n.frame.width, n.frame.height);
+    ctx.drawImage(
+      image.source,
+      n.frame.x,
+      n.frame.y,
+      n.frame.width,
+      n.frame.height,
+    );
   }
 }
 
 /** Disposable drawing cache; SceneIR remains the only page model. No HTML/DOM dependency. */
 export class SceneRenderer {
   private scene?: SceneIR;
-  private images = new Map<string, ImageBitmap>();
+  private images = new Map<string, DrawableAsset>();
   private generation = 0;
   private disposed = false;
   private width = 800;
@@ -163,9 +215,9 @@ export class SceneRenderer {
     assertScene(scene);
     const token = ++this.generation;
     this.scene = undefined;
-    this.images.forEach((i) => i.close());
+    this.images.forEach((i) => i.dispose());
     this.images.clear();
-    const decoded = new Map<string, ImageBitmap>();
+    const decoded = new Map<string, DrawableAsset>();
     const fonts = new Map<string, { style: TextStyle; sample: string }>();
     for (const n of scene.nodes)
       if (n.kind === "text")
@@ -184,10 +236,19 @@ export class SceneRenderer {
           }
     try {
       const results = await Promise.allSettled([
-        ...scene.assets.map(async (a) => {
-          const image = await assetResolver(a, signal);
-          decoded.set(a.id, image);
-        }),
+        ...scene.assets
+          .filter((a) =>
+            scene.nodes.some((n) => n.kind === "image" && n.assetId === a.id),
+          )
+          .map(async (a) => {
+            const image = await assetResolver(a, signal);
+            decoded.set(
+              a.id,
+              "source" in image
+                ? image
+                : { source: image, dispose: () => image.close() },
+            );
+          }),
         ...[...fonts.values()].map((f) =>
           fontResolver(f.style, f.sample, signal),
         ),
@@ -219,7 +280,7 @@ export class SceneRenderer {
       this.images = decoded;
       this.scene = scene;
     } catch (error) {
-      decoded.forEach((i) => i.close());
+      decoded.forEach((i) => i.dispose());
       throw error;
     }
   }
@@ -255,14 +316,28 @@ export class SceneRenderer {
     );
   }
   /** Transparent Scene-only composition. Ancestor clip/opacity is applied exactly once. */
-  renderRegion(bounds: Rect, nodeIds: string[], scale = 3): HTMLCanvasElement {
+  renderRegion(
+    bounds: Rect,
+    nodeIds: string[],
+    scale = 3,
+    shadowOnly = false,
+    fragmentKeys?: string[],
+  ): HTMLCanvasElement {
     if (!this.scene || this.disposed) throw new Error("SCENE_NOT_LOADED");
     const target = document.createElement("canvas");
     target.width = Math.max(1, Math.ceil(bounds.width * scale));
     target.height = Math.max(1, Math.ceil(bounds.height * scale));
     if (target.width * target.height > 16_000_000)
       throw new Error("RASTER_PIXEL_LIMIT");
-    this.paint(target, bounds, scale, new Set(nodeIds), false);
+    this.paint(
+      target,
+      bounds,
+      scale,
+      new Set(nodeIds),
+      false,
+      shadowOnly,
+      fragmentKeys ? new Set(fragmentKeys) : undefined,
+    );
     return target;
   }
   private paint(
@@ -271,6 +346,8 @@ export class SceneRenderer {
     scale: number,
     selected: Set<string> | undefined,
     background: boolean,
+    shadowOnly = false,
+    fragments?: Set<string>,
   ) {
     if (!this.scene) return;
     const scene = this.scene,
@@ -331,14 +408,15 @@ export class SceneRenderer {
         }
         ctx = entry.parent;
         ctx.restore();
-      } else if (!selected || selected.has(n.id)) draw(ctx, n, this.images);
+      } else if (!selected || selected.has(n.id))
+        draw(ctx, n, this.images, shadowOnly, fragments);
     }
   }
   dispose() {
     this.disposed = true;
     this.generation++;
     this.scene = undefined;
-    this.images.forEach((i) => i.close());
+    this.images.forEach((i) => i.dispose());
     this.images.clear();
     this.canvas.width = 1;
     this.canvas.height = 1;

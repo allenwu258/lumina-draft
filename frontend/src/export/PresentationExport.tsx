@@ -26,7 +26,7 @@ export function PresentationExport({ presentationId, source, latest }: Props) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
-    if (latest) setRecord(latest);
+    setRecord(latest || null);
   }, [latest]);
   const active = record && ['PREPARING', 'QUEUED', 'RUNNING'].includes(record.status);
   useEffect(() => {
@@ -114,7 +114,7 @@ export function PresentationExport({ presentationId, source, latest }: Props) {
       )}
       {!!record?.warnings?.length && (
         <small className="export-warning" title={record.warnings.join('\n')}>
-          部分元素已作为图片导出
+          导出提示（{record.warnings.length} 项）
         </small>
       )}
     </div>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { SceneRenderer } from '@lumina/scene-renderer';
+import { SceneRenderer, decodeAsset } from '@lumina/scene-renderer';
 import { ensureScene, fetchScene, type SceneSummary } from './scene-api';
 import './scene.css';
 
@@ -21,7 +21,7 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
   const [renderAttempt, setRenderAttempt] = useState(0);
   const request = useRef(0);
   useEffect(() => {
-    if (scene?.status && scene.status !== 'NOT_REQUESTED') return;
+    if (scene?.up_to_date || (scene?.status && scene.status !== 'NOT_REQUESTED')) return;
     const controller = new AbortController();
     ensureScene(pageId, htmlHash, false, controller.signal)
       .then((s) => callback.current(s))
@@ -29,10 +29,9 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
         if (!controller.signal.aborted) setError(String(e));
       });
     return () => controller.abort();
-  }, [pageId, htmlHash, scene?.status]);
+  }, [pageId, htmlHash, scene?.status, scene?.up_to_date]);
   useEffect(() => {
-    if (!scene?.scene_id || scene.status !== 'SUCCEEDED' || !canvas.current || !host.current)
-      return;
+    if (!scene?.scene_id || !canvas.current || !host.current) return;
     const controller = new AbortController(),
       token = ++request.current;
     const renderer = new SceneRenderer(canvas.current),
@@ -61,7 +60,7 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
               .map((v) => v.toString(16).padStart(2, '0'))
               .join('');
             if (hash !== asset.sha256) throw new Error('场景资源校验失败');
-            return createImageBitmap(new Blob([bytes], { type: asset.mediaType }));
+            return decodeAsset(bytes, asset.mediaType, controller.signal);
           },
           async (style, sample) => {
             const font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize}px ${style.fontFamily}`;
@@ -88,9 +87,9 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
       window.removeEventListener('resize', resize);
       renderer.dispose();
     };
-  }, [scene?.scene_id, scene?.status, renderAttempt]);
+  }, [scene?.scene_id, renderAttempt]);
   async function retry() {
-    if (scene?.status === 'SUCCEEDED') {
+    if (scene?.up_to_date) {
       setRenderAttempt((n) => n + 1);
       return;
     }
@@ -105,7 +104,7 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
     }
   }
   const failed = scene?.status === 'FAILED' || scene?.status === 'CANCELLED';
-  const ready = phase === 'ready' && scene?.status === 'SUCCEEDED';
+  const ready = phase === 'ready' && !!scene?.scene_id;
   const message = failed
     ? '这一页转换失败'
     : scene?.status === 'RUNNING'
@@ -140,7 +139,22 @@ export function SceneViewport({ pageId, htmlHash, scene, number, onScene }: Prop
           <small>可切换 HTML 预览或源码查看原始页面</small>
         </div>
       )}
-      {ready && !!scene?.warning_count && (
+      {ready && failed && (
+        <span className="scene-warning" title={scene?.error || '新版转换失败，当前显示已有场景'}>
+          新版转换失败{' '}
+          <button onClick={retry} disabled={retrying}>
+            重试转换
+          </button>
+        </span>
+      )}
+      {ready && !failed && !scene?.up_to_date && (
+        <span className="scene-warning">
+          {scene?.error_code === 'SOURCE_HTML_MISSING'
+            ? '缺少来源，保留已有场景'
+            : '正在升级矢量场景'}
+        </span>
+      )}
+      {ready && !failed && scene?.up_to_date && !!scene?.warning_count && (
         <span className="scene-warning" title="部分 CSS 效果由 Canvas 近似绘制">
           {scene.warning_count} 项渲染提示
         </span>

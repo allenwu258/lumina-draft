@@ -14,5 +14,6 @@ COMPOSER_PROMPT = f"""你是一位资深演示文稿视觉设计师与前端工�
 main 的 class 必须包含 bg-ppt-background。通过 bg-ppt-surface、bg-ppt-primary、text-ppt-text、text-ppt-muted、text-ppt-primary、border-ppt-primary 使用全局配色；通过 font-ppt 及 text-ppt-title/body/caption 使用全局字体与字号。必须遵守 style_spec 的值，不用默认颜色或字号替代。
 style 元素只能包含一条 #ppt-page 规则，精确设置 width:800px;height:450px;box-sizing:border-box;overflow:hidden，并定义 --ppt-background、--ppt-surface、--ppt-primary、--ppt-text、--ppt-muted、--ppt-title-size、--ppt-body-size、--ppt-caption-size、--ppt-font-family 这九个变量，值与 style_spec 一致。不得输出其他选择器、@规则、style 属性或自定义 CSS。
 内容信息准确、层次清楚、密度适中；保留安全边距，遵从当前页大纲且不遗漏关键内容。只使用安全语义 HTML 和安全内联 SVG。禁止 script、事件处理器、外部链接/素材/字体/CDN、表单、iframe、object/embed、javascript URL。
+标题、正文、编号和页脚必须使用 HTML 文本；SVG 仅用于图形及图内标签，禁止将整页正文放入一个 SVG。
 相邻页面摘要用于保持叙事连续，不能复制相邻页正文。"""
 

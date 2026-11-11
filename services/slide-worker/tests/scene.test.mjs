@@ -17,7 +17,7 @@ before(async () => {
   bundle = (
     await build({
       stdin: {
-        contents: `import {SceneRenderer} from '@lumina/scene-renderer';window.SceneRenderer=SceneRenderer;`,
+        contents: `import {SceneRenderer,decodeAsset} from '@lumina/scene-renderer';window.SceneRenderer=SceneRenderer;window.decodeAsset=decodeAsset;`,
         resolveDir: resolve("."),
       },
       bundle: true,
@@ -55,7 +55,9 @@ test("real Chromium capture preserves text, table, SVG and deterministic identit
   assert.match(display, /重点内容/);
   assert.match(display, /保留  空格/);
   assert.equal(scene.nodes.filter((n) => n.kind === "table").length, 1);
-  assert.equal(scene.assets.length, 1);
+  assert.equal(scene.assets.length, 2);
+  assert.equal(scene.assets[0].mediaType, "image/svg+xml");
+  assert.equal(scene.assets[0].fallbackAssetId, scene.assets[1].id);
   assert.equal(texts.filter((n) => n.text.sourceText === "转换服务").length, 1);
   assert.equal(
     scene.textInventory.filter((t) => t.sourceText === "转换服务").length,
@@ -101,10 +103,9 @@ test("Canvas consumes only SceneIR/assets and matches independent HTML regions a
           await renderer.load(
             scene,
             async (asset) =>
-              createImageBitmap(
-                await (
-                  await fetch("data:image/png;base64," + assets[asset.id])
-                ).blob(),
+              window.decodeAsset(
+                Uint8Array.from(atob(assets[asset.id]), (c) => c.charCodeAt(0)),
+                asset.mediaType,
               ),
             async (s, text) => {
               await document.fonts.load(

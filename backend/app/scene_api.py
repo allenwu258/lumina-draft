@@ -38,7 +38,7 @@ async def ensure_scene(task_id: str, body: ConvertRequest, response: Response):
                         "message": "页面来源已更新、未完成或场景数据不可用，请刷新后重试",
                     },
                 ) from exc
-            response.status_code = 200 if result["scene_id"] else 202
+            response.status_code = 200 if result["up_to_date"] or result["error_code"] == "SOURCE_HTML_MISSING" else 202
             presentation_id = page.presentation_id
     WAKE.set()
     await runtime.EVENT_BUS.notify(presentation_id)

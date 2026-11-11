@@ -118,7 +118,7 @@ test('Provider configuration, model discovery, routing and presentation generati
   const sceneResponse = await page.request.get(`/api/v1/scenes/${sceneId}`);
   expect(sceneResponse.ok()).toBe(true);
   const scene = await sceneResponse.json();
-  expect(scene.schemaVersion).toBe('0.3.0');
+  expect(scene.schemaVersion).toBe('0.4.0');
   expect(
     scene.nodes.some(
       (n: any) => n.kind === 'text' && n.text.sourceText.includes('Provider 验收完成'),

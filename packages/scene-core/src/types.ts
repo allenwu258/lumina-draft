@@ -65,7 +65,7 @@ export type TextNode = BaseNode & { kind: "text"; text: TextContent };
 export type ImageNode = BaseNode & { kind: "image"; assetId: string };
 export type SceneNode = GroupNode | ShapeNode | TextNode | ImageNode;
 export type SceneIR = {
-  schemaVersion: "0.3.0";
+  schemaVersion: "0.3.0" | "0.4.0";
   source: { htmlHash: string; cssHash: string; converterVersion: string };
   environment: {
     chromium: string;
@@ -80,7 +80,8 @@ export type SceneIR = {
   paintOps: { op: "begin" | "draw" | "end"; nodeId: string }[];
   assets: {
     id: string;
-    mediaType: "image/png";
+    mediaType: "image/png" | "image/svg+xml";
+    fallbackAssetId?: string;
     sha256: string;
     byteLength: number;
     width: number;
@@ -94,9 +95,20 @@ export type SceneIR = {
     sourceText: string;
     nodeId: string | null;
     reason: string | null;
+    target?:
+      | { kind: "text"; nodeId: string }
+      | { kind: "asset"; nodeId: string; assetId: string }
+      | { kind: "hidden"; reason: string };
   }[];
-  diagnostics: { code: string; message: string; sourcePath: string }[];
+  diagnostics: {
+    code: string;
+    message: string;
+    sourcePath: string;
+    nodeId?: string;
+    severity?: "info" | "warning" | "error";
+    details?: Record<string, string | number | boolean | null>;
+  }[];
 };
-export const SCENE_VERSION = "0.3.0" as const;
-export const CONVERTER_VERSION = "dom-canvas-0.3.0";
+export const SCENE_VERSION = "0.4.0" as const;
+export const CONVERTER_VERSION = "dom-canvas-0.4.0";
 export const EMU_PER_SCENE_PX = 15240;

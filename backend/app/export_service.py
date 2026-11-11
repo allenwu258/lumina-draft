@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import shutil
 import zipfile
+import struct
+import zlib
 from xml.etree import ElementTree as ET
 
 from sqlalchemy import select
@@ -25,6 +27,7 @@ from .db import (
 )
 from .scene_service import (
     ROOT,
+    SCENE_TARGET,
     SCENE_ROOT,
     canonical,
     digest,
@@ -34,7 +37,7 @@ from .scene_service import (
     validate_scene,
 )
 
-EXPORT_VERSION = "scene-pptx-0.1.0"
+EXPORT_VERSION = "scene-pptx-0.2.0"
 EXPORT_ROOT = Path(os.getenv("PPTX_EXPORT_DIR", ROOT / "data" / "exports")).resolve()
 MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
@@ -150,12 +153,26 @@ def fail_tx(db, record, exc):
     event_tx(db, record, "failed")
 
 
+def request_identity(presentation_id, source):
+    return digest(canonical([presentation_id, source, EXPORT_VERSION, SCENE_TARGET]))
+
+
+def exportable_ref(result):
+    # Old display may remain while enhancement fails. Only source-less historical pages opt out.
+    return (
+        result["ref"]
+        if result["up_to_date"] or result["error_code"] == "SOURCE_HTML_MISSING"
+        else None
+    )
+
+
 def create_tx(db, presentation_id, expected_hash, retry=False):
     manifest = source_manifest(db, presentation_id)
     source = digest(canonical(manifest))
     if source != expected_hash:
         raise ExportError("SOURCE_CHANGED", "作品已更新，请刷新后重新导出")
-    request_hash = digest(canonical([presentation_id, source, EXPORT_VERSION]))
+    manifest["target"] = SCENE_TARGET
+    request_hash = request_identity(presentation_id, source)
     record = db.scalar(
         select(PptxExport).where(
             PptxExport.presentation_id == presentation_id,
@@ -204,7 +221,11 @@ def create_tx(db, presentation_id, expected_hash, retry=False):
                     f"第 {item['page_number']} 页场景准备失败：{exc}",
                     item["page_number"],
                 ) from exc
-            item["conversion_job_id"], item["scene"] = result["job_id"], result["ref"]
+            item["conversion_job_id"], item["scene"] = result["job_id"], exportable_ref(
+                result
+            )
+            if result["error_code"] == "SOURCE_HTML_MISSING":
+                item["compatibility_warning"] = result["error"]
         record.input_manifest_json = canonical(manifest)
         advance_tx(db, record)
         if record.status == "PREPARING":
@@ -219,6 +240,16 @@ def advance_tx(db, record):
     if record.status != "PREPARING":
         return
     manifest = loads(record.input_manifest_json)
+    if (
+        manifest.get("target") != SCENE_TARGET
+        or record.export_version != EXPORT_VERSION
+    ):
+        fail_tx(
+            db,
+            record,
+            ExportError("EXPORT_VERSION_CHANGED", "导出引擎已升级，请重新发起导出"),
+        )
+        return
     previous = sum(bool(p.get("scene")) for p in manifest["pages"])
     try:
         for item in manifest["pages"]:
@@ -308,13 +339,63 @@ def stage_input(record, work: Path) -> dict:
                     f"第 {item['page_number']} 页场景或资产不可用：{exc}",
                     item["page_number"],
                 ) from exc
-    return {"title": manifest["title"], "inputHash": record.input_hash, "pages": pages}
+    return {
+        "title": manifest["title"],
+        "inputHash": record.input_hash,
+        "pages": pages,
+        "warnings": [
+            p["compatibility_warning"]
+            for p in manifest["pages"]
+            if p.get("compatibility_warning")
+        ],
+    }
 
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "asvg": "http://schemas.microsoft.com/office/drawing/2016/SVG/main",
 }
+
+
+def png_dimensions(raw):
+    """Validate the compatibility resource itself, not an unrelated stored PNG hash."""
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 45:
+        raise ExportError("PPTX_VALIDATION", "PNG 兼容资源无效")
+    pos, compressed, dims, ended = 8, bytearray(), None, False
+    while pos + 12 <= len(raw):
+        size = struct.unpack(">I", raw[pos : pos + 4])[0]
+        tag, data = raw[pos + 4 : pos + 8], raw[pos + 8 : pos + 8 + size]
+        if (
+            pos + size + 12 > len(raw)
+            or zlib.crc32(tag + data) & 0xFFFFFFFF
+            != struct.unpack(">I", raw[pos + size + 8 : pos + size + 12])[0]
+        ):
+            raise ExportError("PPTX_VALIDATION", "PNG 校验失败")
+        if tag == b"IHDR":
+            if size != 13 or dims:
+                raise ExportError("PPTX_VALIDATION", "PNG 尺寸信息无效")
+            dims = struct.unpack(">II", data[:8])
+            if min(dims) < 1 or max(dims) > 8192 or dims[0] * dims[1] > 32_000_000:
+                raise ExportError("PPTX_VALIDATION", "PNG 尺寸超限")
+        elif tag == b"IDAT":
+            compressed.extend(data)
+        elif tag == b"IEND":
+            ended = True
+            break
+        pos += size + 12
+    if not ended or not dims or not compressed:
+        raise ExportError("PPTX_VALIDATION", "PNG 内容不完整")
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(
+            compressed, min(256 * 1024 * 1024, dims[0] * dims[1] * 9 + dims[1] * 8)
+        )
+        if not decoded or not decoder.eof:
+            raise ValueError("incomplete")
+    except (ValueError, zlib.error) as exc:
+        raise ExportError("PPTX_VALIDATION", "PNG 图像数据无效") from exc
+    return dims
 
 
 def verify_pptx(path: Path, report: dict, staged: dict):
@@ -381,17 +462,51 @@ def verify_pptx(path: Path, report: dict, staged: dict):
             ):
                 raise ExportError("PPTX_VALIDATION", "局部图片覆盖范围错误", i)
             nodes = {n["id"]: n for n in page["scene"]["nodes"]}
-            expected_text = [
-                f["displayText"]
+            partial_regions = [
+                r for r in page_report.get("rasterDetails", []) if r.get("fragmentKeys")
+            ]
+            partial_nodes = {n for r in partial_regions for n in r["nodeIds"]}
+            whole_raster = set(raster_ids) - partial_nodes
+            raster_fragments = {
+                key for r in partial_regions for key in r["fragmentKeys"]
+            }
+            expected_fragments = {
+                f"{node_id}/{li}/{fi}": f["displayText"]
                 for node_id in drawn
                 if nodes[node_id]["kind"] == "text"
-                and node_id not in set(raster_ids + invisible_ids)
-                for line in nodes[node_id]["text"]["lines"]
-                for f in line["fragments"]
+                and node_id not in whole_raster | set(invisible_ids)
+                for li, line in enumerate(nodes[node_id]["text"]["lines"])
+                for fi, f in enumerate(line["fragments"])
                 if f["displayText"]
-            ]
-            if expected_text != text:
+            }
+            if not raster_fragments.issubset(expected_fragments):
+                raise ExportError("PPTX_VALIDATION", "Scene 局部文字来源无效", i)
+            native_records = page_report.get("nativeFragments", [])
+            actual_fragments = {}
+            for item in native_records:
+                key = item["fragmentKey"]
+                if not key.startswith(item["nodeId"] + "/") or key in raster_fragments:
+                    raise ExportError("PPTX_VALIDATION", "Scene 文字重复输出", i)
+                actual_fragments[key] = actual_fragments.get(key, "") + item["text"]
+            if (
+                actual_fragments
+                != {
+                    key: value
+                    for key, value in expected_fragments.items()
+                    if key not in raster_fragments
+                }
+                or [r["text"] for r in native_records] != text
+            ):
                 raise ExportError("PPTX_VALIDATION", "Scene 显示文字未完整写入", i)
+            xml_records = []
+            for shape in xml.findall(".//p:sp", NS):
+                properties = shape.find("p:nvSpPr/p:cNvPr", NS)
+                name = properties.get("name", "") if properties is not None else ""
+                contents = "".join(t.text or "" for t in shape.findall(".//a:t", NS))
+                if contents:
+                    xml_records.append((name.removeprefix("text:"), contents))
+            if xml_records != [(r["nodeId"], r["text"]) for r in native_records]:
+                raise ExportError("PPTX_VALIDATION", "Scene 文字对象顺序错误", i)
             page_rels_path = f"ppt/slides/_rels/slide{i}.xml.rels"
             page_rels = (
                 {
@@ -401,33 +516,73 @@ def verify_pptx(path: Path, report: dict, staged: dict):
                 if page_rels_path in names
                 else {}
             )
-            images = {}
+            images, vectors = {}, {}
             raster_count = 0
+            svg_report = {r["objectName"]: r for r in page_report.get("svgRegions", [])}
+            if len(svg_report) != len(page_report.get("svgRegions", [])):
+                raise ExportError("PPTX_VALIDATION", "重复矢量区域", i)
+            embed_key = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+
+            def media(rel_id):
+                target = posixpath.normpath(
+                    posixpath.join("ppt/slides", page_rels.get(rel_id, ""))
+                )
+                if not target.startswith("ppt/media/") or target not in names:
+                    raise ExportError("PPTX_VALIDATION", "图片资源引用错误", i)
+                return archive.read(target)
+
             for picture in xml.findall(".//p:pic", NS):
                 name = picture.find("p:nvPicPr/p:cNvPr", NS).get("name", "")
+                blip = picture.find("p:blipFill/a:blip", NS)
+                raw = media(blip.get(embed_key))
+                dims = png_dimensions(raw)
+                svg_blip = blip.find(".//asvg:svgBlip", NS)
+                primary_hash = digest(raw)
+                if svg_blip is not None:
+                    primary = media(svg_blip.get(embed_key))
+                    primary_hash = digest(primary)
+                    if (
+                        name not in svg_report
+                        or primary_hash != svg_report[name]["sha256"]
+                    ):
+                        raise ExportError("PPTX_VALIDATION", "SVG 主资源来源不符", i)
+                    root = ET.fromstring(primary)
+                    if root.tag != "{http://www.w3.org/2000/svg}svg":
+                        raise ExportError("PPTX_VALIDATION", "SVG 主资源无效", i)
+                    frame = svg_report[name]["frame"]
+                    ratio = frame["width"] / frame["height"]
+                    if abs(dims[0] / dims[1] - ratio) > 0.02 * ratio:
+                        raise ExportError("PPTX_VALIDATION", "SVG 兼容预览比例不符", i)
+                    vectors[name] = primary_hash
+                elif name in svg_report:
+                    raise ExportError("PPTX_VALIDATION", "SVG 主资源缺失", i)
                 if name.startswith("raster:"):
                     raster_count += 1
                 elif name.startswith("image:"):
                     node_id = name.removeprefix("image:")
                     if node_id in images:
                         raise ExportError("PPTX_VALIDATION", "图片重复输出", i)
-                    rel_id = picture.find("p:blipFill/a:blip", NS).get(
-                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
-                    )
-                    target = posixpath.normpath(
-                        posixpath.join("ppt/slides", page_rels.get(rel_id, ""))
-                    )
-                    images[node_id] = digest(archive.read(target))
-            asset_hashes = {a["id"]: a["sha256"] for a in page["scene"]["assets"]}
+                    images[node_id] = primary_hash
+                elif not name.startswith("vector:"):
+                    raise ExportError("PPTX_VALIDATION", "未知图片对象", i)
+            assets = {a["id"]: a for a in page["scene"]["assets"]}
             expected_images = {
-                node_id: asset_hashes[nodes[node_id]["assetId"]]
+                node_id: assets[nodes[node_id]["assetId"]]["sha256"]
                 for node_id in drawn
                 if nodes[node_id]["kind"] == "image"
                 and node_id not in set(raster_ids + invisible_ids)
             }
+            for region in svg_report.values():
+                if not set(region["nodeIds"]).issubset(drawn) or any(
+                    nodes[n]["kind"] != "shape"
+                    for n in region["nodeIds"]
+                    if region["reasonCode"] != "SOURCE_SVG"
+                ):
+                    raise ExportError("PPTX_VALIDATION", "SVG 覆盖范围无效", i)
             if (
                 images != expected_images
                 or raster_count != page_report["rasterRegions"]
+                or vectors != {name: r["sha256"] for name, r in svg_report.items()}
             ):
                 raise ExportError("PPTX_VALIDATION", "图片来源或局部合成数量不符", i)
             if sorted(drawn) != sorted(page_report["coveredNodeIds"]) or len(
@@ -488,6 +643,14 @@ def install_result(record, token, output: Path, staged: dict):
                     "native_text_count": len(p["nativeTexts"]),
                     "raster_regions": p["rasterRegions"],
                     "fonts": p.get("fonts", []),
+                    "svg_regions": p.get("svgRegions", []),
+                    "raster_details": p.get("rasterDetails", []),
+                    "invisible_node_ids": p.get("invisibleNodeIds", []),
+                    "asset_text_count": p.get("assetTextCount", 0),
+                    "vector_text_count": p.get("vectorTextCount", 0),
+                    "raster_asset_text_count": p.get("rasterAssetTextCount", 0),
+                    "raster_text_count": p.get("rasterTextCount", 0),
+                    "compatibility_png_count": p.get("compatibilityPngCount", 0),
                 }
                 for p in report["pages"]
             ],

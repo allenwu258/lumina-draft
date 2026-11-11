@@ -13,7 +13,7 @@ import { resolveFont } from "../dist/export/fonts.js";
 import { rasterRegions } from "../dist/export/raster.js";
 import { fixture, css } from "./fixtures.mjs";
 
-test("saved Scene exports native text, tables and assets without HTML or browser", async () => {
+test("saved Scene exports native text, tables and assets without HTML", async () => {
   const temp = await mkdtemp(join(tmpdir(), "lumina-pptx-"));
   const browser = await chromium.launch({ headless: true });
   try {
@@ -23,7 +23,6 @@ test("saved Scene exports native text, tables and assets without HTML or browser
       { html, htmlHash: hash(html), cssHash: hash("") },
       { browser, outputDir: join(temp, "capture") },
     );
-    await browser.close();
     const output = join(temp, "out");
     await mkdir(output);
     const report = await writePptx(
@@ -34,6 +33,7 @@ test("saved Scene exports native text, tables and assets without HTML or browser
       },
       output,
       resolve,
+      browser,
     );
     assert.equal(report.pages[0].rasterRegions, 0);
     assert.ok(
@@ -71,6 +71,7 @@ test("saved Scene exports native text, tables and assets without HTML or browser
       },
       large,
       resolve,
+      browser,
     );
     assert.equal(twenty.pages.length, 20);
     assert.deepEqual(

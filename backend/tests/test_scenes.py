@@ -56,7 +56,11 @@ def seed_pages(count=1):
 
 def minimal_scene(job):
     return {
-        "schemaVersion": "0.3.0",
+        "schemaVersion": (
+            "0.3.0"
+            if job.converter_version == "dom-canvas-0.3.0"
+            else scene_service.SCENE_VERSION
+        ),
         "source": {
             "htmlHash": job.html_hash,
             "cssHash": job.css_hash,
@@ -177,7 +181,10 @@ def test_fifo_single_slot_idempotency_and_immutable_scene(scene_queue):
     assert worker.peak == 1 and worker.active == 0
     summary = get_summary(client, pid)
     result = client.get(f"/api/v1/scenes/{summary['scene_id']}")
-    assert result.status_code == 200 and result.json()["schemaVersion"] == "0.3.0"
+    assert (
+        result.status_code == 200
+        and result.json()["schemaVersion"] == scene_service.SCENE_VERSION
+    )
     assert scene_service.digest(result.text) == summary["scene_hash"]
     assert (
         client.get(
@@ -299,7 +306,7 @@ def test_scene_validation_rejects_bad_references_and_oversized_sources(
         assert scene_service.validate_scene(scene, job, tmp_path)
         bad = copy.deepcopy(scene)
         bad["paintOps"] = [{"op": "draw", "nodeId": "absent"}]
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="SCENE_DANGLING_PAINT"):
             scene_service.validate_scene(bad, job, tmp_path)
         bad = copy.deepcopy(scene)
         bad["source"]["htmlHash"] = "b" * 64

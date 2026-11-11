@@ -28,12 +28,18 @@ from .scene_service import (
     canonical,
     digest,
     publish_tx,
+    enqueue_tx,
     validate_scene,
 )
 from .tailwind_profile import preview_html
 
 log = logging.getLogger(__name__)
-HEALTH = {"status": "starting", "active_job_id": None, "error": None}
+HEALTH = {
+    "status": "starting",
+    "active_job_id": None,
+    "error": None,
+    "converter_version": CONVERTER_VERSION,
+}
 
 
 class WorkerError(Exception):
@@ -320,8 +326,26 @@ async def recover():
     async with EVENT_WRITE_LOCK:
         with session_scope() as db:
             for record in db.scalars(
-                select(PptxExport).where(PptxExport.status == "RUNNING")
+                select(PptxExport).where(
+                    PptxExport.status.in_(["PREPARING", "QUEUED", "RUNNING"])
+                )
             ):
+                if record.export_version != export_service.EXPORT_VERSION:
+                    if record.attempt_token:
+                        abandoned.append(
+                            SCENE_ROOT / ".work" / record.id / record.attempt_token
+                        )
+                    export_service.fail_tx(
+                        db,
+                        record,
+                        export_service.ExportError(
+                            "EXPORT_VERSION_CHANGED", "导出引擎已升级，请重新发起导出"
+                        ),
+                    )
+                    presentations.add(record.presentation_id)
+                    continue
+                if record.status != "RUNNING":
+                    continue
                 if record.attempt_token:
                     abandoned.append(
                         SCENE_ROOT / ".work" / record.id / record.attempt_token
@@ -334,12 +358,49 @@ async def recover():
                 presentations.add(record.presentation_id)
                 export_service.event_tx(db, record, "queued")
             for job in db.scalars(
-                select(SceneConversionJob).where(SceneConversionJob.status == "RUNNING")
+                select(SceneConversionJob).where(
+                    SceneConversionJob.status.in_(["QUEUED", "RUNNING"])
+                )
             ):
                 if job.attempt_token:
                     abandoned.append(SCENE_ROOT / ".work" / job.id / job.attempt_token)
-                job.status, job.attempt_token, job.queued_at = "QUEUED", None, utcnow()
                 presentations.add(job.presentation_id)
+                if job.converter_version != CONVERTER_VERSION:
+                    job.status, job.attempt_token, job.finished_at = (
+                        "CANCELLED",
+                        None,
+                        utcnow(),
+                    )
+                    job.error_code, job.error = (
+                        "CONVERTER_VERSION_CHANGED",
+                        "转换引擎已升级，旧版本任务已取消",
+                    )
+                    append_event_tx(
+                        db,
+                        job.presentation_id,
+                        "page.scene.cancelled",
+                        {
+                            "page_task_id": job.page_task_id,
+                            "job_id": job.id,
+                            "status": "CANCELLED",
+                            "error_code": job.error_code,
+                            "error": job.error,
+                        },
+                        job.run_id,
+                    )
+                    page = db.get(PageTask, job.page_task_id)
+                    if (
+                        page
+                        and page.current_scene_job_id == job.id
+                        and page.html_hash == job.html_hash
+                        and page.status == "SUCCEEDED"
+                        and page.html
+                    ):
+                        enqueue_tx(db, page, frozen_css=job.css)
+                    continue
+                if job.status != "RUNNING":
+                    continue
+                job.status, job.attempt_token, job.queued_at = "QUEUED", None, utcnow()
                 append_event_tx(
                     db,
                     job.presentation_id,

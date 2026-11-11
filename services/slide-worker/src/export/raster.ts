@@ -34,16 +34,19 @@ export async function rasterRegions(
     });
     return await page.evaluate(
       async ({ scene, assets, regions }) => {
-        const Renderer = (
+        const library = (
           window as unknown as {
             LuminaScene: {
+              decodeAsset: typeof import("@lumina/scene-renderer").decodeAsset;
               SceneRenderer: new (
                 c: HTMLCanvasElement,
               ) => import("@lumina/scene-renderer").SceneRenderer;
             };
           }
-        ).LuminaScene.SceneRenderer;
-        const renderer = new Renderer(document.querySelector("canvas")!);
+        ).LuminaScene;
+        const renderer = new library.SceneRenderer(
+          document.querySelector("canvas")!,
+        );
         try {
           await renderer.load(
             scene,
@@ -51,9 +54,7 @@ export async function rasterRegions(
               const bytes = Uint8Array.from(atob(assets[a.id]), (c) =>
                 c.charCodeAt(0),
               );
-              return createImageBitmap(
-                new Blob([bytes], { type: a.mediaType }),
-              );
+              return library.decodeAsset(bytes, a.mediaType);
             },
             async (s, text) => {
               const font = `${s.fontStyle} ${s.fontWeight} ${s.fontSize}px ${s.fontFamily}`;
@@ -63,7 +64,13 @@ export async function rasterRegions(
             },
           );
           return regions.map((r) => {
-            const canvas = renderer.renderRegion(r.frame, r.nodeIds, 3);
+            const canvas = renderer.renderRegion(
+              r.frame,
+              r.nodeIds,
+              3,
+              r.shadowOnly,
+              r.fragmentKeys,
+            );
             const data = canvas.toDataURL("image/png");
             canvas.width = canvas.height = 1;
             return data;

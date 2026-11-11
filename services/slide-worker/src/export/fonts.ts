@@ -19,6 +19,8 @@ export type ResolvedFont = {
   descent: number;
   unitsPerEm: number;
   width: number;
+  bold: boolean;
+  weight: number;
 };
 const normalize = (s: string) => s.replace(/[\s"'-]/g, "").toLowerCase();
 let faces: Face[] | undefined;
@@ -102,10 +104,15 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
   );
   // Browser glyph fallback can select symbol faces absent from CSS font-family.
   families.push(
+    ...defaults,
+    ...(process.platform === "win32" ? ["Noto Sans SC"] : ["Noto Sans CJK SC"]),
+  );
+  families.push(
     ...(process.platform === "win32"
       ? ["Segoe UI Symbol", "Segoe UI Emoji", "Segoe UI"]
       : ["Noto Sans Symbols", "DejaVu Sans"]),
   );
+  const weight = Number(style.fontWeight) >= 600 ? 700 : 400;
   const chars = [...text].filter((c) => !/[\s\u200b-\u200d\ufe0f]/u.test(c));
   for (const family of families) {
     const choices = installed()
@@ -116,13 +123,15 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
       )
       .sort(
         (a, b) =>
-          Math.abs(a.weight - Number(style.fontWeight || 400)) +
+          Math.abs(a.weight - weight) +
           (a.italic !== (style.fontStyle === "italic") ? 1000 : 0) -
-          (Math.abs(b.weight - Number(style.fontWeight || 400)) +
+          (Math.abs(b.weight - weight) +
             (b.italic !== (style.fontStyle === "italic") ? 1000 : 0)),
       );
     for (const face of choices) {
-      const font = load(face);
+      let font = load(face);
+      // OOXML exposes regular/bold. Measure the same face/weight that the writer requests.
+      if (font.variationAxes?.wght) font = font.getVariation({ wght: weight });
       if (!chars.every((c) => font.hasGlyphForCodePoint(c.codePointAt(0)!)))
         continue;
       const advance = font
@@ -134,6 +143,8 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
         ascent: font.ascent,
         descent: font.descent,
         unitsPerEm: font.unitsPerEm,
+        bold: weight >= 600,
+        weight,
         width:
           (advance * style.fontSize) / font.unitsPerEm +
           [...text].length * style.letterSpacing,
@@ -143,4 +154,28 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
   throw new Error(
     `FONT_UNAVAILABLE: ${style.fontFamily}: ${text.slice(0, 32)}`,
   );
+}
+
+/** Resolve browser-style glyph fallback, preserving font runs instead of flattening a mixed string. */
+export function splitFontRuns(
+  style: TextStyle,
+  text: string,
+  resolver = resolveFont,
+) {
+  const result: { text: string; font: ResolvedFont }[] = [];
+  const segments = new Intl.Segmenter(undefined, {
+    granularity: "grapheme",
+  }).segment(text);
+  for (const { segment } of segments) {
+    const font = resolver(style, segment),
+      last = result.at(-1);
+    if (
+      last?.font.postscript === font.postscript &&
+      last.font.weight === font.weight
+    ) {
+      last.text += segment;
+      last.font = resolver(style, last.text);
+    } else result.push({ text: segment, font });
+  }
+  return result;
 }

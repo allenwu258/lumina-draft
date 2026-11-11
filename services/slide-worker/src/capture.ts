@@ -6,6 +6,7 @@ import type { Browser } from "playwright-core";
 import {
   assertScene,
   CONVERTER_VERSION,
+  SCENE_VERSION,
   type SceneIR,
 } from "@lumina/scene-core";
 import { extractDOM } from "./extract.js";
@@ -47,6 +48,19 @@ export async function convert(
     );
     await page.evaluate((html) => {
       const parsed = new DOMParser().parseFromString(html, "text/html");
+      // Language and body styles affect inherited fonts and all downstream geometry.
+      // Copy presentation facts only; author event handlers are never attached.
+      for (const [source, target] of [
+        [parsed.documentElement, document.documentElement],
+        [parsed.body, document.body],
+      ]) {
+        for (const attr of source.attributes)
+          if (
+            /^(lang|dir|class|id|style|bgcolor|text)$/.test(attr.name) ||
+            /^(data-|aria-)/.test(attr.name)
+          )
+            target.setAttribute(attr.name, attr.value);
+      }
       document.head.append(
         ...[...parsed.head.childNodes].filter(
           (n) =>
@@ -82,21 +96,31 @@ export async function convert(
     data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
     await mkdir(runtime.outputDir, { recursive: true });
     const assets: SceneIR["assets"] = [];
+    let totalBytes = 0;
     for (const img of data.images) {
-      const bytes = Buffer.from(img.data, "base64"),
-        file = img.id + ".png";
-      await writeFile(join(runtime.outputDir, file), bytes);
-      assets.push({
-        id: img.id,
-        mediaType: "image/png",
-        sha256: hash(bytes),
-        byteLength: bytes.length,
-        width: img.width,
-        height: img.height,
-        file,
-        coveredNodeIds: [img.id + "_image"],
-        bakedEffects: ["svg-content"],
-      });
+      for (const vector of [true, false]) {
+        const bytes = vector
+          ? Buffer.from(img.svg, "utf8")
+          : Buffer.from(img.data, "base64");
+        totalBytes += bytes.length;
+        if (bytes.length > 8 * 1024 * 1024 || totalBytes > 32 * 1024 * 1024)
+          throw new Error("SCENE_ASSET_LIMIT");
+        const id = img.id + (vector ? "" : "_png"),
+          file = id + (vector ? ".svg" : ".png");
+        await writeFile(join(runtime.outputDir, file), bytes);
+        assets.push({
+          id,
+          mediaType: vector ? "image/svg+xml" : "image/png",
+          sha256: hash(bytes),
+          byteLength: bytes.length,
+          width: vector ? img.width : img.pixelWidth,
+          height: vector ? img.height : img.pixelHeight,
+          file,
+          coveredNodeIds: [img.id + "_image"],
+          bakedEffects: vector ? [] : ["svg-content"],
+          ...(vector ? { fallbackAssetId: img.id + "_png" } : {}),
+        });
+      }
     }
     const fontMetrics = await page.evaluate((fonts) => {
       const ctx = document.createElement("canvas").getContext("2d")!;
@@ -112,7 +136,7 @@ export async function convert(
       });
     }, data.fonts);
     const scene: SceneIR = {
-      schemaVersion: "0.3.0",
+      schemaVersion: SCENE_VERSION,
       source: {
         htmlHash: input.htmlHash,
         cssHash: input.cssHash,

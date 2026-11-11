@@ -1,10 +1,15 @@
 import { Ajv } from "ajv";
 import schema from "../contracts/scene-ir/0.3.0.schema.json" with { type: "json" };
+import schema4 from "../contracts/scene-ir/0.4.0.schema.json" with { type: "json" };
 import type { SceneIR } from "./types.js";
 export * from "./types.js";
 
-const check = new Ajv({ allErrors: true, strict: false }).compile(schema);
+const ajv = new Ajv({ allErrors: true, strict: false });
+const checks = { "0.3.0": ajv.compile(schema), "0.4.0": ajv.compile(schema4) };
 export function assertScene(value: unknown): asserts value is SceneIR {
+  const version = (value as SceneIR)?.schemaVersion;
+  const check = checks[version];
+  if (!check) throw new Error("SCENE_UNSUPPORTED_VERSION");
   if (!check(value))
     throw new Error(
       `SCENE_SCHEMA: ${JSON.stringify(check.errors)?.slice(0, 1200)}`,
@@ -68,7 +73,75 @@ export function assertScene(value: unknown): asserts value is SceneIR {
     if (n.kind === "table" && n.cells?.some((c) => !nodes.has(c.nodeId)))
       throw new Error("SCENE_TABLE_REFERENCE");
   }
-  for (const a of s.assets)
+  for (const a of s.assets) {
     if (a.coveredNodeIds.some((id) => !nodes.has(id)))
       throw new Error("SCENE_ASSET_COVERAGE");
+    if (a.mediaType === "image/svg+xml") {
+      const fallback = assets.get(a.fallbackAssetId!);
+      if (
+        !fallback ||
+        fallback.mediaType !== "image/png" ||
+        fallback.fallbackAssetId ||
+        JSON.stringify([...a.coveredNodeIds].sort()) !==
+          JSON.stringify([...fallback.coveredNodeIds].sort()) ||
+        Math.abs(a.width / a.height - fallback.width / fallback.height) >
+          (0.02 * a.width) / a.height
+      )
+        throw new Error("SCENE_ASSET_FALLBACK");
+    }
+  }
+  for (const n of s.nodes)
+    if (
+      n.kind === "image" &&
+      !assets.get(n.assetId)?.coveredNodeIds.includes(n.id)
+    )
+      throw new Error("SCENE_ASSET_OWNERSHIP");
+  if (s.schemaVersion === "0.4.0")
+    for (const item of s.textInventory) {
+      const t = item.target!;
+      if (t.kind === "hidden") {
+        if (item.nodeId !== null || item.reason !== t.reason)
+          throw new Error("SCENE_INVENTORY_TARGET");
+      } else {
+        const n = nodes.get(t.nodeId);
+        if (
+          item.nodeId !== t.nodeId ||
+          item.reason !== (t.kind === "asset" ? "svg-asset" : null)
+        )
+          throw new Error("SCENE_INVENTORY_TARGET");
+        if (
+          t.kind === "text"
+            ? n?.kind !== "text" ||
+              n.sourcePath !== item.sourcePath ||
+              n.text.sourceText !== item.sourceText
+            : n?.kind !== "image" ||
+              n.assetId !== t.assetId ||
+              assets.get(t.assetId)?.mediaType !== "image/svg+xml"
+        )
+          throw new Error("SCENE_INVENTORY_TARGET");
+        if (
+          t.kind === "asset" &&
+          !item.sourcePath.startsWith(n!.sourcePath + "/")
+        )
+          throw new Error("SCENE_INVENTORY_TARGET");
+      }
+    }
+}
+
+/** Read-only coverage adapter. Historical PNG assets remain PNG; no invented vectors. */
+export function textTarget(
+  scene: SceneIR,
+  item: SceneIR["textInventory"][number],
+): NonNullable<typeof item.target> {
+  if (item.target) return item.target;
+  if (item.nodeId) return { kind: "text", nodeId: item.nodeId };
+  if (item.reason === "svg-asset") {
+    const image = scene.nodes.find(
+      (n) =>
+        n.kind === "image" && item.sourcePath.startsWith(n.sourcePath + "/"),
+    );
+    if (image?.kind === "image")
+      return { kind: "asset", nodeId: image.id, assetId: image.assetId };
+  }
+  return { kind: "hidden", reason: item.reason || "legacy-hidden" };
 }

@@ -12,7 +12,15 @@ export async function extractDOM(): Promise<{
   paintOps: SceneIR["paintOps"];
   textInventory: SceneIR["textInventory"];
   diagnostics: SceneIR["diagnostics"];
-  images: { id: string; data: string; width: number; height: number }[];
+  images: {
+    id: string;
+    data: string;
+    svg: string;
+    width: number;
+    height: number;
+    pixelWidth: number;
+    pixelHeight: number;
+  }[];
   fonts: string[];
   paintGroups: {
     id: string;
@@ -29,7 +37,15 @@ export async function extractDOM(): Promise<{
     paintOps: SceneIR["paintOps"] = [],
     textInventory: SceneIR["textInventory"] = [],
     diagnostics: SceneIR["diagnostics"] = [],
-    images: { id: string; data: string; width: number; height: number }[] = [],
+    images: {
+      id: string;
+      data: string;
+      svg: string;
+      width: number;
+      height: number;
+      pixelWidth: number;
+      pixelHeight: number;
+    }[] = [],
     fonts = new Set<string>();
   let count = 0;
   const paintGroups: {
@@ -293,13 +309,13 @@ export async function extractDOM(): Promise<{
     });
     return result;
   }
+  let svgPixels = 0;
   async function svg(el: SVGElement, r: Rect) {
-    if (r.width <= 0 || r.height <= 0) return;
-    if (
-      r.width > 4096 ||
-      r.height > 4096 ||
-      r.width * r.height > 8 * 1024 * 1024
-    )
+    if (r.width <= 0 || r.height <= 0 || styleOf(el).visibility !== "visible") {
+      hiddenText(el, "invisible-svg");
+      return;
+    }
+    if (r.width > 4096 || r.height > 4096 || r.width * r.height > 8_000_000)
       throw new Error("SVG_ASSET_LIMIT");
     const clone = el.cloneNode(true) as SVGElement;
     const originals = [el, ...el.querySelectorAll("*")],
@@ -314,48 +330,169 @@ export async function extractDOM(): Promise<{
       "stroke-linecap",
       "stroke-linejoin",
       "stroke-dasharray",
+      "stroke-dashoffset",
+      "stroke-miterlimit",
       "font-family",
       "font-size",
       "font-weight",
+      "font-style",
+      "font-variant",
+      "letter-spacing",
+      "word-spacing",
+      "text-anchor",
+      "dominant-baseline",
+      "alignment-baseline",
+      "text-decoration",
+      "white-space",
       "color",
       "opacity",
       "visibility",
+      "display",
+      "stop-color",
+      "stop-opacity",
+      "clip-rule",
+      "clip-path",
+      "marker-start",
+      "marker-mid",
+      "marker-end",
+      "paint-order",
+      "vector-effect",
+      "overflow",
+      "transform",
+      "transform-origin",
     ];
+    const srgb = (value: string) => {
+      if (value === "none" || value.startsWith("url(")) return value;
+      measure.clearRect(0, 0, 1, 1);
+      measure.fillStyle = value;
+      measure.fillRect(0, 0, 1, 1);
+      const [red, green, blue, alpha] = measure.getImageData(0, 0, 1, 1).data;
+      return alpha === 255
+        ? `rgb(${red}, ${green}, ${blue})`
+        : `rgba(${red}, ${green}, ${blue}, ${round(alpha / 255)})`;
+    };
     originals.forEach((e, i) => {
-      const s = styleOf(e);
-      for (const p of props)
-        (copies[i] as SVGElement).style.setProperty(p, s.getPropertyValue(p));
+      const style = styleOf(e),
+        copy = copies[i] as SVGElement;
+      if (
+        style.filter !== "none" ||
+        style.maskImage !== "none" ||
+        style.mixBlendMode !== "normal"
+      )
+        throw new Error(`UNSUPPORTED_SVG_EFFECT: ${path(e)}`);
+      copy.removeAttribute("class");
+      copy.removeAttribute("style");
+      for (const prop of props) {
+        let value = style.getPropertyValue(prop);
+        if (/^(fill|stroke|color|stop-color)$/.test(prop)) value = srgb(value);
+        // Computed URLs may be absolute. Assets are standalone and only local references survive.
+        value = value.replace(
+          /url\(\s*["']?[^#)]*#([^"')]+)["']?\s*\)/g,
+          "url(#$1)",
+        );
+        if (value.includes("url(") && !/^url\(#[a-zA-Z0-9_.:-]+\)$/.test(value))
+          throw new Error("UNSUPPORTED_SVG_REFERENCE");
+        if (value) {
+          if (copy.hasAttribute(prop)) copy.removeAttribute(prop);
+          copy.style.setProperty(prop, value);
+          // Presentation attributes also carry resolved colors/fonts for Office SVG consumers.
+          if (
+            /^(fill|stroke|color|stop-color|font-family|font-size|font-weight|font-style|letter-spacing|text-anchor|dominant-baseline)$/.test(
+              prop,
+            )
+          )
+            copy.setAttribute(prop, value);
+        }
+      }
     });
+    clone.querySelectorAll("style").forEach((e) => e.remove());
     clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
     clone.setAttribute("width", String(r.width));
     clone.setAttribute("height", String(r.height));
+    clone.style.width = `${r.width}px`;
+    clone.style.height = `${r.height}px`;
+    // Root opacity already belongs to the Scene group.
     clone.style.opacity = "1";
+    clone.setAttribute("opacity", "1");
     clone.style.margin = "0";
+    const source = new XMLSerializer().serializeToString(clone);
     const image = new Image();
     image.src =
-      "data:image/svg+xml;charset=utf-8," +
-      encodeURIComponent(new XMLSerializer().serializeToString(clone));
+      "data:image/svg+xml;charset=utf-8," + encodeURIComponent(source);
     await image.decode();
+    const scale = Math.min(
+      3,
+      4096 / r.width,
+      4096 / r.height,
+      Math.sqrt(8_000_000 / (r.width * r.height)),
+    );
     const c = document.createElement("canvas");
-    c.width = Math.ceil(r.width);
-    c.height = Math.ceil(r.height);
-    c.getContext("2d")!.drawImage(image, 0, 0, r.width, r.height);
-    const assetId = id(el, "svg");
+    c.width = Math.max(1, Math.floor(r.width * scale));
+    c.height = Math.max(1, Math.floor(r.height * scale));
+    svgPixels += c.width * c.height;
+    if (svgPixels > 32_000_000) throw new Error("SVG_PAGE_PIXEL_LIMIT");
+    c.getContext("2d")!.drawImage(image, 0, 0, c.width, c.height);
+    const assetId = id(el, "svg"),
+      nodeId = assetId + "_image";
     images.push({
       id: assetId,
       data: c.toDataURL("image/png").split(",")[1],
-      width: c.width,
-      height: c.height,
+      svg: source,
+      width: r.width,
+      height: r.height,
+      pixelWidth: c.width,
+      pixelHeight: c.height,
     });
+    c.width = c.height = 1;
     nodes.push({
-      id: assetId + "_image",
+      id: nodeId,
       sourcePath: path(el),
       kind: "image",
       frame: r,
       assetId,
     });
-    paintOps.push({ op: "draw", nodeId: assetId + "_image" });
-    hiddenText(el, "svg-asset");
+    paintOps.push({ op: "draw", nodeId });
+    let textCount = 0;
+    const inventory = (n: Node, parentHidden = false) => {
+      if (n instanceof Text) {
+        const hidden =
+          parentHidden ||
+          !n.data.trim() ||
+          styleOf(n.parentElement!).visibility !== "visible";
+        if (!hidden) textCount++;
+        textInventory.push({
+          sourcePath: path(n),
+          sourceText: n.data,
+          nodeId: hidden ? null : nodeId,
+          reason: hidden ? "invisible-svg-text" : "svg-asset",
+          target: hidden
+            ? { kind: "hidden", reason: "invisible-svg-text" }
+            : { kind: "asset", nodeId, assetId },
+        });
+      } else {
+        const hidden =
+          parentHidden ||
+          (n instanceof Element &&
+            (["defs", "title", "desc", "style", "clippath", "marker"].includes(
+              n.tagName.toLowerCase(),
+            ) ||
+              styleOf(n).display === "none"));
+        for (const child of n.childNodes) inventory(child, hidden);
+      }
+    };
+    inventory(el);
+    if (textCount)
+      diagnostics.push({
+        code:
+          r.width >= 760 && r.height >= 420
+            ? "FULL_PAGE_SVG_TEXT"
+            : "ASSET_TEXT",
+        message: `${textCount} text sources are preserved inside a vector asset; they are not editable text boxes.`,
+        sourcePath: path(el),
+        nodeId,
+        severity: "warning",
+        details: { textCount, assetId },
+      });
   }
   async function element(el: Element, parentOwner: string) {
     if (++count > 5000) throw new Error("DOM_LIMIT");
@@ -521,6 +658,35 @@ export async function extractDOM(): Promise<{
     paintOps.push({ op: "end", nodeId: groupId });
   }
   await element(root, id(root, "group"));
+  for (const item of textInventory)
+    if (!item.target)
+      item.target = item.nodeId
+        ? { kind: "text", nodeId: item.nodeId }
+        : { kind: "hidden", reason: item.reason! };
+  for (const n of nodes)
+    if (
+      n.kind !== "group" &&
+      n.kind !== "table" &&
+      (n.frame.x < 0 ||
+        n.frame.y < 0 ||
+        n.frame.x + n.frame.width > 800 ||
+        n.frame.y + n.frame.height > 450)
+    ) {
+      const outside =
+        n.frame.x >= 800 ||
+        n.frame.y >= 450 ||
+        n.frame.x + n.frame.width <= 0 ||
+        n.frame.y + n.frame.height <= 0;
+      diagnostics.push({
+        code: outside ? "OUTSIDE_PAGE" : "PAGE_OVERFLOW",
+        sourcePath: n.sourcePath,
+        nodeId: n.id,
+        severity: "warning",
+        message: outside
+          ? "Content lies entirely outside the page."
+          : "Content extends beyond the page boundary.",
+      });
+    }
   return {
     nodes,
     paintOps,

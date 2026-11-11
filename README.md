@@ -11,7 +11,7 @@ Python 后端负责 Agent 编排、模型调用、校验、任务执行和持久
 - **大纲编辑与确认**：完整 JSON 解析并通过结构校验后进入编辑；确认后才启动页面生成。
 - **页面并行生成**：结合全局规范、当前页任务与相邻页摘要生成独立 HTML；新页面使用受控的 Tailwind CSS v4 utility 子集，预览由后端注入本地编译样式，不依赖 CDN。按所选模型并发分配调用名额，等待页面与正在生成页面分开展示。
 - **页面查看**：默认由自研 Canvas 直接渲染持久化 SceneIR，另提供 HTML 预览和 HTML 源码；保留原始 HTML 作为生成来源与对照。当前画布只预览，不提供编辑。
-- **PPTX 导出**：完整作品可导出整本 PowerPoint。已有 SceneIR 直接复用，旧 HTML 按需补转换并保存；普通文字和图形可编辑，复杂裁剪、透明组合与阴影使用透明局部图片，并显示导出提示。任务持久化，刷新后继续查询和下载。
+- **PPTX 导出**：完整作品可导出整本 PowerPoint。已有 SceneIR 直接复用，旧 HTML 按需补转换并保存；普通文字和图形优先可编辑，复杂纯几何使用 SVG，模糊阴影与无法忠实表达的局部内容使用透明图片；报告区分矢量文字、局部图片及兼容预览。任务持久化，刷新后继续查询和下载。
 - **恢复与重试**：作品、任务和 SSE 事件落库，支持浏览器刷新、断线回放、取消生成与失败重试。
 - **模型配置与统计**：独立 Provider 管理页，支持多连接、多模型、主动发现、思考档位、模型并发、业务 Override、模型测试与调用详情；作品按冻结配置生成。
 
@@ -70,15 +70,15 @@ npm run dev -- --port 5173
 
 ## HTML → SceneIR → Canvas
 
-HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。独立的 SQLite FIFO 转换队列只有一个活动槽，不占模型并发额度。FastAPI 监督一个 Node 子进程和一个热 Chromium；每页使用新 BrowserContext，结束后释放。后端关闭或重启时，中断转换回到队列并更换执行令牌。浏览器崩溃等基础设施错误最多自动重试一次；内容错误需要显式重试。
+HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。独立的 SQLite FIFO 转换队列只有一个活动槽，不占模型并发额度。FastAPI 监督一个 Node 子进程和一个热 Chromium；每页使用新 BrowserContext，结束后释放。后端关闭或重启时，同版本中断转换回到队列并更换执行令牌；旧版本未完成任务取消并按冻结来源创建当前版本替代任务。浏览器崩溃等基础设施错误最多自动重试一次；内容错误需要显式重试。
 
 `scene_conversion_jobs` 保存冻结 HTML/CSS、来源哈希和执行状态；`page_scenes` 保存不可变 SceneIR JSON 与资源引用。PageTask 只指向当前任务和场景。旧任务必须同时匹配执行令牌、当前任务引用与 HTML 哈希，才能发布结果。资产先验证并安装，再提交场景、当前引用和事件。
 
-转换使用与 HTML 预览相同的本地 Tailwind CSS 字节，固定 800×450、DPR 1、zh-CN 和 Asia/Shanghai，阻断外部网络和作者脚本。浏览器计算 Flex/Grid；转换器读取实际几何、文本片段、绘制顺序和裁剪。Canvas 直接绘制 SceneIR，不读取 HTML、DOM 报告或 RenderPlan，也不重新换行。SVG 是 SceneIR 声明的透明 PNG 资产，页面的其余内容仍为结构化图元。
+转换使用与 HTML 预览相同的本地 Tailwind CSS 字节，固定 800×450、DPR 1、zh-CN 和 Asia/Shanghai，阻断外部网络和作者脚本。浏览器计算 Flex/Grid；转换器读取实际几何、文本片段、绘制顺序和裁剪。Canvas 直接绘制 SceneIR，不读取 HTML、DOM 报告或 RenderPlan，也不重新换行。新写出 SceneIR 0.4 / dom-canvas-0.4.0，同时兼容读取 0.3。SVG 保留为规范化 image/svg+xml 资产，包含已固化的颜色、字体、局部引用，并显式引用受预算限制的 PNG 兼容资产；Canvas 直接绘制 SVG 来源以适应缩放与 DPR。文字清单通过 text / asset / hidden 目标记录唯一归属，SVG 内文字本轮保留矢量，不拆成独立文本框。
 
 当前覆盖受控 profile 中的布局、背景、圆角实线边框、中文/英文富文本、大小写、字距、基础表格、SVG、透明组和 overflow 裁剪。Box shadow 使用 Canvas 模糊近似并记录提示。合并表格、滤镜、渐变、伪元素文字、变换、复杂文字排版等尚未支持的内容会明确失败，可继续查看 HTML。当前以同一台机器的系统字体为准，字体宽度明显失配时不会发布成功首帧；跨机器字体分发和 Office 一致性留给后续。
 
-已有成功 HTML 页在第一次预览或导出时按需转换，不批量迁移历史作品。预览、生成完成钩子与导出共用 `ensure_page_scene`：先查询匹配来源的有效 Scene，命中后不因当前 CSS 或字体环境变化而隐式重转；缺失才进入转换队列。旧页缺少来源哈希时统一计算并登记。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。
+已有成功 HTML 页在第一次预览或导出时按需转换，不批量迁移历史作品。预览、生成完成钩子与导出共用 `ensure_page_scene`：先查询匹配来源与当前转换目标的有效 Scene，命中后不因当前 CSS 或字体环境变化而隐式重转；缺失才进入转换队列。同来源升级沿用旧任务冻结的 CSS，保留旧场景显示，成功后才切换。快照分开返回 display_scene、conversion 和 up_to_date；GET 不入队，失败需显式重试。缺少 HTML 的旧场景可继续预览与导出并报告兼容提示；有来源时不能用旧结果掩盖升级失败。旧页缺少来源哈希时统一计算并登记。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。
 
 所有 npm 依赖都在仓库根目录安装，已移除前端单独的锁文件。全新安装或修改共享包后，启动后端前先运行 `npm run build:scene`；修改共享渲染器后需重新构建该包，Vite 会加载构建产物。Chromium 使用锁定的 Playwright 版本，通过 `npm run browser:install` 显式安装，不在请求时下载。依赖缺失的原因可在健康接口的 `scene_worker` 字段和转换错误中查看。
 
@@ -86,13 +86,13 @@ HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。�
 
 ## SceneIR → PPTX
 
-导出只消费已保存 SceneIR 与其声明资产，不读取 HTML 排版。RenderPlan 在导出时按页生成，仅是可重新计算的内存结构；Canvas 预览继续直接消费 SceneIR。PptxGenJS 4.0.1 使用标准 `addText/addShape/addImage` 接口写出，800×450 对应 13⅓×7.5 英寸，统一 `inch = px/60`、`pt = px×1.2`。
+导出只消费已保存 SceneIR 与其声明资产，不读取 HTML 排版。RenderPlan 在导出时按页生成，仅是可重新计算的内存结构；Canvas 预览继续直接消费 SceneIR。Node 完成字体、规划与资产校验，PptxGenJS 4.0.1 在现有 Chromium 的隔离 Context 内统一使用标准 `addText/addShape/addImage` 接口写出，800×450 对应 13⅓×7.5 英寸，统一 `inch = px/60`、`pt = px×1.2`。
 
 `pptx_exports` 一张表保存冻结页序、来源与最终 Scene 引用、状态、错误及文件结果。状态为 `PREPARING / QUEUED / RUNNING / SUCCEEDED / FAILED`。准备阶段复用 Scene 转换且不占执行槽；转换和整本导出共享一个 Node/Chromium 执行槽，不占 Provider 并发。准备期间缺 Scene 的页被重新生成会报告来源冲突；最终清单固定后，后续页面修改不会混入本次导出。重复点击复用等价任务，失败需显式重试，中断 RUNNING 在重启后重新排队并更换令牌。
 
-文字按保存的显示行/片段输出，关闭自动换行和缩放；根据本机安装字体选择有字形覆盖的候选，并校验宽度。字体度量不匹配、裁剪、透明组合和复杂图形使用共享 SceneRenderer 生成局部资产；不静默把整页替换为截图。表格第一版是固定单元格图形与文字，不是原生 PowerPoint table。不提供选页、导出设置、字体嵌入或跨机器像素一致性保证。
+文字按保存的显示行/片段输出，关闭自动换行和缩放；字体测量包含可变字体 wght，并与 PowerPoint 的普通/粗体输出匹配。可证明位置的混合字体拆成小片段；不支持的片段才局部栅格化。整页矩形裁剪交给页面视口，完全越界内容报告不可见。纯几何圆角、边框、内部裁剪和透明组合通过小型 Scene→SVG 函数输出，阴影尽量单独转成 PNG、主体保留矢量；其余组合使用共享 SceneRenderer 局部合成。禁止静默整页截图。表格第一版是固定单元格图形与文字，不是原生 PowerPoint table。不提供选页、导出设置、字体嵌入或跨机器像素一致性保证。
 
-候选文件先独立检查 ZIP/OPC、页序、文字、资源引用和几何，再原子保存并发布成功。默认文件在 `data/exports/`，可用 `PPTX_EXPORT_DIR` 指定绝对目录，与数据库和 Scene 资产一同备份。下载接口只读取成功文件；文件丢失/损坏明确报错，不在 GET 中重转或重建。
+导出请求和 latest_export 缓存同时绑定当前转换目标与 scene-pptx-0.2.0；旧文件仍可按 ID 下载。候选文件先独立检查 ZIP/OPC、页序、文字片段覆盖、SVG 主资源哈希、PNG 兼容资源有效性、资源引用和几何，再原子保存并发布成功。report_json 保存每处 SVG / PNG 的原因、节点和边界以及文字编辑性统计。默认文件在 `data/exports/`，可用 `PPTX_EXPORT_DIR` 指定绝对目录，与数据库和 Scene 资产一同备份。下载接口只读取成功文件；文件丢失/损坏明确报错，不在 GET 中重转或重建。
 
 开发时可用 `powershell.exe -NoProfile -STA -File services/slide-worker/scripts/check-office.ps1 -Pptx <绝对文件路径> -OutputDirectory <已存在的空目录>` 在本机 PowerPoint 中检查文字与页面 PNG。脚本只管理自己创建的 Office 实例；已有 PowerPoint 进程时停止该项检查。Office 不是导出运行依赖。
 
@@ -223,7 +223,7 @@ frontend/
     generation-settings.css
   vite.config.ts   # React 插件与 /api 开发代理
   package.json
-packages/scene-core/ # SceneIR 0.3 契约、类型与引用/几何校验
+packages/scene-core/ # SceneIR 0.3 / 0.4 契约、类型与引用/几何校验
 packages/scene-renderer/ # 只消费 SceneIR 的 Canvas 2D 渲染器
 services/slide-worker/ # 常驻 Node/Chromium，SceneIR 转换与 PptxGenJS 导出
 package.json / package-lock.json # npm workspaces 与唯一安装锁文件
