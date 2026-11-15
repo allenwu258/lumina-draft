@@ -109,25 +109,85 @@ export function assertScene(value: unknown): asserts value is SceneIR {
         const n = nodes.get(t.nodeId);
         if (
           item.nodeId !== t.nodeId ||
-          item.reason !== (t.kind === "asset" ? "svg-asset" : null)
+          (t.kind === "text" && item.reason !== null)
         )
           throw new Error("SCENE_INVENTORY_TARGET");
-        if (
-          t.kind === "text"
-            ? n?.kind !== "text" ||
-              n.sourcePath !== item.sourcePath ||
-              n.text.sourceText !== item.sourceText
-            : n?.kind !== "image" ||
-              n.assetId !== t.assetId ||
-              assets.get(t.assetId)?.mediaType !== "image/svg+xml"
-        )
+        if (t.kind === "text") {
+          if (
+            n?.kind !== "text" ||
+            n.sourcePath !== item.sourcePath ||
+            n.text.sourceText !== item.sourceText
+          )
+            throw new Error("SCENE_INVENTORY_TARGET");
+        } else if (
+          n?.kind !== "image" ||
+          n.assetId !== t.assetId ||
+          !assets.has(t.assetId)
+        ) {
           throw new Error("SCENE_INVENTORY_TARGET");
+        }
         if (
           t.kind === "asset" &&
           !item.sourcePath.startsWith(n!.sourcePath + "/")
         )
           throw new Error("SCENE_INVENTORY_TARGET");
+        if (t.kind === "asset") {
+          const asset = assets.get(t.assetId);
+          const supportedAssetTarget =
+            (item.reason === "svg-asset" && asset?.mediaType === "image/svg+xml") ||
+            (item.reason === "page-raster" &&
+              asset?.mediaType === "image/png" &&
+              asset.bakedEffects.includes("full-page-composite"));
+          if (!supportedAssetTarget) throw new Error("SCENE_INVENTORY_TARGET");
+          if (item.reason === "page-raster") {
+            const fullPageRaster = s.diagnostics.some(
+              (diagnostic) =>
+                diagnostic.code === "FULL_PAGE_RASTER_FALLBACK" &&
+                diagnostic.details?.assetId === t.assetId &&
+                diagnostic.details?.strategy === "full-page-raster" &&
+                diagnostic.details?.editability === "page-image",
+            );
+            if (
+              !fullPageRaster ||
+              n?.kind !== "image" ||
+              n.sourcePath !== "main" ||
+              n.frame.x !== 0 ||
+              n.frame.y !== 0 ||
+              n.frame.width !== s.page.width ||
+              n.frame.height !== s.page.height ||
+              asset?.width !== s.page.width ||
+              asset?.height !== s.page.height
+            )
+              throw new Error("SCENE_INVENTORY_TARGET");
+          }
+        }
       }
+  for (const asset of s.assets) {
+    if (asset.bakedEffects.includes("full-page-composite")) {
+      const pageImage = s.nodes.find(
+        (node) => node.kind === "image" && node.assetId === asset.id,
+      );
+      const reported = s.diagnostics.some(
+        (diagnostic) =>
+          diagnostic.code === "FULL_PAGE_RASTER_FALLBACK" &&
+          diagnostic.details?.assetId === asset.id &&
+          diagnostic.details?.strategy === "full-page-raster" &&
+          diagnostic.details?.editability === "page-image",
+      );
+      if (
+        !reported ||
+        pageImage?.kind !== "image" ||
+        pageImage.sourcePath !== "main" ||
+        pageImage.frame.x !== 0 ||
+        pageImage.frame.y !== 0 ||
+        pageImage.frame.width !== s.page.width ||
+        pageImage.frame.height !== s.page.height ||
+        asset.width !== s.page.width ||
+        asset.height !== s.page.height
+      )
+        throw new Error("SCENE_PAGE_RASTER_CONTRACT");
+    }
+  }
     }
 }
 

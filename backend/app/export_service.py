@@ -283,7 +283,7 @@ def advance_tx(db, record):
                     raise ExportError(
                         "SCENE_MISSING", "场景产物缺失", item["page_number"]
                     )
-                item["scene"] = scene_ref(scene, item["source_html_hash"])
+                item["scene"] = scene_ref(db, scene, item["source_html_hash"])
         record.input_manifest_json = canonical(manifest)
         ready = sum(bool(p.get("scene")) for p in manifest["pages"])
         if ready == len(manifest["pages"]):

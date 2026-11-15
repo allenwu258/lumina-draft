@@ -24,13 +24,15 @@ from .tailwind_profile import TAILWIND_PROFILE, compiled_tailwind_css
 from .workflows import DESIGN, PPT, WORKFLOWS, PPT_CANVAS
 
 ROOT = Path(__file__).resolve().parents[2]
-CONVERTER_VERSION = "dom-canvas-0.4.0"
+CONVERTER_VERSION = "dom-canvas-0.4.1"
 SCENE_VERSION = "0.4.0"
-DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.0"
+DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.1"
 DESIGN_SCENE_VERSION = "0.5.0"
 SUPPORTED_CONVERTERS = (CONVERTER_VERSION, DESIGN_CONVERTER_VERSION)
 SCENE_VERSIONS = {
     "dom-canvas-0.3.0": "0.3.0",
+    "dom-canvas-0.4.0": SCENE_VERSION,
+    "dom-canvas-0.5.0": DESIGN_SCENE_VERSION,
     CONVERTER_VERSION: SCENE_VERSION,
     DESIGN_CONVERTER_VERSION: DESIGN_SCENE_VERSION,
 }
@@ -151,7 +153,7 @@ def find_scene(db, page: PageTask, *, current_target=False) -> PageScene | None:
             SceneConversionJob.canvas_height == height,
         )
     )
-    if current_target or converter == DESIGN_CONVERTER_VERSION:
+    if current_target:
         query = query.where(
             SceneConversionJob.converter_version == converter,
         )
@@ -162,17 +164,16 @@ def find_scene(db, page: PageTask, *, current_target=False) -> PageScene | None:
     return db.scalar(query.order_by(PageScene.created_at.desc(), PageScene.id).limit(1))
 
 
-def scene_ref(scene: PageScene, html_hash: str) -> dict:
+def scene_ref(db, scene: PageScene, html_hash: str) -> dict:
+    # Scene identity includes its originating converter, not just the schema.
+    # Several converter revisions intentionally share a backwards-compatible IR.
+    source_job = db.get(SceneConversionJob, scene.job_id)
     return {
         "page_task_id": scene.page_task_id,
         "scene_id": scene.id,
         "scene_hash": scene.scene_hash,
         "schema_version": scene.schema_version,
-        "converter_version": {
-            "0.3.0": "dom-canvas-0.3.0",
-            SCENE_VERSION: CONVERTER_VERSION,
-            DESIGN_SCENE_VERSION: DESIGN_CONVERTER_VERSION,
-        }[scene.schema_version],
+        "converter_version": source_job.converter_version if source_job else None,
         "source_html_hash": html_hash,
     }
 
@@ -191,7 +192,7 @@ def summary(db, page: PageTask) -> dict:
     up_to_date = bool(target_scene)
     if up_to_date:
         scene = target_scene
-    ref = scene_ref(scene, html_hash) if scene else None
+    ref = scene_ref(db, scene, html_hash) if scene else None
     missing_source = not page.html and scene and not up_to_date
     conversion = (
         {
@@ -521,12 +522,44 @@ def validate_scene(scene: dict, job: SceneConversionJob, output: Path) -> str:
                     )
                 else:
                     asset = assets.get(target["assetId"], {})
+                    asset_target_valid = (
+                        asset.get("mediaType") == "image/svg+xml"
+                        and item["reason"] == "svg-asset"
+                    ) or (
+                        asset.get("mediaType") == "image/png"
+                        and item["reason"] == "page-raster"
+                        and "full-page-composite" in asset.get("bakedEffects", [])
+                    )
+                    if item["reason"] == "page-raster":
+                        fallback_reported = any(
+                            diagnostic.get("code") == "FULL_PAGE_RASTER_FALLBACK"
+                            and diagnostic.get("details", {}).get("assetId")
+                            == target["assetId"]
+                            and diagnostic.get("details", {}).get("strategy")
+                            == "full-page-raster"
+                            and diagnostic.get("details", {}).get("editability")
+                            == "page-image"
+                            for diagnostic in scene["diagnostics"]
+                        )
+                        frame = node.get("frame", {})
+                        asset_target_valid = (
+                            asset_target_valid
+                            and fallback_reported
+                            and node.get("sourcePath") == "main"
+                            and frame == {
+                                "x": 0,
+                                "y": 0,
+                                "width": width,
+                                "height": height,
+                            }
+                            and asset.get("width") == width
+                            and asset.get("height") == height
+                        )
                     valid = (
                         valid
                         and node.get("kind") == "image"
                         and node.get("assetId") == target["assetId"]
-                        and asset.get("mediaType") == "image/svg+xml"
-                        and item["reason"] == "svg-asset"
+                        and asset_target_valid
                         and item["sourcePath"].startswith(node["sourcePath"] + "/")
                     )
             if not valid:
@@ -539,6 +572,33 @@ def validate_scene(scene: dict, job: SceneConversionJob, output: Path) -> str:
                 or source.get("sourceText") != node["text"]["sourceText"]
             ):
                 raise ValueError("SCENE_TEXT_PROVENANCE")
+    for asset in assets.values():
+        if "full-page-composite" in asset["bakedEffects"]:
+            page_image = next(
+                (
+                    node
+                    for node in nodes.values()
+                    if node["kind"] == "image" and node["assetId"] == asset["id"]
+                ),
+                None,
+            )
+            reported = any(
+                diagnostic.get("code") == "FULL_PAGE_RASTER_FALLBACK"
+                and diagnostic.get("details", {}).get("assetId") == asset["id"]
+                and diagnostic.get("details", {}).get("strategy") == "full-page-raster"
+                and diagnostic.get("details", {}).get("editability") == "page-image"
+                for diagnostic in scene["diagnostics"]
+            )
+            frame = page_image.get("frame", {}) if page_image else {}
+            if (
+                not reported
+                or not page_image
+                or page_image.get("sourcePath") != "main"
+                or frame != {"x": 0, "y": 0, "width": width, "height": height}
+                or asset.get("width") != width
+                or asset.get("height") != height
+            ):
+                raise ValueError("SCENE_PAGE_RASTER_CONTRACT")
     return canonical(scene)
 
 

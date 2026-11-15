@@ -121,7 +121,7 @@ export type SceneIR = {
   }[];
 };
 export const SCENE_VERSION = "0.4.0" as const;
-export const CONVERTER_VERSION = "dom-canvas-0.4.0";
+export const CONVERTER_VERSION = "dom-canvas-0.4.1";
 export const DESIGN_SCENE_VERSION = "0.5.0" as const;
-export const DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.0";
+export const DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.1";
 export const EMU_PER_SCENE_PX = 15240;

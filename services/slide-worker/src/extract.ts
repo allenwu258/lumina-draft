@@ -49,6 +49,8 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     }[] = [],
     fonts = new Set<string>();
   let count = 0;
+  let droppedDiagnosticCount = 0;
+  const MAX_DIAGNOSTICS = 512;
   const paintGroups: {
     id: string;
     context: boolean;
@@ -56,6 +58,19 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     z: number;
   }[] = [];
   const round = (n: number) => Math.round(n * 1000) / 1000;
+  const diagnostic = (
+    code: string,
+    sourcePath: string,
+    message: string,
+    details?: Record<string, string | number | boolean | null>,
+    severity: "info" | "warning" | "error" = "warning",
+  ) => {
+    if (diagnostics.length >= MAX_DIAGNOSTICS) {
+      droppedDiagnosticCount++;
+      return;
+    }
+    diagnostics.push({ code, sourcePath, message, severity, ...(details ? { details } : {}) });
+  };
   const rect = (r: DOMRect): Rect => ({
     x: round(r.x - origin.x),
     y: round(r.y - origin.y),
@@ -70,11 +85,23 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
   const id = (n: Node, role: string) =>
     path(n).replaceAll("/", "_") + "_" + role;
   const styleOf = (el: Element) => getComputedStyle(el);
+  const translationMatrix = (value: string) => {
+    if (value === "none") return true;
+    try {
+      const m = new DOMMatrixReadOnly(value), eps = 0.001;
+      return m.is2D &&
+        Math.abs(m.a - 1) < eps && Math.abs(m.b) < eps &&
+        Math.abs(m.c) < eps && Math.abs(m.d - 1) < eps &&
+        Number.isFinite(m.e) && Number.isFinite(m.f);
+    } catch {
+      return false;
+    }
+  };
   const transparent = (c: string) =>
     c === "transparent" || c === "rgba(0, 0, 0, 0)";
   const radius = (v: string, size: number) =>
     v.endsWith("%") ? (parseFloat(v) * size) / 100 : parseFloat(v) || 0;
-  const radii = (s: CSSStyleDeclaration, r: Rect) =>
+  const radii = (s: CSSStyleDeclaration, r: Rect, sourcePath: string) =>
     [
       s.borderTopLeftRadius,
       s.borderTopRightRadius,
@@ -82,7 +109,12 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       s.borderBottomLeftRadius,
     ].map((v) => {
       if (v.trim().split(/\s+/).length > 1)
-        throw new Error("UNSUPPORTED_ELLIPTICAL_RADIUS");
+        diagnostic(
+          "CSS_ELLIPTICAL_RADIUS_APPROXIMATED",
+          sourcePath,
+          "Elliptical corner radius was reduced to its horizontal radius.",
+          { value: v },
+        );
       return round(
         Math.min(
           radius(v, Math.min(r.width, r.height)),
@@ -131,21 +163,28 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
         s.letterSpacing === "normal" ? 0 : parseFloat(s.letterSpacing),
       decoration: s.textDecorationLine,
     };
-    if (!["none", "uppercase", "lowercase"].includes(s.textTransform))
-      throw new Error(`UNSUPPORTED_TEXT_TRANSFORM: ${sourcePath}`);
-    if (
-      s.writingMode !== "horizontal-tb" ||
-      s.direction !== "ltr" ||
-      s.textShadow !== "none"
-    )
-      throw new Error(`UNSUPPORTED_TEXT_STYLE: ${sourcePath}`);
-    if (
-      s.textAlign === "justify" ||
-      !["normal", "0px"].includes(s.wordSpacing) ||
-      s.fontVariantCaps !== "normal" ||
-      s.fontStretch !== "100%"
-    )
-      throw new Error(`UNSUPPORTED_TEXT_TYPOGRAPHY: ${sourcePath}`);
+    if (!["none", "uppercase", "lowercase", "capitalize"].includes(s.textTransform))
+      diagnostic(
+        "CSS_TEXT_TRANSFORM_OMITTED",
+        sourcePath,
+        "The text transform could not be represented; source text is retained.",
+        { value: s.textTransform },
+      );
+    const omittedTextStyles: string[] = [];
+    if (s.writingMode !== "horizontal-tb") omittedTextStyles.push("writing-mode");
+    if (s.direction !== "ltr") omittedTextStyles.push("direction");
+    if (s.textShadow !== "none") omittedTextStyles.push("text-shadow");
+    if (s.textAlign === "justify") omittedTextStyles.push("text-align:justify");
+    if (!["normal", "0px"].includes(s.wordSpacing)) omittedTextStyles.push("word-spacing");
+    if (s.fontVariantCaps !== "normal") omittedTextStyles.push("font-variant-caps");
+    if (s.fontStretch !== "100%") omittedTextStyles.push("font-stretch");
+    if (omittedTextStyles.length)
+      diagnostic(
+        "CSS_TEXT_STYLE_OMITTED",
+        sourcePath,
+        "Some text styling is not represented in the editable Scene text.",
+        { properties: omittedTextStyles.join(",") },
+      );
     measure.font = font(ts);
     measure.letterSpacing = `${ts.letterSpacing}px`;
     fonts.add(font(ts));
@@ -198,6 +237,11 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       }
       if (s.textTransform === "uppercase") display = display.toUpperCase();
       if (s.textTransform === "lowercase") display = display.toLowerCase();
+      if (s.textTransform === "capitalize" && /^\p{L}$/u.test(display)) {
+        const previous = sourceText.slice(0, start);
+        if (!previous || /[\s\p{P}\p{S}]$/u.test(previous))
+          display = display.toLocaleUpperCase();
+      }
       const metrics = measure.measureText(display);
       const baseline = round(r.y + metrics.fontBoundingBoxAscent);
       let line = lines.find(
@@ -285,16 +329,28 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     const parts = s.boxShadow.split(/,(?![^()]*\))/);
     const result = [];
     for (const p of parts) {
-      if (p.includes("inset"))
-        throw new Error(`UNSUPPORTED_INSET_SHADOW: ${sourcePath}`);
+      if (p.includes("inset")) {
+        diagnostic(
+          "CSS_INSET_SHADOW_OMITTED",
+          sourcePath,
+          "Inset box shadow is omitted; supported outer shadows on the same element are retained.",
+        );
+        continue;
+      }
       const color = p.match(/rgba?\([^)]+\)|color\([^)]+\)/)?.[0];
       const values =
         p
           .replace(color || "", "")
           .match(/-?[\d.]+px/g)
           ?.map(parseFloat) || [];
-      if (!color || values.length < 2)
-        throw new Error(`UNSUPPORTED_SHADOW: ${sourcePath}`);
+      if (!color || values.length < 2) {
+        diagnostic(
+          "CSS_SHADOW_OMITTED",
+          sourcePath,
+          "A box shadow with an unsupported color or value format was omitted.",
+        );
+        continue;
+      }
       result.push({
         color,
         x: values[0],
@@ -303,11 +359,13 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
         spread: values[3] || 0,
       });
     }
-    diagnostics.push({
-      code: "SHADOW_CANVAS_BLUR",
-      message: "Canvas uses its native blur for CSS box shadows.",
+    diagnostic(
+      "SHADOW_CANVAS_BLUR",
       sourcePath,
-    });
+      "Canvas uses its native blur for CSS box shadows.",
+      undefined,
+      "info",
+    );
     return result;
   }
   let svgPixels = 0;
@@ -375,12 +433,23 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     originals.forEach((e, i) => {
       const style = styleOf(e),
         copy = copies[i] as SVGElement;
-      if (
-        style.filter !== "none" ||
-        style.maskImage !== "none" ||
-        style.mixBlendMode !== "normal"
-      )
-        throw new Error(`UNSUPPORTED_SVG_EFFECT: ${path(e)}`);
+      const omittedEffects: string[] = [];
+      if (style.filter !== "none") omittedEffects.push("filter");
+      if (style.maskImage !== "none") omittedEffects.push("mask-image");
+      if (style.mixBlendMode !== "normal") omittedEffects.push("mix-blend-mode");
+      if (style.textShadow !== "none") omittedEffects.push("text-shadow");
+      if (omittedEffects.length) {
+        diagnostic(
+          "SVG_EFFECT_OMITTED",
+          path(e),
+          "Unsupported SVG effects were removed from this vector asset; the remaining SVG content is retained.",
+          { properties: omittedEffects.join(",") },
+        );
+        for (const name of ["filter", "mask", "mask-image", "mix-blend-mode", "text-shadow"]) {
+          copy.removeAttribute(name);
+          copy.style.removeProperty(name);
+        }
+      }
       copy.removeAttribute("class");
       copy.removeAttribute("style");
       for (const prop of props) {
@@ -508,29 +577,65 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     for (const pseudo of ["::before", "::after"]) {
       const p = getComputedStyle(el, pseudo);
       if (p.content && !["none", "normal", '""'].includes(p.content))
-        throw new Error(`UNSUPPORTED_PSEUDO: ${sourcePath}`);
+        diagnostic(
+          "CSS_PSEUDO_CONTENT_OMITTED",
+          sourcePath,
+          `Generated ${pseudo} content is not represented in the Scene.`,
+          { pseudo, contentType: p.content.startsWith("url(") ? "image" : "text" },
+        );
     }
-    if (
-      s.transform !== "none" ||
-      s.filter !== "none" ||
-      s.backdropFilter !== "none" ||
-      s.mixBlendMode !== "normal" ||
-      s.clipPath !== "none" ||
-      s.maskImage !== "none" ||
-      s.backgroundImage !== "none"
-    )
-      throw new Error(`UNSUPPORTED_EFFECT: ${sourcePath}`);
-    if (
-      s.position === "fixed" ||
-      s.position === "sticky" ||
-      (el.tagName === "LI" && s.listStyleType !== "none")
-    )
-      throw new Error(`UNSUPPORTED_LAYOUT: ${sourcePath}`);
+    const individualTransform =
+      s.getPropertyValue("translate") !== "none" ||
+      s.getPropertyValue("rotate") !== "none" ||
+      !["none", "1"].includes(s.getPropertyValue("scale"));
+    if (s.transform !== "none" || individualTransform) {
+      const onlyTranslation = !individualTransform && translationMatrix(s.transform);
+      if (!onlyTranslation)
+        diagnostic(
+          "CSS_TRANSFORM_OMITTED",
+          sourcePath,
+          "The transformed bounding box is retained, but rotation, scale, and other transform effects are not represented.",
+          { transform: s.transform === "none" ? "individual-transform" : s.transform },
+        );
+    }
+    const omittedEffects: string[] = [];
+    if (s.filter !== "none") omittedEffects.push("filter");
+    if (s.backdropFilter !== "none") omittedEffects.push("backdrop-filter");
+    if (s.mixBlendMode !== "normal") omittedEffects.push("mix-blend-mode");
+    if (s.clipPath !== "none") omittedEffects.push("clip-path");
+    if (s.maskImage !== "none") omittedEffects.push("mask-image");
+    if (s.backgroundImage !== "none") omittedEffects.push("background-image");
+    if (omittedEffects.length)
+      diagnostic(
+        "CSS_EFFECT_OMITTED",
+        sourcePath,
+        "Unsupported visual effects were omitted while preserving the element geometry and other captured content.",
+        { properties: omittedEffects.join(",") },
+      );
+    if (s.position === "fixed" || s.position === "sticky")
+      diagnostic(
+        "CSS_POSITION_STATICIZED",
+        sourcePath,
+        "Fixed or sticky positioning was captured at its settled viewport position.",
+        { position: s.position },
+        "info",
+      );
+    if (el.tagName === "LI" && s.listStyleType !== "none")
+      diagnostic(
+        "CSS_LIST_MARKER_OMITTED",
+        sourcePath,
+        "The list item content is retained, but its generated marker is not represented.",
+        { listStyleType: s.listStyleType, listStylePosition: s.listStylePosition },
+      );
     if (
       (el.scrollWidth > el.clientWidth + 1 && s.overflowX === "auto") ||
       (el.scrollHeight > el.clientHeight + 1 && s.overflowY === "auto")
     )
-      throw new Error(`UNSUPPORTED_SCROLL: ${sourcePath}`);
+      diagnostic(
+        "CSS_SCROLL_CAPTURED_AT_ORIGIN",
+        sourcePath,
+        "Scrollable content is captured at its initial scroll offset and clipped to the viewport.",
+      );
     const groupId = id(el, "group");
     const parentDisplay = el.parentElement
       ? styleOf(el.parentElement).display
@@ -549,7 +654,7 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     });
     const isBlock = !["inline", "contents"].includes(s.display),
       owner = isBlock ? groupId : parentOwner;
-    const rad = radii(s, r);
+    const rad = radii(s, r, sourcePath);
     const clipped =
       ["hidden", "clip", "scroll", "auto"].includes(s.overflowX) ||
       ["hidden", "clip", "scroll", "auto"].includes(s.overflowY);
@@ -562,8 +667,8 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       opacity: parseFloat(s.opacity),
       clip: null,
     };
-    if (group.kind === "table")
-      group.cells = [...el.querySelectorAll("tr")]
+    if (group.kind === "table") {
+      const cells = [...el.querySelectorAll("tr")]
         .filter((tr) => tr.closest("table") === el)
         .flatMap((tr, row) =>
           [...tr.children]
@@ -577,25 +682,47 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
               frame: rect(c.getBoundingClientRect()),
             })),
         );
-    if (group.cells?.some((c) => c.rowSpan !== 1 || c.columnSpan !== 1))
-      throw new Error(`UNSUPPORTED_MERGED_TABLE: ${sourcePath}`);
+      if (cells.some((c) => c.rowSpan !== 1 || c.columnSpan !== 1))
+        diagnostic(
+          "HTML_MERGED_TABLE_SEMANTICS_OMITTED",
+          sourcePath,
+          "Merged table cell semantics are omitted; visible cell geometry and text are still captured individually.",
+        );
+      else group.cells = cells;
+    }
     nodes.push(group);
     paintOps.push({ op: "begin", nodeId: groupId });
     if (s.visibility === "visible" && r.width > 0 && r.height > 0) {
-      const borders = ["Top", "Right", "Bottom", "Left"].map((side) => ({
-        width:
+      const borders = ["Top", "Right", "Bottom", "Left"].map((side) => {
+        const width =
           parseFloat(
             s.getPropertyValue("border-" + side.toLowerCase() + "-width"),
-          ) || 0,
-        color: s.getPropertyValue("border-" + side.toLowerCase() + "-color"),
-        style: s.getPropertyValue("border-" + side.toLowerCase() + "-style"),
-      }));
-      if (
-        borders.some(
-          (b) => b.width && !["none", "solid", "hidden"].includes(b.style),
-        )
-      )
-        throw new Error(`UNSUPPORTED_BORDER: ${sourcePath}`);
+          ) || 0;
+        const color = s.getPropertyValue("border-" + side.toLowerCase() + "-color");
+        const sourceStyle = s.getPropertyValue("border-" + side.toLowerCase() + "-style");
+        const supported = ["none", "solid", "hidden", "dashed", "dotted"];
+        const style = supported.includes(sourceStyle) ? sourceStyle : "solid";
+        if (width && !supported.includes(sourceStyle))
+          diagnostic(
+            "CSS_BORDER_STYLE_APPROXIMATED",
+            sourcePath,
+            "This border line style is represented as solid.",
+            { side: side.toLowerCase(), sourceStyle },
+          );
+        return { width, color, style };
+      });
+      const uniformBorder = borders.every(
+        (b) => b.width === borders[0].width && b.color === borders[0].color && b.style === borders[0].style,
+      );
+      if (!uniformBorder && borders.some((b) => ["dashed", "dotted"].includes(b.style))) {
+        for (const border of borders)
+          if (["dashed", "dotted"].includes(border.style)) border.style = "solid";
+        diagnostic(
+          "CSS_PER_SIDE_DASHED_BORDER_APPROXIMATED",
+          sourcePath,
+          "Different dashed or dotted side borders are represented as solid because the current renderer only preserves uniform dash patterns.",
+        );
+      }
       let fill = ["TR", "TBODY", "THEAD", "TFOOT"].includes(el.tagName)
         ? "rgba(0, 0, 0, 0)"
         : s.backgroundColor;
@@ -658,7 +785,27 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     if (clipped) paintOps.push({ op: "end", nodeId: clipId });
     paintOps.push({ op: "end", nodeId: groupId });
   }
+  const classTokens = [...document.querySelectorAll<HTMLElement>("#ppt-page, #ppt-page *")]
+    .flatMap((el) => [...el.classList]);
+  const utilityLike = classTokens.filter((value) =>
+    /^(?:flex|grid|block|inline-flex|hidden|absolute|relative|fixed|sticky|items-|justify-|gap-|space-|p-|px-|py-|pt-|pb-|m-|mx-|my-|mt-|mb-|w-|h-|min-w-|max-w-|min-h-|max-h-|bg-|text-(?:xs|sm|base|lg|xl|[2-9]xl|left|right|center|justify)-|font-|leading-|rounded|border|shadow|opacity-|overflow-|whitespace-|z-)/.test(value),
+  );
+  if (!root.hasAttribute("data-css-profile") && utilityLike.length)
+    diagnostic(
+      "STYLE_PROFILE_UNVERIFIED",
+      "main",
+      "Utility-style classes are present without a frozen CSS profile marker; verify that the intended stylesheet was included in the captured HTML.",
+      { classCount: utilityLike.length, examples: [...new Set(utilityLike)].slice(0, 8).join(" ") },
+    );
   await element(root, id(root, "group"));
+  if (droppedDiagnosticCount)
+    diagnostics.push({
+      code: "DIAGNOSTICS_LIMIT_REACHED",
+      message: "The page exceeded the per-page diagnostic detail limit; additional unsupported features were counted but not listed individually.",
+      sourcePath: "main",
+      severity: "warning",
+      details: { omittedDiagnosticCount: droppedDiagnosticCount, limit: MAX_DIAGNOSTICS },
+    });
   for (const item of textInventory)
     if (!item.target)
       item.target = item.nodeId

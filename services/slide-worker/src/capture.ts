@@ -27,6 +27,20 @@ export const canonical = (v: unknown): string =>
         )
       : value,
   );
+const PAGE_RASTER_FALLBACK_CODES = new Set([
+  "CSS_EFFECT_OMITTED",
+  "CSS_TRANSFORM_OMITTED",
+  "CSS_LIST_MARKER_OMITTED",
+  "CSS_PSEUDO_CONTENT_OMITTED",
+  "CSS_TEXT_STYLE_OMITTED",
+  "CSS_TEXT_TRANSFORM_OMITTED",
+  "CSS_BORDER_STYLE_APPROXIMATED",
+  "CSS_PER_SIDE_DASHED_BORDER_APPROXIMATED",
+  "CSS_ELLIPTICAL_RADIUS_APPROXIMATED",
+  "CSS_INSET_SHADOW_OMITTED",
+  "CSS_SHADOW_OMITTED",
+  "SVG_EFFECT_OMITTED",
+]);
 export async function convert(
   input: {
     html: string;
@@ -112,7 +126,87 @@ export async function convert(
       throw new Error("LAYOUT_UNSTABLE");
     });
     const data = await page.evaluate(extractDOM, { width, height });
-    data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
+    const rasterizedDiagnostics = data.diagnostics.filter((d) =>
+      PAGE_RASTER_FALLBACK_CODES.has(d.code),
+    );
+    let pageRaster:
+      | { bytes: Buffer; id: string; file: string; pixelWidth: number; pixelHeight: number }
+      | undefined;
+    if (rasterizedDiagnostics.length) {
+      const screenshot = await page.locator("#ppt-page").screenshot({
+        type: "png",
+        animations: "disabled",
+        timeout: 5000,
+      });
+      if (
+        screenshot.length < 24 ||
+        !screenshot.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      )
+        throw new Error("PAGE_RASTER_INVALID");
+      const pixelWidth = screenshot.readUInt32BE(16);
+      const pixelHeight = screenshot.readUInt32BE(20);
+      if (pixelWidth !== width || pixelHeight !== height)
+        throw new Error("PAGE_RASTER_DIMENSIONS");
+      if (screenshot.length > 8 * 1024 * 1024)
+        throw new Error("SCENE_ASSET_LIMIT");
+      const assetId = `fallback_${hash(input.htmlHash + rasterizedDiagnostics.map((d) => d.code).join(",")).slice(0, 20)}`;
+      const nodeId = "main_page_raster_image";
+      pageRaster = {
+        bytes: screenshot,
+        id: assetId,
+        file: `${assetId}.png`,
+        pixelWidth,
+        pixelHeight,
+      };
+      for (const diagnostic of rasterizedDiagnostics) {
+        diagnostic.nodeId = nodeId;
+        diagnostic.details = {
+          ...(diagnostic.details || {}),
+          pageRasterFallback: true,
+          editability: "page-image",
+        };
+      }
+      if (data.diagnostics.length >= 512) data.diagnostics.length = 511;
+      data.diagnostics.push({
+        code: "FULL_PAGE_RASTER_FALLBACK",
+        message: "The source Chromium page was preserved as one bounded page image because one or more visual features cannot be represented safely as native Scene elements.",
+        sourcePath: "main",
+        nodeId,
+        severity: "warning",
+        details: {
+          assetId,
+          width,
+          height,
+          pixelWidth,
+          pixelHeight,
+          sourceFeatureCount: rasterizedDiagnostics.length,
+          sourceFeatures: [...new Set(rasterizedDiagnostics.map((d) => d.code))].join(","),
+          strategy: "full-page-raster",
+          editability: "page-image",
+        },
+      });
+      data.nodes = [
+        {
+          id: nodeId,
+          sourcePath: "main",
+          kind: "image",
+          frame: { x: 0, y: 0, width, height },
+          assetId,
+        },
+      ];
+      data.paintOps = [{ op: "draw", nodeId }];
+      data.paintGroups = [];
+      data.images = [];
+      data.fonts = [];
+      for (const item of data.textInventory) {
+        if (item.target?.kind === "hidden") continue;
+        item.nodeId = nodeId;
+        item.reason = "page-raster";
+        item.target = { kind: "asset", nodeId, assetId };
+      }
+    }
+    if (!pageRaster)
+      data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
     await mkdir(runtime.outputDir, { recursive: true });
     const assets: SceneIR["assets"] = [];
     let totalBytes = 0;
@@ -140,6 +234,25 @@ export async function convert(
           ...(vector ? { fallbackAssetId: img.id + "_png" } : {}),
         });
       }
+    }
+    if (pageRaster) {
+      totalBytes += pageRaster.bytes.length;
+      if (totalBytes > 32 * 1024 * 1024) throw new Error("SCENE_ASSET_LIMIT");
+      await writeFile(join(runtime.outputDir, pageRaster.file), pageRaster.bytes);
+      assets.push({
+        id: pageRaster.id,
+        mediaType: "image/png",
+        sha256: hash(pageRaster.bytes),
+        byteLength: pageRaster.bytes.length,
+        width: pageRaster.pixelWidth,
+        height: pageRaster.pixelHeight,
+        file: pageRaster.file,
+        coveredNodeIds: ["main_page_raster_image"],
+        bakedEffects: [
+          ...new Set(rasterizedDiagnostics.map((d) => d.code)),
+          "full-page-composite",
+        ],
+      });
     }
     const fontMetrics = await page.evaluate((fonts) => {
       const ctx = document.createElement("canvas").getContext("2d")!;

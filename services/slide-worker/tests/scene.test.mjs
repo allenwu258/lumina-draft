@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright-core";
@@ -8,6 +8,7 @@ import { build } from "esbuild";
 import { PNG } from "pngjs";
 import { assertScene, DESIGN_CONVERTER_VERSION } from "@lumina/scene-core";
 import { convert, canonical, hash } from "../dist/capture.js";
+import { planPptxPage } from "../dist/export/plan.js";
 import { css, fixture, tailwind } from "./fixtures.mjs";
 
 let browser, temp, scene, bundle;
@@ -340,14 +341,72 @@ test("author scripts and external resources are never executed by capture", asyn
     "safe",
   );
 });
-test("unsupported effects fail explicitly and do not poison the hot browser", async () => {
-  await assert.rejects(
-    convert(input(tailwind('<div style="filter:blur(1px)">bad</div>')), {
-      browser,
-      outputDir: join(temp, "bad"),
-    }),
-    /UNSUPPORTED_EFFECT/,
+test("unsupported visual effects are bounded best-effort diagnostics", async () => {
+  const html = tailwind('<div style="filter:blur(1px)">retained text</div>');
+  const scene = await convert(
+    input(html),
+    { browser, outputDir: join(temp, "best-effort-effect") },
   );
+  assertScene(scene);
+  assert.ok(
+    scene.diagnostics.some(
+      (d) => d.code === "CSS_EFFECT_OMITTED" && d.details.properties === "filter",
+    ),
+  );
+  assert.ok(
+    scene.nodes.some((n) => n.kind === "image" && n.frame.width === 800 && n.frame.height === 450),
+    "visual degradation is preserved as a page-sized source raster",
+  );
+  const fallback = scene.diagnostics.find((d) => d.code === "FULL_PAGE_RASTER_FALLBACK");
+  assert.equal(fallback?.details.strategy, "full-page-raster");
+  assert.equal(fallback?.details.editability, "page-image");
+  const rasterText = scene.textInventory.find((item) => item.sourceText === "retained text");
+  assert.equal(rasterText?.reason, "page-raster");
+  assert.equal(rasterText?.target.kind, "asset");
+  const rasterAsset = scene.assets.find((asset) => asset.id === rasterText?.target.assetId);
+  assert.equal(rasterAsset?.mediaType, "image/png");
+  assert.deepEqual([rasterAsset?.width, rasterAsset?.height], [800, 450]);
+  const pptPlan = planPptxPage(scene);
+  assert.equal(pptPlan.elements.length, 1);
+  assert.equal(pptPlan.elements[0].kind, "image");
+  const pngFile = join(temp, "best-effort-effect", rasterAsset.file);
+  assert.ok((await readdir(join(temp, "best-effort-effect"))).includes(rasterAsset.file), `expected ${pngFile}`);
+  const rasterBytes = await readFile(pngFile);
+  const raster = PNG.sync.read(rasterBytes);
+  assert.deepEqual([raster.width, raster.height], [800, 450]);
+  const invalid = structuredClone(scene);
+  invalid.diagnostics = invalid.diagnostics.filter((d) => d.code !== "FULL_PAGE_RASTER_FALLBACK");
+  assert.throws(() => assertScene(invalid), /SCENE_INVENTORY_TARGET|SCENE_PAGE_RASTER_CONTRACT/);
+  const preview = await browser.newPage({ viewport: { width: 800, height: 450 } });
+  try {
+    await preview.setContent('<html><body style="margin:0"><canvas></canvas></body></html>');
+    await preview.addScriptTag({ content: bundle });
+    await preview.evaluate(async ({ scene, imageBase64 }) => {
+      const renderer = new window.SceneRenderer(document.querySelector("canvas"));
+      await renderer.load(
+        scene,
+        async (asset) => {
+          const binary = atob(imageBase64);
+          return window.decodeAsset(Uint8Array.from(binary, (char) => char.charCodeAt(0)), asset.mediaType);
+        },
+        async () => {},
+      );
+      renderer.resize(800, 450, 1);
+      renderer.render();
+    }, { scene, imageBase64: rasterBytes.toString("base64") });
+    const previewPng = PNG.sync.read(await preview.locator("canvas").screenshot());
+    assert.deepEqual(previewPng.data, raster.data, "Scene Canvas must render the page-raster asset exactly");
+  } finally {
+    await preview.close();
+  }
+  const sourcePage = await browser.newPage({ viewport: { width: 800, height: 450 } });
+  try {
+    await sourcePage.setContent(html);
+    const source = PNG.sync.read(await sourcePage.locator("#ppt-page").screenshot());
+    assert.deepEqual(raster.data, source.data, "fallback pixels must match the frozen source render");
+  } finally {
+    await sourcePage.close();
+  }
   assert.ok(
     (
       await convert(input(tailwind("<p>next page</p>")), {
@@ -357,4 +416,89 @@ test("unsupported effects fail explicitly and do not poison the hot browser", as
     ).nodes.length,
   );
   assert.equal(browser.contexts().length, 0);
+});
+test("list markers, pseudo content and unverified utility styles are reported", async () => {
+  const html = tailwind(
+    '<ul style="list-style-type:disc"><li>list text remains</li></ul><p class="with-pseudo">paragraph remains</p>',
+  )
+    .replace(' data-css-profile="tailwind-ppt-v1"', "")
+    .replace("</head>", '<style>.with-pseudo::before{content:"generated"}</style></head>');
+  const scene = await convert(input(html), {
+    browser,
+    outputDir: join(temp, "best-effort-layout"),
+  });
+  const codes = new Set(scene.diagnostics.map((d) => d.code));
+  assert.ok(codes.has("CSS_LIST_MARKER_OMITTED"));
+  assert.ok(codes.has("CSS_PSEUDO_CONTENT_OMITTED"));
+  assert.ok(codes.has("STYLE_PROFILE_UNVERIFIED"));
+  assert.ok(scene.diagnostics.some((d) => d.code === "FULL_PAGE_RASTER_FALLBACK"));
+  assert.ok(scene.textInventory.some((t) => t.sourceText === "list text remains" && t.reason === "page-raster"));
+  assert.ok(scene.textInventory.some((t) => t.sourceText === "paragraph remains" && t.reason === "page-raster"));
+});
+test("unverified utility styles are diagnosed without forcing rasterization", async () => {
+  const html = tailwind('<p class="text-ppt-title">Still editable</p>')
+    .replace(' data-css-profile="tailwind-ppt-v1"', "");
+  const scene = await convert(input(html), {
+    browser,
+    outputDir: join(temp, "unverified-profile-only"),
+  });
+  assert.ok(scene.diagnostics.some((d) => d.code === "STYLE_PROFILE_UNVERIFIED"));
+  assert.ok(!scene.diagnostics.some((d) => d.code === "FULL_PAGE_RASTER_FALLBACK"));
+  assert.ok(scene.nodes.some((n) => n.kind === "text" && n.text.sourceText === "Still editable"));
+});
+test("pure translations normalize from final browser geometry", async () => {
+  const html = tailwind(
+    '<div style="position:absolute;left:20px;top:30px;width:100px;height:40px;background:#ff0000;transform:translate(12px, 6px)"></div>',
+  );
+  const scene = await convert(input(html), {
+    browser,
+    outputDir: join(temp, "translate-normalized"),
+  });
+  const shape = scene.nodes.find((n) => n.kind === "shape" && n.frame.width === 100);
+  assert.ok(shape);
+  assert.deepEqual(shape.frame, { x: 32, y: 36, width: 100, height: 40 });
+  assert.ok(!scene.diagnostics.some((d) => d.code === "CSS_TRANSFORM_OMITTED"));
+});
+test("uniform dashed borders render in the Scene Canvas", async () => {
+  const html = tailwind(
+    '<div style="position:absolute;left:40px;top:40px;width:200px;height:100px;background:#fff;border:4px dashed #ff0000"></div>',
+  );
+  const scene = await convert(input(html), {
+    browser,
+    outputDir: join(temp, "dashed-border"),
+  });
+  const shape = scene.nodes.find((n) => n.kind === "shape" && n.frame.width === 200);
+  assert.equal(shape?.kind, "shape");
+  assert.ok(shape.borders.every((b) => b.style === "dashed"));
+  const page = await browser.newPage({ viewport: { width: 800, height: 450 } });
+  try {
+    await page.setContent(html);
+    const expected = PNG.sync.read(await page.locator("#ppt-page").screenshot());
+    await page.setContent('<html><body style="margin:0"><canvas></canvas></body></html>');
+    await page.addScriptTag({ content: bundle });
+    await page.evaluate(async (scene) => {
+      const renderer = new window.SceneRenderer(document.querySelector("canvas"));
+      await renderer.load(scene, async () => { throw new Error("Unexpected asset"); }, async () => {});
+      renderer.resize(800, 450, 1);
+      renderer.render();
+    }, scene);
+    const actual = PNG.sync.read(await page.locator("canvas").screenshot());
+    const redPixels = (png) => {
+      let count = 0;
+      for (let y = 39; y < 46; y++)
+        for (let x = 40; x < 240; x++) {
+          const i = (y * png.width + x) * 4;
+          if (png.data[i] > 180 && png.data[i + 1] < 100 && png.data[i + 2] < 100) count++;
+        }
+      return count;
+    };
+    const expectedRed = redPixels(expected), actualRed = redPixels(actual);
+    assert.ok(expectedRed > 0 && actualRed > 0);
+    assert.ok(
+      Math.abs(actualRed - expectedRed) / expectedRed < 0.25,
+      `dashed border coverage differs: source=${expectedRed}, canvas=${actualRed}`,
+    );
+  } finally {
+    await page.close();
+  }
 });

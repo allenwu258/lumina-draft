@@ -106,6 +106,14 @@ function draw(
       if (t.width > 0 && t.style !== "none" && t.style !== "hidden") {
         ctx.strokeStyle = t.color;
         ctx.lineWidth = t.width;
+        ctx.setLineDash(
+          t.style === "dashed"
+            ? [t.width * 3, t.width * 2]
+            : t.style === "dotted"
+              ? [0, t.width * 2]
+              : [],
+        );
+        ctx.lineCap = t.style === "dotted" ? "round" : "butt";
         rounded(
           ctx,
           {
@@ -117,6 +125,8 @@ function draw(
           n.radii.map((v) => Math.max(0, v - t.width / 2)),
         );
         ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.lineCap = "butt";
       }
     } else {
       const f = n.frame,

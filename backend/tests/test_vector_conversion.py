@@ -236,6 +236,72 @@ def test_svg_fallback_hash_ownership_and_text_targets_are_validated(
             scene_service.validate_scene(scene, job, tmp_path)
 
 
+def test_page_raster_text_inventory_target_is_validated(scene_queue, tmp_path):
+    client, _, _ = scene_queue
+    _, _, pages = seed_pages()
+    queued = enqueue(client, pages[0])
+    with session_scope() as db:
+        job = db.get(SceneConversionJob, queued["job_id"])
+        scene = minimal_scene(job)
+        raw = png(800, 450)
+        (tmp_path / "page.png").write_bytes(raw)
+        scene["nodes"] = [
+            {
+                "id": "page-image",
+                "kind": "image",
+                "sourcePath": "main",
+                "assetId": "page-raster",
+                "frame": {"x": 0, "y": 0, "width": 800, "height": 450},
+            }
+        ]
+        scene["paintOps"] = [{"op": "draw", "nodeId": "page-image"}]
+        scene["assets"] = [
+            {
+                "id": "page-raster",
+                "mediaType": "image/png",
+                "file": "page.png",
+                "sha256": scene_service.digest(raw),
+                "byteLength": len(raw),
+                "width": 800,
+                "height": 450,
+                "coveredNodeIds": ["page-image"],
+                "bakedEffects": ["full-page-composite"],
+            }
+        ]
+        scene["textInventory"] = [
+            {
+                "sourcePath": "main/0/0",
+                "sourceText": "Visible but not editable",
+                "nodeId": "page-image",
+                "reason": "page-raster",
+                "target": {
+                    "kind": "asset",
+                    "nodeId": "page-image",
+                    "assetId": "page-raster",
+                },
+            }
+        ]
+        scene["diagnostics"] = [
+            {
+                "code": "FULL_PAGE_RASTER_FALLBACK",
+                "message": "page converted to image",
+                "sourcePath": "main",
+                "nodeId": "page-image",
+                "severity": "warning",
+                "details": {
+                    "assetId": "page-raster",
+                    "strategy": "full-page-raster",
+                    "editability": "page-image",
+                },
+            }
+        ]
+        assert scene_service.validate_scene(scene, job, tmp_path)
+        invalid = copy.deepcopy(scene)
+        invalid["textInventory"][0]["reason"] = "svg-asset"
+        with pytest.raises(ValueError, match="SCENE_INVENTORY_TARGET"):
+            scene_service.validate_scene(invalid, job, tmp_path)
+
+
 def test_export_target_creates_new_identity_and_hides_old_latest(export_queue):
     client, _, _ = export_queue
     pid, _, pages = seed_pages()

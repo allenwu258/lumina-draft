@@ -29,6 +29,44 @@
   border-radius: 4px;
   font-size: 10px;
 }
+.scene-warning-details {
+  z-index: 5;
+  max-width: min(420px, calc(100% - 16px));
+}
+.scene-warning-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+.scene-warning-details[open] {
+  max-height: min(60%, 260px);
+  overflow: auto;
+  box-shadow: 0 2px 10px #0002;
+}
+.scene-warning-details ul {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0 0 0 14px;
+}
+.scene-warning-details li {
+  display: grid;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.scene-warning-details code {
+  opacity: .75;
+}
+.scene-raster-warning {
+  left: 6px;
+  right: auto;
+  top: 6px;
+  bottom: auto;
+  max-width: calc(100% - 12px);
+  background: #fff1e8;
+  color: #9a3412;
+  font-size: 11px;
+  font-weight: 600;
+}
 .canvas-controls .segmented button {
   white-space: nowrap;
 }

@@ -75,9 +75,9 @@ HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。�
 
 `scene_conversion_jobs` 保存冻结 HTML/CSS、来源哈希和执行状态；`page_scenes` 保存不可变 SceneIR JSON 与资源引用。PageTask 只指向当前任务和场景。旧任务必须同时匹配执行令牌、当前任务引用与 HTML 哈希，才能发布结果。资产先验证并安装，再提交场景、当前引用和事件。
 
-转换使用与 HTML 预览相同的本地 Tailwind CSS 字节和作品冻结的画布尺寸，采用 DPR 1、zh-CN 和 Asia/Shanghai。浏览器计算 Flex/Grid；转换器读取实际几何、文本片段、绘制顺序和裁剪。Canvas 直接绘制 SceneIR，不读取 HTML、DOM 报告或 RenderPlan，也不重新换行。PPT 写出 SceneIR 0.4 / dom-canvas-0.4.0，同时兼容读取 0.3；设计写出支持可变尺寸的 0.5 / dom-canvas-0.5.0，提供 Canvas、HTML 和源码预览。SVG 保留为规范化 image/svg+xml 资产，包含已固化的颜色、字体、局部引用，并显式引用受预算限制的 PNG 兼容资产；Canvas 直接绘制 SVG 来源以适应缩放与 DPR。文字清单通过 text / asset / hidden 目标记录唯一归属，SVG 内文字本轮保留矢量，不拆成独立文本框。
+转换使用与 HTML 预览相同的本地 Tailwind CSS 字节和作品冻结的画布尺寸，采用 DPR 1、zh-CN 和 Asia/Shanghai。浏览器计算 Flex/Grid；转换器读取实际几何、文本片段、绘制顺序和裁剪。Canvas 直接绘制 SceneIR，不读取 HTML、DOM 报告或 RenderPlan，也不重新换行。PPT 写出 SceneIR 0.4 / dom-canvas-0.4.1，同时兼容读取旧的 0.3/0.4 converter；设计写出支持可变尺寸的 0.5 / dom-canvas-0.5.1，同时兼容旧的 0.5 converter，提供 Canvas、HTML 和源码预览。SVG 保留为规范化 image/svg+xml 资产，包含已固化的颜色、字体、局部引用，并显式引用受预算限制的 PNG 兼容资产；Canvas 直接绘制 SVG 来源以适应缩放与 DPR。文字清单通过 text / asset / hidden 目标记录唯一归属，SVG 内文字本轮保留矢量，不拆成独立文本框。
 
-当前覆盖受控 profile 中的布局、背景、圆角实线边框、中文/英文富文本、大小写、字距、基础表格、SVG、透明组和 overflow 裁剪。Box shadow 使用 Canvas 模糊近似并记录提示。合并表格、滤镜、渐变、伪元素文字、变换、复杂文字排版等尚未支持的内容会明确失败，可继续查看 HTML。当前以同一台机器的系统字体为准，字体宽度明显失配时不会发布成功首帧；跨机器字体分发和 Office 一致性留给后续。
+当前覆盖受控 profile 中的布局、背景、圆角、实线/虚线/点线边框、中文/英文富文本、大小写、字距、基础表格、SVG、透明组和 overflow 裁剪。纯 translate 使用浏览器最终几何归一；滤镜、渐变背景、伪元素、列表标记、复杂变换或文字效果会产生来源诊断，并在白名单视觉退化触发时用受预算限制的整页 Chromium PNG 保留原始画面。该页仍可预览和导出，但文本和元素不再分别可编辑；预览会醒目标注。utility 样式缺少冻结 profile marker 时只作提示，不单独触发整页栅格。诊断数量、DOM、画布和资产均有上限；画布/Scene 合同/资源硬限制仍会失败。Box shadow 使用 Canvas 模糊近似并记录提示。局部 raster island 与依赖层叠关系的独立视觉合成仍待后续实现。当前以同一台机器的系统字体为准，字体宽度明显失配时不会发布成功首帧；跨机器字体分发和 Office 一致性留给后续。
 
 已有成功 HTML 页在第一次预览或导出时按需转换，不批量迁移历史作品。预览、生成完成钩子与导出共用 `ensure_page_scene`：先查询匹配来源与当前转换目标的有效 Scene，命中后不因当前 CSS 或字体环境变化而隐式重转；缺失才进入转换队列。同来源升级沿用旧任务冻结的 CSS，保留旧场景显示，成功后才切换。快照分开返回 display_scene、conversion 和 up_to_date；GET 不入队，失败需显式重试。缺少 HTML 的旧场景可继续预览与导出并报告兼容提示；有来源时不能用旧结果掩盖升级失败。旧页缺少来源哈希时统一计算并登记。转换成功后，HTML 对照票据绑定该 Scene 的冻结来源和 CSS。新版预览区分排队、转换、资源加载、客户端绘制错误，可分别重试转换或渲染。
 

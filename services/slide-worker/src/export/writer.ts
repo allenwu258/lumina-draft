@@ -209,7 +209,12 @@ export async function writePptx(
           fill: alpha(color(n.fill), e.opacity),
           line:
             uniform && b.width && b.style !== "none" && b.style !== "hidden"
-              ? { ...alpha(color(b.color), e.opacity), width: point(b.width) }
+              ? {
+                  ...alpha(color(b.color), e.opacity),
+                  width: point(b.width),
+                  ...(b.style === "dashed" ? { dashType: "dash" as const } : {}),
+                  ...(b.style === "dotted" ? { dashType: "sysDot" as const } : {}),
+                }
               : { color: "000000", transparency: 100 },
           objectName: `shape:${n.id}`,
         });

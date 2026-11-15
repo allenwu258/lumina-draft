@@ -33,7 +33,13 @@ function shape(n: ShapeNode, id: string) {
       result += `<path d="${rounded(
         r,
         n.radii.map((v) => Math.max(0, v - b.width / 2)),
-      )}" fill="none" ${paint(b.color, "stroke")} stroke-width="${b.width}"/>`;
+      )}" fill="none" ${paint(b.color, "stroke")} stroke-width="${b.width}"${
+        b.style === "dashed"
+          ? ` stroke-dasharray="${b.width * 3} ${b.width * 2}"`
+          : b.style === "dotted"
+            ? ` stroke-dasharray="0 ${b.width * 2}" stroke-linecap="round"`
+            : ""
+      }/>`;
     }
   } else {
     const f = n.frame,
