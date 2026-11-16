@@ -8,10 +8,12 @@ from backend.app.provider_protocols import (
 
 def test_responses_protocol_is_registered_once():
     assert supports_protocol("openai_responses")
+    assert supports_protocol("openai_chat_completions")
     adapter = get_protocol_adapter("openai_responses")
     assert adapter.protocol == "openai_responses"
     assert [item.code for item in PROTOCOL_REGISTRY.descriptors()] == [
-        "openai_responses"
+        "openai_responses",
+        "openai_chat_completions",
     ]
 
 

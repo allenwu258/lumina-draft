@@ -43,7 +43,7 @@ from .provider_management import (
     route_issues,
 )
 from .providers import ProviderError, validate_endpoint
-from .provider_protocols import PROTOCOL_REGISTRY
+from .provider_protocols import PROTOCOL_REGISTRY, supports_protocol
 from .secrets import delete_secret, read_secret, save_secret
 from .workflows import ROUTE_LABELS
 
@@ -62,7 +62,7 @@ def handle_configuration_error(error: ConfigurationError):
 class ProviderCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=160)
-    protocol: Literal["openai_responses"] = "openai_responses"
+    protocol: str = Field(default="openai_responses", min_length=1, max_length=80)
     base_url: str = Field(min_length=8, max_length=500)
     auth_mode: Literal["bearer", "none"] = "bearer"
     api_key: str | None = Field(default=None, max_length=500)
@@ -75,6 +75,13 @@ class ProviderCreate(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("不能为空")
+        return value
+
+    @field_validator("protocol")
+    @classmethod
+    def registered_protocol(cls, value: str) -> str:
+        if not supports_protocol(value):
+            raise ValueError("Provider 协议未启用或未注册")
         return value
 
     @model_validator(mode="after")
@@ -91,7 +98,7 @@ class ProviderPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=160)
-    protocol: Literal["openai_responses"]
+    protocol: str = Field(min_length=1, max_length=80)
     base_url: str = Field(min_length=8, max_length=500)
     auth_mode: Literal["bearer", "none"]
     allow_private_http: bool
@@ -103,6 +110,13 @@ class ProviderPatch(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("不能为空")
+        return value
+
+    @field_validator("protocol")
+    @classmethod
+    def registered_protocol(cls, value: str) -> str:
+        if not supports_protocol(value):
+            raise ValueError("Provider 协议未启用或未注册")
         return value
 
 
@@ -488,6 +502,12 @@ def patch_provider(provider_id: str, body: ProviderPatch):
         except ConfigurationError as exc:
             handle_configuration_error(exc)
         _check_revision(owner.revision, body.expected_revision)
+        if body.protocol != endpoint.protocol:
+            api_error(
+                "PROVIDER_PROTOCOL_IMMUTABLE",
+                "Provider 协议创建后不可更改，请新建 Provider 并重新绑定模型",
+                409,
+            )
         if body.auth_mode == "none" and endpoint.credential_ref:
             credentials = db.scalars(
                 select(ApiCredential).where(

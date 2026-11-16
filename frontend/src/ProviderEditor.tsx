@@ -1,10 +1,11 @@
-import { useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Activity, Download, LoaderCircle, Plus, Save, ShieldCheck, Trash2 } from 'lucide-react';
 import {
   type ApiProvider,
   type ModelCandidate,
   type ProviderFields,
   type ProviderModel,
+  type ProviderProtocolDescriptor,
   errorMessage,
   providerApi,
 } from './provider-api';
@@ -44,9 +45,31 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
   const keyInput = useRef<HTMLInputElement>(null);
   const [confirmation, setConfirmation] = useState<'archive' | 'revoke' | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
+  const [protocols, setProtocols] = useState<ProviderProtocolDescriptor[]>([]);
   const dirty = !!provider && JSON.stringify(fields) !== JSON.stringify(fieldsOf(provider));
   const update = <K extends keyof ProviderFields>(key: K, value: ProviderFields[K]) =>
     setFields((current) => ({ ...current, [key]: value }));
+
+  useEffect(() => {
+    let active = true;
+    providerApi
+      .protocols()
+      .then(({ items }) => {
+        if (active) setProtocols(items.filter((item) => item.enabled));
+      })
+      .catch((error) => {
+        if (active) setNotice({ text: errorMessage(error), error: true });
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const protocolLabel =
+    protocols.find((item) => item.code === fields.protocol)?.label ??
+    (fields.protocol === 'openai_chat_completions'
+      ? 'OpenAI Chat Completions'
+      : 'OpenAI Responses');
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -136,11 +159,9 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
         <header>
           <div>
             <h2>{provider?.name || '添加 Provider'}</h2>
-            <p>
-              {provider ? '编辑 Provider 连接与认证信息' : '创建一个兼容 OpenAI Responses 的连接'}
-            </p>
+            <p>{provider ? '编辑 Provider 连接与认证信息' : '创建一个 OpenAI API 协议连接'}</p>
           </div>
-          <span className="settings-badge">Responses</span>
+          <span className="settings-badge">{protocolLabel}</span>
         </header>
         <fieldset disabled={!!busy || !!testing} className="settings-form">
           <div className="settings-fields">
@@ -156,12 +177,22 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
             </label>
             <label>
               API 协议
-              <select aria-label="API 协议" value={fields.protocol} onChange={() => {}}>
-                <option value="openai_responses">OpenAI Responses</option>
-                <option disabled>Chat Completions · 待扩展</option>
-                <option disabled>Messages · 待扩展</option>
-                <option disabled>Gemini · 待扩展</option>
+              <select
+                aria-label="API 协议"
+                value={fields.protocol}
+                disabled={!protocols.length || !!provider}
+                onChange={(event) =>
+                  update('protocol', event.target.value as ProviderFields['protocol'])
+                }
+              >
+                {!protocols.length && <option value={fields.protocol}>正在加载协议…</option>}
+                {protocols.map((item) => (
+                  <option key={item.code} value={item.code}>
+                    {item.label}
+                  </option>
+                ))}
               </select>
+              {provider && <small>协议创建后不可更改；需要切换协议时请新建 Provider。</small>}
             </label>
           </div>
           <label>
@@ -175,7 +206,11 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
               onChange={(event) => update('base_url', event.target.value)}
               placeholder="https://api.example.com/v1"
             />
-            <small>填写 API 根地址，系统自动追加 /responses 或 /models。</small>
+            <small>
+              填写 API 根地址，系统会按协议追加{' '}
+              {fields.protocol === 'openai_chat_completions' ? '/chat/completions' : '/responses'}{' '}
+              或 /models。
+            </small>
           </label>
           <div className="settings-fields">
             <label>

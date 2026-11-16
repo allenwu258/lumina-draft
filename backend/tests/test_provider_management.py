@@ -299,6 +299,62 @@ def test_provider_model_crud_validation_and_revision(managed_client):
     assert client.get(PREFIX + f"/providers/{provider['id']}").status_code == 404
 
 
+def test_chat_completions_protocol_is_discoverable_and_persisted(managed_client):
+    client = managed_client
+    protocols = client.get(PREFIX + "/protocols").json()["items"]
+    assert {item["code"] for item in protocols if item["enabled"]} == {
+        "openai_responses",
+        "openai_chat_completions",
+    }
+    provider = create_provider(client, protocol="openai_chat_completions")
+    assert provider["protocol"] == "openai_chat_completions"
+    updated = client.patch(
+        PREFIX + f"/providers/{provider['id']}",
+        json=provider_patch(provider, name="Chat Provider"),
+    )
+    assert updated.status_code == 200
+    assert updated.json()["protocol"] == "openai_chat_completions"
+    changed_protocol = client.patch(
+        PREFIX + f"/providers/{provider['id']}",
+        json=provider_patch(updated.json(), protocol="openai_responses"),
+    )
+    assert changed_protocol.status_code == 409
+    assert changed_protocol.json()["detail"]["code"] == "PROVIDER_PROTOCOL_IMMUTABLE"
+    assert client.get(PREFIX + f"/providers/{provider['id']}").json()["protocol"] == (
+        "openai_chat_completions"
+    )
+
+    unsupported = client.post(
+        PREFIX + "/providers",
+        json={
+            "name": "Unknown protocol",
+            "base_url": "https://example.com/v1",
+            "protocol": "not_registered",
+            "auth_mode": "none",
+        },
+    )
+    assert unsupported.status_code == 422
+
+
+def test_legacy_default_provider_update_preserves_chat_protocol(managed_client):
+    client = managed_client
+    provider = create_provider(client, protocol="openai_chat_completions")
+    model = create_model(client, provider)
+    seed_default(model)
+
+    response = client.put(
+        "/api/v1/settings/llm/default",
+        json={
+            "name": "Updated Chat Provider",
+            "base_url": "https://example.com/v2",
+            "model": model["remote_model_id"],
+            "enabled": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["protocol"] == "openai_chat_completions"
+
+
 @pytest.mark.parametrize(
     "url,allowed,status",
     [
@@ -310,6 +366,7 @@ def test_provider_model_crud_validation_and_revision(managed_client):
         ("https://example.com/v1?key=x", False, 422),
         ("https://example.com:invalid/v1", False, 422),
         ("https://example.com/v1/responses", False, 422),
+        ("https://example.com/v1/chat/completions", False, 422),
     ],
 )
 def test_provider_endpoint_validation(managed_client, url, allowed, status):

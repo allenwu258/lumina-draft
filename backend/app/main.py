@@ -227,7 +227,7 @@ def update_provider(body: ProviderUpdate):
             enabled=body.enabled,
         )
         provider_fields = ProviderPatch(
-            expected_revision=revision, name=body.name, protocol="openai_responses",
+            expected_revision=revision, name=body.name, protocol=endpoint.protocol,
             base_url=body.base_url, auth_mode="bearer" if body.api_key else endpoint.auth_mode,
             allow_private_http=endpoint.allow_private_http,
             enabled=body.enabled,

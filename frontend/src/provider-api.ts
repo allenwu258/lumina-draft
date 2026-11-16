@@ -34,10 +34,16 @@ export type ProviderModel = {
   reasoning_tiers: ReasoningTier[];
   last_test: ModelTest | null;
 };
+export type ProviderProtocol = 'openai_responses' | 'openai_chat_completions';
+export type ProviderProtocolDescriptor = {
+  code: ProviderProtocol;
+  label: string;
+  enabled: boolean;
+};
 export type ApiProvider = {
   id: string;
   name: string;
-  protocol: 'openai_responses';
+  protocol: ProviderProtocol;
   base_url: string;
   auth_mode: 'bearer' | 'none';
   credential_configured: boolean;
@@ -141,6 +147,7 @@ const send = <T>(path: string, method: string, body?: unknown) =>
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
 export const providerApi = {
+  protocols: () => providerRequest<{ items: ProviderProtocolDescriptor[] }>('/protocols'),
   list: () => providerRequest<{ items: ApiProvider[] }>('/providers'),
   create: (fields: ProviderFields, apiKey?: string) =>
     send<ApiProvider>('/providers', 'POST', { ...fields, api_key: apiKey || null }),

@@ -11,10 +11,15 @@ test('Provider configuration, model discovery, routing and presentation generati
   await expect(page.getByRole('heading', { name: '模型与 API', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '添加 Provider', exact: true }).last().click();
   await page.getByLabel('显示名称', { exact: true }).fill('E2E Provider');
+  await page.getByLabel('API 协议', { exact: true }).selectOption('openai_chat_completions');
+  await expect(
+    page.locator('.settings-card .settings-badge').getByText('OpenAI Chat Completions'),
+  ).toBeVisible();
   await page.getByLabel('API 根地址', { exact: true }).fill(`${apiOrigin}/mock/v1`);
   await page.getByLabel('认证方式', { exact: true }).selectOption('none');
   await page.getByRole('button', { name: '保存 Provider', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'E2E Provider', exact: true })).toBeVisible();
+  await expect(page.getByLabel('API 协议', { exact: true })).toHaveValue('openai_chat_completions');
   await page.getByRole('button', { name: '获取可用模型', exact: true }).click();
   const discovery = page.getByRole('dialog', { name: '导入可用模型' });
   await expect(discovery.getByText('接口未提供上下文', { exact: true })).toBeVisible();
