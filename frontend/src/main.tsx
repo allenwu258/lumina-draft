@@ -5,6 +5,7 @@ import './styles.css';
 import './generation-settings.css';
 import './chat-ui.css';
 import { ProviderSettings, type SettingsTab } from './ProviderSettings';
+import './layout.css';
 import { GenerationProgress, PageStatusIcon, pageStatusLabel } from './PageStatus';
 import type { CanvasSize } from '@lumina/scene-core';
 import { canvasRatio, defaultDesignDraft, designOptions, DesignOptions } from './DesignOptions';
