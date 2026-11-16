@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import validate_html  # noqa: E402
 from backend.app.prompts import COMPOSER_PROMPT  # noqa: E402
-from backend.app.tailwind_profile import TAILWIND_CLASSES, TAILWIND_PROFILE, preview_html  # noqa: E402
+from backend.app.tailwind_profile import COMPOSER_UTILITIES, TAILWIND_CLASSES, TAILWIND_PROFILE, preview_html  # noqa: E402
 from backend.app.db import Conversation, ConversationMessage, engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
@@ -59,6 +60,56 @@ def test_tailwind_profile_is_enforced_and_shared_with_composer():
     assert 'data-tailwind-profile="tailwind-ppt-v1"' in rendered
     assert ".flex{" in rendered
     assert preview_html(legacy_html()) == legacy_html()
+
+
+def test_composer_is_single_paragraph_with_an_exact_utility_catalog():
+    assert len(COMPOSER_PROMPT.splitlines()) == 1
+    assert '\\' not in COMPOSER_PROMPT
+    assert f'data-css-profile="{TAILWIND_PROFILE}"' in COMPOSER_PROMPT
+
+    def expand(token):
+        group = re.search(r"\{([^{}]+)\}", token)
+        if group is None:
+            return [token]
+        return [
+            item for option in group[1].split(",")
+            for item in expand(token[:group.start()] + option + token[group.end():])
+        ]
+
+    expanded = [item for token in COMPOSER_UTILITIES.split() for item in expand(token)]
+    assert len(expanded) == len(set(expanded))
+    assert set(expanded) == set(TAILWIND_CLASSES)
+
+
+def test_expanded_composer_utilities_pass_the_html_contract():
+    body = '<section class="flex-1 min-h-0 min-w-0 grid grid-cols-12 gap-6"><div class="col-span-7 bg-linear-to-br from-indigo-900 via-violet-700 to-rose-500 rounded-3xl p-6"><h1 class="text-[30px] leading-tight text-white">专业演示</h1></div><aside class="col-span-5 bg-ppt-primary/10"><div class="size-16 rotate-3 bg-amber-300 shadow-lg"></div></aside></section>'
+    html = valid_html().replace(
+        '<div class="flex items-center gap-4 bg-ppt-surface p-4"><h1 id="tailwind-proof" class="font-ppt text-ppt-title font-semibold text-ppt-text">Hello</h1><p class="text-ppt-body text-ppt-muted">Utility rendering</p></div>',
+        body,
+    )
+    assert body in html
+    assert validate_html(html) == (True, "ok")
+    assert not validate_html(html.replace("text-[30px]", "text-[301px]"))[0]
+
+
+@pytest.mark.parametrize("utility", [
+    "mt-auto", "mb-auto", "border-l-2", "border-r-4", "border-y-2",
+    "text-[17px]", "size-7", "items-baseline", "w-5", "left-40", "left-72", "top-32",
+])
+def test_real_failed_output_utility_families_are_admitted(utility):
+    html = valid_html().replace("items-center", f"items-center {utility}")
+    assert validate_html(html) == (True, "ok")
+
+
+def test_unregistered_utility_error_names_unique_classes_and_bounds_details():
+    html = valid_html().replace("items-center", "items-center unknown-z unknown-a unknown-z")
+    valid, reason = validate_html(html)
+    assert not valid
+    assert "unknown-a、unknown-z" in reason
+    assert reason.count("unknown-z") == 1
+    many = " ".join(f"unregistered-{n}-" + "x" * 80 for n in range(100))
+    valid, reason = validate_html(valid_html().replace("items-center", many))
+    assert not valid and len(reason) < 500
 
 
 def document():

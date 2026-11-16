@@ -14,6 +14,32 @@ TAILWIND_CLASSES = tuple(_MANIFEST["classes"])
 TAILWIND_CLASS_SET = frozenset(TAILWIND_CLASSES)
 
 
+def _utility_catalog(classes: tuple[str, ...]) -> str:
+    """Describe the exact manifest with finite, lossless brace choices."""
+    families: dict[str, list[str]] = {}
+    literals = []
+    for token in classes:
+        prefix, separator, suffix = token.rpartition("-")
+        if not separator or token.startswith("-"):
+            literals.append(token)
+        else:
+            families.setdefault(prefix, []).append(suffix)
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for prefix, suffixes in families.items():
+        groups.setdefault(tuple(sorted(suffixes)), []).append(prefix)
+
+    def choices(values) -> str:
+        return values[0] if len(values) == 1 else "{" + ",".join(values) + "}"
+
+    return " ".join(literals + [
+        choices(prefixes) + "-" + choices(suffixes)
+        for suffixes, prefixes in groups.items()
+    ])
+
+
+COMPOSER_UTILITIES = _utility_catalog(TAILWIND_CLASSES)
+
+
 @lru_cache(maxsize=1)
 def compiled_tailwind_css() -> str:
     return (_ROOT / "tailwind-ppt-v1.css").read_text(encoding="utf-8")

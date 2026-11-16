@@ -64,8 +64,14 @@ def validate_tailwind_page(soup, root, canvas: tuple[int, int] = PPT_CANVAS) -> 
     classes = [token for element in soup.find_all(True) for token in element.get("class", [])]
     if not classes:
         return False, "Tailwind 页面必须使用受控 utility class"
-    if any(token not in TAILWIND_CLASS_SET for token in classes):
-        return False, "页面使用了未登记的 Tailwind class"
+    unknown = sorted(set(classes) - TAILWIND_CLASS_SET)
+    if unknown:
+        examples = "、".join(token[:48] for token in unknown[:6])
+        remainder = f"，另有 {len(unknown) - 6} 个" if len(unknown) > 6 else ""
+        return False, (
+            f"页面使用了未登记的 Tailwind class（{len(unknown)} 个）：{examples}{remainder}。"
+            "请将这些类改为能力表内的 utility；不能仅改变 class 顺序。"
+        )
     if any(element.has_attr("style") for element in soup.find_all(True)):
         return False, "Tailwind 页面不允许 style 属性"
 
