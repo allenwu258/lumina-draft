@@ -6,7 +6,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, TypedDict
+from typing import Any, AsyncIterator, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
@@ -14,7 +14,13 @@ from sqlalchemy import select
 from .config import settings
 from .db import ApiCredential, ApiEndpoint, ApiProvider, Conversation, ConversationMessage, ConversationTurn, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, ProviderTest, Run, dumps, loads, session_scope, utcnow
 from .prompts import COMPOSER_PROMPT, DIRECTOR_PROMPT
-from .providers import ProviderError, stream_responses
+from .providers import (
+    ProviderError,
+    ProviderEvent,
+    ProviderRequest,
+    get_protocol_adapter,
+    stream_responses,
+)
 from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
 from .rendering import html_hash, validate_html
 from .schemas import OutlineDocument
@@ -30,6 +36,21 @@ def canonical_hash(value: object) -> str:
 def request_reasoning_effort(snapshot: dict[str, Any]) -> str | None:
     effort = snapshot.get("reasoning_effort", "none")
     return None if effort == "auto" else effort
+
+
+async def _stream_provider_request(
+    request: ProviderRequest,
+) -> AsyncIterator[ProviderEvent]:
+    """Keep the legacy injection seam at the edge of the Gateway.
+
+    The Gateway works with one normalized request object.  The temporary
+    keyword conversion here lets existing callers replace ``stream_responses``
+    in tests and integrations while the real implementation dispatches through
+    the protocol registry.
+    """
+
+    async for event in stream_responses(**request.as_legacy_kwargs()):
+        yield event
 
 
 class DirectorState(TypedDict, total=False):
@@ -166,8 +187,9 @@ class ProviderGateway:
             model = config.get("remote_model_id", config.get("model", binding.remote_model_id))
             credential_ref = config.get("credential_ref", endpoint.credential_ref) or ""
             protocol = config.get("protocol", endpoint.protocol)
-            if protocol != "openai_responses":
-                raise ProviderError("UNSUPPORTED_PROTOCOL", "当前仅支持 OpenAI Responses 协议")
+            # Resolve the adapter before creating an audit row.  The Gateway
+            # remains protocol-agnostic; the registry owns protocol support.
+            get_protocol_adapter(protocol)
             call = LlmCall(
                 presentation_id=presentation_id,
                 purpose=purpose,
@@ -260,22 +282,24 @@ class ProviderGateway:
                     await emit_event(presentation_id, "page.started", {"page_task_id": page_task_id, "page_number": page_number}, run_id)
                 if presentation_id:
                     await emit_event(presentation_id, "llm.started", {"call_id": call_id, "model_id": model_id, "queue_duration_ms": queue_duration_ms}, run_id)
-                request_options = {
-                    "base_url": base_url,
-                    "api_key": key or "",
-                    "model": model,
-                    "instructions": instructions or (DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT),
-                    "prompt": prompt,
-                    "json_schema": schema,
-                    "reasoning_effort": config.get("reasoning_effort"),
-                    "auth_mode": auth_mode,
-                    "allow_private_http": allow_private_http,
-                }
-                if max_output_tokens is not None:
-                    request_options["max_output_tokens"] = max_output_tokens
-                async for event in stream_responses(
-                    **request_options,
-                ):
+                request_context = ProviderRequest(
+                    protocol=protocol,
+                    base_url=base_url,
+                    api_key=key or "",
+                    model=model,
+                    instructions=instructions
+                    or (DIRECTOR_PROMPT if purpose == "director" else COMPOSER_PROMPT),
+                    prompt=prompt,
+                    json_schema=schema,
+                    reasoning_effort=config.get("reasoning_effort"),
+                    max_output_tokens=max_output_tokens,
+                    auth_mode=auth_mode,
+                    allow_private_http=allow_private_http,
+                    structured_output_mode=config.get(
+                        "structured_output_mode", "native_json_schema"
+                    ),
+                )
+                async for event in _stream_provider_request(request_context):
                     if event.kind == "text_delta":
                         if first_token_at is None:
                             first_token_at = time.monotonic()

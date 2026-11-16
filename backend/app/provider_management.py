@@ -24,6 +24,7 @@ from .db import (
     resolve_default,
     session_scope,
 )
+from .provider_protocols import supports_protocol
 from .workflows import OUTLINE_ROUTES, PPT, WorkflowSpec
 
 
@@ -240,8 +241,8 @@ def route_issues(db, config: dict[str, Any], *, require_test: bool = True) -> li
         )
     ):
         issues.append("Provider 或模型已停用")
-    if config["protocol"] != "openai_responses":
-        issues.append("当前仅支持 Responses 协议")
+    if not supports_protocol(config["protocol"]):
+        issues.append("当前 Provider 协议未注册适配器")
     if config["auth_mode"] == "bearer" and not config.get("credential_id"):
         issues.append("未配置有效 API Key")
     if require_test:

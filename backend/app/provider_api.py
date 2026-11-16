@@ -43,6 +43,7 @@ from .provider_management import (
     route_issues,
 )
 from .providers import ProviderError, validate_endpoint
+from .provider_protocols import PROTOCOL_REGISTRY
 from .secrets import delete_secret, read_secret, save_secret
 from .workflows import ROUTE_LABELS
 
@@ -373,7 +374,12 @@ def _check_revision(current: int, expected: int):
 def get_protocols():
     return {
         "items": [
-            {"code": "openai_responses", "label": "OpenAI Responses", "enabled": True}
+            {
+                "code": descriptor.code,
+                "label": descriptor.label,
+                "enabled": descriptor.enabled,
+            }
+            for descriptor in PROTOCOL_REGISTRY.descriptors()
         ]
     }
 
