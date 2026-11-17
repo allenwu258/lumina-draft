@@ -12,6 +12,9 @@ class ProtocolDescriptor:
     code: str
     label: str
     enabled: bool = True
+    auth_modes: tuple[str, ...] = ("bearer", "none")
+    default_auth_mode: str = "bearer"
+    default_base_url: str | None = None
 
 
 class ProviderProtocolRegistry:
@@ -42,7 +45,13 @@ class ProviderProtocolRegistry:
 
     def descriptors(self) -> list[ProtocolDescriptor]:
         return [
-            ProtocolDescriptor(code=adapter.protocol, label=adapter.label)
+            ProtocolDescriptor(
+                code=adapter.protocol,
+                label=adapter.label,
+                auth_modes=adapter.auth_modes,
+                default_auth_mode=adapter.default_auth_mode,
+                default_base_url=adapter.default_base_url,
+            )
             for adapter in self._adapters.values()
         ]
 

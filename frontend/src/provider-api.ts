@@ -34,18 +34,25 @@ export type ProviderModel = {
   reasoning_tiers: ReasoningTier[];
   last_test: ModelTest | null;
 };
-export type ProviderProtocol = 'openai_responses' | 'openai_chat_completions';
+export type ProviderProtocol =
+  | 'openai_responses'
+  | 'openai_chat_completions'
+  | 'gemini_generate_content';
+export type ProviderAuthMode = 'bearer' | 'none' | 'api_key_header';
 export type ProviderProtocolDescriptor = {
   code: ProviderProtocol;
   label: string;
   enabled: boolean;
+  auth_modes: ProviderAuthMode[];
+  default_auth_mode: ProviderAuthMode;
+  default_base_url: string | null;
 };
 export type ApiProvider = {
   id: string;
   name: string;
   protocol: ProviderProtocol;
   base_url: string;
-  auth_mode: 'bearer' | 'none';
+  auth_mode: ProviderAuthMode;
   credential_configured: boolean;
   credential_version: number | null;
   credential_store_available?: boolean;

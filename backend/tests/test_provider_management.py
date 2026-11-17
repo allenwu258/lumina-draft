@@ -299,12 +299,15 @@ def test_provider_model_crud_validation_and_revision(managed_client):
     assert client.get(PREFIX + f"/providers/{provider['id']}").status_code == 404
 
 
-def test_chat_completions_protocol_is_discoverable_and_persisted(managed_client):
+def test_provider_protocols_are_discoverable_and_chat_completions_is_persisted(
+    managed_client,
+):
     client = managed_client
     protocols = client.get(PREFIX + "/protocols").json()["items"]
     assert {item["code"] for item in protocols if item["enabled"]} == {
         "openai_responses",
         "openai_chat_completions",
+        "gemini_generate_content",
     }
     provider = create_provider(client, protocol="openai_chat_completions")
     assert provider["protocol"] == "openai_chat_completions"
@@ -334,6 +337,54 @@ def test_chat_completions_protocol_is_discoverable_and_persisted(managed_client)
         },
     )
     assert unsupported.status_code == 422
+
+
+def test_gemini_protocol_defaults_to_header_auth_and_model_specific_tiers(
+    managed_client,
+):
+    client = managed_client
+    protocols = {
+        item["code"]: item for item in client.get(PREFIX + "/protocols").json()["items"]
+    }
+    descriptor = protocols["gemini_generate_content"]
+    assert descriptor["auth_modes"] == ["api_key_header"]
+    assert descriptor["default_auth_mode"] == "api_key_header"
+    assert descriptor["default_base_url"] == (
+        "https://generativelanguage.googleapis.com/v1beta"
+    )
+
+    created = client.post(
+        PREFIX + "/providers",
+        json={
+            "name": "Gemini Provider",
+            "protocol": "gemini_generate_content",
+            "base_url": descriptor["default_base_url"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    provider = created.json()
+    assert provider["auth_mode"] == "api_key_header"
+
+    legacy = create_model(client, provider, remote="gemini-1.5-pro")
+    assert [tier["code"] for tier in legacy["reasoning_tiers"]] == ["off"]
+    thinking = create_model(client, provider, remote="gemini-2.5-flash")
+    assert [tier["api_value"] for tier in thinking["reasoning_tiers"]] == [
+        None,
+        "1024",
+        "8192",
+        "16384",
+    ]
+
+    wrong_auth = client.post(
+        PREFIX + "/providers",
+        json={
+            "name": "Gemini Wrong Auth",
+            "protocol": "gemini_generate_content",
+            "base_url": descriptor["default_base_url"],
+            "auth_mode": "bearer",
+        },
+    )
+    assert wrong_auth.status_code == 422
 
 
 def test_legacy_default_provider_update_preserves_chat_protocol(managed_client):

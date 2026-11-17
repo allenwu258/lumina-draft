@@ -15,6 +15,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, PageScene, SceneConversionJob, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
 from .provider_management import ConfigurationError, resolve_workflow_routes, resolve_business_route, route_issues
+from .provider_protocols import get_protocol_adapter
 from .workflows import ENTRY_WORKFLOWS, WORKFLOWS, scheduled_model_id
 from .provider_api import CredentialPut, ModelPatch, ProviderPatch, patch_model, patch_provider, replace_credential, router as provider_management_router, test_model
 from .rendering import html_hash
@@ -228,7 +229,8 @@ def update_provider(body: ProviderUpdate):
         )
         provider_fields = ProviderPatch(
             expected_revision=revision, name=body.name, protocol=endpoint.protocol,
-            base_url=body.base_url, auth_mode="bearer" if body.api_key else endpoint.auth_mode,
+            base_url=body.base_url,
+            auth_mode=(get_protocol_adapter(endpoint.protocol).default_auth_mode if body.api_key else endpoint.auth_mode),
             allow_private_http=endpoint.allow_private_http,
             enabled=body.enabled,
         )
@@ -323,7 +325,7 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
             issues = route_issues(db, config)
             if issues:
                 fail("CONFIG_NOT_READY", config["business_code"] + "：" + "；".join(issues))
-            if config["auth_mode"] == "bearer":
+            if config["auth_mode"] != "none":
                 try:
                     if not read_secret(config["credential_ref"]):
                         fail("CONFIG_NOT_READY", "请先配置业务 Provider 的 API Key")

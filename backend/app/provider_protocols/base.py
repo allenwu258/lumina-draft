@@ -77,9 +77,34 @@ class ProviderAdapter(ABC):
 
     protocol: ClassVar[str]
     label: ClassVar[str]
+    auth_modes: ClassVar[tuple[str, ...]] = ("bearer", "none")
+    default_auth_mode: ClassVar[str] = "bearer"
+    default_base_url: ClassVar[str | None] = None
+
+    def default_reasoning_tiers(self, model_id: str) -> list[dict[str, Any]]:
+        return [
+            {"code": "off", "label": "Off", "api_value": None, "sort_order": 0},
+            {"code": "low", "label": "Low", "api_value": "low", "sort_order": 1},
+            {"code": "medium", "label": "Medium", "api_value": "medium", "sort_order": 2},
+            {"code": "high", "label": "High", "api_value": "high", "sort_order": 3},
+        ]
 
     @abstractmethod
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderEvent]:
         """Stream a normalized provider response."""
 
         raise NotImplementedError
+
+    async def discover_models(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        auth_mode: str,
+        allow_private_http: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return provider model records normalized to the management API shape."""
+
+        raise ProviderError(
+            "MODEL_DISCOVERY_UNSUPPORTED", "当前 Provider 协议不支持模型发现"
+        )

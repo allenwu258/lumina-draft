@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from .base import ProviderAdapter, ProviderError, ProviderEvent, ProviderRequest
+from .openai_model_catalog import discover_openai_models
 from .transport import (
     MAX_EVENT_BYTES,
     bounded_lines,
@@ -22,6 +23,9 @@ class OpenAIResponsesAdapter(ProviderAdapter):
 
     protocol = "openai_responses"
     label = "OpenAI Responses"
+
+    async def discover_models(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await discover_openai_models(**kwargs)
 
     @staticmethod
     def build_body(request: ProviderRequest) -> dict[str, Any]:

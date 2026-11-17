@@ -43,7 +43,11 @@ from .provider_management import (
     route_issues,
 )
 from .providers import ProviderError, validate_endpoint
-from .provider_protocols import PROTOCOL_REGISTRY, supports_protocol
+from .provider_protocols import (
+    PROTOCOL_REGISTRY,
+    get_protocol_adapter,
+    supports_protocol,
+)
 from .secrets import delete_secret, read_secret, save_secret
 from .workflows import ROUTE_LABELS
 
@@ -64,7 +68,7 @@ class ProviderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     protocol: str = Field(default="openai_responses", min_length=1, max_length=80)
     base_url: str = Field(min_length=8, max_length=500)
-    auth_mode: Literal["bearer", "none"] = "bearer"
+    auth_mode: str | None = None
     api_key: str | None = Field(default=None, max_length=500)
     allow_private_http: bool = False
     enabled: bool = True
@@ -89,6 +93,11 @@ class ProviderCreate(BaseModel):
         self.api_key = (
             self.api_key.strip() or None if self.api_key is not None else None
         )
+        adapter = get_protocol_adapter(self.protocol)
+        if self.auth_mode is None:
+            self.auth_mode = adapter.default_auth_mode
+        if self.auth_mode not in adapter.auth_modes:
+            raise ValueError("该 API 协议不支持所选认证方式")
         if self.auth_mode == "none" and self.api_key:
             raise ValueError("无认证模式不能同时提交 API Key")
         return self
@@ -100,7 +109,7 @@ class ProviderPatch(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     protocol: str = Field(min_length=1, max_length=80)
     base_url: str = Field(min_length=8, max_length=500)
-    auth_mode: Literal["bearer", "none"]
+    auth_mode: str
     allow_private_http: bool
     enabled: bool
 
@@ -118,6 +127,13 @@ class ProviderPatch(BaseModel):
         if not supports_protocol(value):
             raise ValueError("Provider 协议未启用或未注册")
         return value
+
+    @model_validator(mode="after")
+    def validate_auth_mode(self):
+        adapter = get_protocol_adapter(self.protocol)
+        if self.auth_mode not in adapter.auth_modes:
+            raise ValueError("该 API 协议不支持所选认证方式")
+        return self
 
 
 class CredentialPut(BaseModel):
@@ -309,7 +325,7 @@ def _provider_payload(
         "base_url": endpoint.base_url,
         "auth_mode": endpoint.auth_mode,
         "credential_configured": (
-            credential_configured if endpoint.auth_mode == "bearer" else False
+            credential_configured if endpoint.auth_mode != "none" else False
         ),
         "credential_version": credential.version if credential else None,
         "credential_store_available": credential_store_available,
@@ -354,7 +370,7 @@ def _validate_route_model(
         or not config["binding_enabled"]
     ):
         api_error("MODEL_NOT_READY", "停用的模型不能用于业务路由", 422)
-    if config["auth_mode"] == "bearer":
+    if config["auth_mode"] != "none":
         try:
             if not config.get("credential_ref") or not read_secret(
                 config["credential_ref"]
@@ -392,6 +408,9 @@ def get_protocols():
                 "code": descriptor.code,
                 "label": descriptor.label,
                 "enabled": descriptor.enabled,
+                "auth_modes": list(descriptor.auth_modes),
+                "default_auth_mode": descriptor.default_auth_mode,
+                "default_base_url": descriptor.default_base_url,
             }
             for descriptor in PROTOCOL_REGISTRY.descriptors()
         ]
@@ -575,8 +594,8 @@ def replace_credential(provider_id: str, body: CredentialPut):
             except ConfigurationError as exc:
                 handle_configuration_error(exc)
             _check_revision(owner.revision, body.expected_revision)
-            if endpoint.auth_mode != "bearer":
-                api_error("INVALID_AUTH_MODE", "请先选择 Bearer API Key 认证", 409)
+            if endpoint.auth_mode == "none":
+                api_error("INVALID_AUTH_MODE", "请先选择需要 API Key 的认证方式", 409)
             old = (
                 db.scalar(
                     select(ApiCredential).where(
@@ -727,21 +746,17 @@ def create_model(provider_id: str, body: ModelCreate):
             structured_output_mode="native_json_schema",
         )
         db.add(binding)
-        for order, (code, label, api_value) in enumerate(
-            (
-                ("off", "Off", None),
-                ("low", "Low", "low"),
-                ("medium", "Medium", "medium"),
-                ("high", "High", "high"),
-            )
-        ):
+        tiers = get_protocol_adapter(endpoint.protocol).default_reasoning_tiers(
+            body.remote_model_id
+        )
+        for order, tier in enumerate(tiers):
             db.add(
                 ModelReasoningTier(
                     model_id=model.id,
-                    code=code,
-                    label=label,
-                    api_value=api_value,
-                    sort_order=order,
+                    code=tier["code"],
+                    label=tier["label"],
+                    api_value=tier.get("api_value"),
+                    sort_order=tier.get("sort_order", order),
                 )
             )
         db.flush()
@@ -1038,9 +1053,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
         try:
             validate_endpoint(base_url, allow_private_http=allow_private_http)
             key = (
-                read_secret(secret_ref)
-                if auth_mode == "bearer" and secret_ref
-                else None
+                read_secret(secret_ref) if auth_mode != "none" and secret_ref else None
             )
         except ProviderError as exc:
             api_error(exc.code, str(exc), 422)
@@ -1052,13 +1065,14 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                     "message": "系统凭据存储暂不可用",
                 },
             ) from exc
-        if auth_mode == "bearer" and not key:
+        if auth_mode != "none" and not key:
             api_error("CREDENTIAL_NOT_CONFIGURED", "请先配置 API Key 或选择无认证模式")
         provider_id_snapshot = owner.id
         endpoint_id_snapshot = endpoint.id
-    headers = {"Accept": "application/json"}
-    if auth_mode == "bearer":
-        headers["Authorization"] = f"Bearer {key}"
+        protocol = endpoint.protocol
+    adapter = get_protocol_adapter(protocol)
+    if auth_mode not in adapter.auth_modes:
+        api_error("INVALID_AUTH_MODE", "该 API 协议不支持当前认证方式", 422)
     candidates = []
     try:
         async with asyncio.timeout(30):
@@ -1069,7 +1083,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                 _check_revision(current_owner.revision, expected_revision)
                 if not current_owner.enabled or not current_endpoint.enabled:
                     api_error("PROVIDER_DISABLED", "Provider 已停用")
-                if auth_mode == "bearer" and not db.scalar(
+                if auth_mode != "none" and not db.scalar(
                     select(ApiCredential.id).where(
                         ApiCredential.endpoint_id == endpoint_id_snapshot,
                         ApiCredential.secret_ref == secret_ref,
@@ -1077,39 +1091,12 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                     )
                 ):
                     api_error("CREDENTIAL_REVOKED", "API 凭据已撤销")
-            timeout = httpx.Timeout(25.0, connect=10.0)
-            async with httpx.AsyncClient(
-                timeout=timeout, follow_redirects=False
-            ) as client:
-                async with client.stream(
-                    "GET", f"{base_url}/models", headers=headers
-                ) as response:
-                    if response.status_code >= 300:
-                        code = {
-                            401: "PROVIDER_UNAUTHORIZED",
-                            403: "PROVIDER_FORBIDDEN",
-                            404: "MODEL_DISCOVERY_UNSUPPORTED",
-                        }.get(response.status_code, "MODEL_DISCOVERY_FAILED")
-                        api_error(
-                            code,
-                            "Provider 未能返回可用模型列表",
-                            422 if response.status_code < 500 else 502,
-                        )
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > 2 * 1024 * 1024:
-                            api_error(
-                                "MODEL_LIST_TOO_LARGE",
-                                "模型目录响应超过 2 MiB",
-                                502,
-                            )
-                    payload = json.loads(body)
-        data = (
-            payload.get("data", payload.get("models", []))
-            if isinstance(payload, dict)
-            else []
-        )
+            data = await adapter.discover_models(
+                base_url=base_url,
+                api_key=key or "",
+                auth_mode=auth_mode,
+                allow_private_http=allow_private_http,
+            )
         if not isinstance(data, list):
             api_error("INVALID_MODEL_LIST", "Provider 返回的模型目录格式无效", 502)
         with session_scope() as db:
@@ -1159,6 +1146,12 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
         return {"provider_id": provider_id_snapshot, "items": candidates}
     except ConfigurationError as exc:
         handle_configuration_error(exc)
+    except ProviderError as exc:
+        api_error(
+            exc.code,
+            str(exc),
+            502 if exc.status is None else (422 if exc.status < 500 else 502),
+        )
     except HTTPException:
         raise
     except (TimeoutError, httpx.TimeoutException) as exc:
@@ -1194,7 +1187,7 @@ async def test_model(model_id: str):
             handle_configuration_error(exc)
         if not owner.enabled or not endpoint.enabled or not model.enabled:
             api_error("MODEL_NOT_READY", "Provider 或模型已停用")
-        if config["auth_mode"] == "bearer":
+        if config["auth_mode"] != "none":
             try:
                 if not config.get("credential_ref") or not read_secret(
                     config["credential_ref"]
@@ -1370,7 +1363,9 @@ def list_calls(
                     "error_code": row.error_code,
                     "error": row.error,
                     "queue_duration_ms": row.queue_duration_ms,
-                    "admitted_at": row.admitted_at.isoformat() if row.admitted_at else None,
+                    "admitted_at": (
+                        row.admitted_at.isoformat() if row.admitted_at else None
+                    ),
                     "time_to_first_token_ms": row.time_to_first_token_ms,
                     "total_duration_ms": row.total_duration_ms,
                     "started_at": row.started_at.isoformat(),

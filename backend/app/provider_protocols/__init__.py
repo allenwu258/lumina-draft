@@ -8,12 +8,14 @@ need to know how a provider transports messages or streams events.
 from .base import ProviderAdapter, ProviderError, ProviderEvent, ProviderRequest
 from .openai_chat_completions import OpenAIChatCompletionsAdapter
 from .openai_responses import OpenAIResponsesAdapter
+from .gemini_generate_content import GeminiGenerateContentAdapter
 from .registry import ProviderProtocolRegistry
 
 
 PROTOCOL_REGISTRY = ProviderProtocolRegistry()
 PROTOCOL_REGISTRY.register(OpenAIResponsesAdapter())
 PROTOCOL_REGISTRY.register(OpenAIChatCompletionsAdapter())
+PROTOCOL_REGISTRY.register(GeminiGenerateContentAdapter())
 
 
 def get_protocol_adapter(protocol: str) -> ProviderAdapter:
@@ -31,6 +33,7 @@ def supports_protocol(protocol: str) -> bool:
 __all__ = [
     "OpenAIResponsesAdapter",
     "OpenAIChatCompletionsAdapter",
+    "GeminiGenerateContentAdapter",
     "PROTOCOL_REGISTRY",
     "ProviderAdapter",
     "ProviderError",

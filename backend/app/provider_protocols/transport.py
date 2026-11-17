@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
+import asyncio
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
+
+import httpx
 
 from .base import ProviderError
 
 
 MAX_EVENT_BYTES = 512 * 1024
+MAX_MODEL_LIST_BYTES = 2 * 1024 * 1024
 PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in (
@@ -110,3 +115,58 @@ async def bounded_lines(response: Any) -> AsyncIterator[str]:
         yield bytes(pending).rstrip(b"\r").decode("utf-8")
     # Dispatch a final event even when the server omits the trailing blank line.
     yield ""
+
+
+async def fetch_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    base_url: str,
+    allow_private_http: bool = False,
+) -> Any:
+    """Fetch a bounded JSON document from a validated provider endpoint."""
+
+    validate_endpoint(base_url, allow_private_http=allow_private_http)
+    try:
+        timeout = httpx.Timeout(25.0, connect=10.0, read=20.0, write=10.0)
+        async with asyncio.timeout(30):
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+            ) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    if response.status_code >= 300:
+                        code = {
+                            401: "PROVIDER_UNAUTHORIZED",
+                            403: "PROVIDER_FORBIDDEN",
+                            404: "MODEL_DISCOVERY_UNSUPPORTED",
+                            429: "PROVIDER_RATE_LIMITED",
+                        }.get(response.status_code, "MODEL_DISCOVERY_FAILED")
+                        message = {
+                            401: "API 凭证无效",
+                            403: "API 凭证没有读取模型目录的权限",
+                            404: "Provider 未提供模型目录接口",
+                            429: "Provider 限流或额度不足",
+                        }.get(response.status_code, "Provider 未能返回模型目录")
+                        raise ProviderError(code, message, response.status_code)
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_MODEL_LIST_BYTES:
+                            raise ProviderError(
+                                "MODEL_LIST_TOO_LARGE", "模型目录响应超过 2 MiB"
+                            )
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ProviderError(
+                "INVALID_MODEL_LIST", "Provider 返回的模型目录格式无效"
+            ) from exc
+    except ProviderError:
+        raise
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise ProviderError("MODEL_DISCOVERY_TIMEOUT", "获取模型目录超时") from exc
+    except httpx.RequestError as exc:
+        raise ProviderError(
+            "MODEL_DISCOVERY_CONNECTION_FAILED", "无法连接 Provider"
+        ) from exc

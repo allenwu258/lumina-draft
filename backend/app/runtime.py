@@ -258,15 +258,15 @@ class ProviderGateway:
                         current_owner.enabled, current_endpoint.enabled, current_model.enabled, current_binding.enabled,
                     )) or current_owner.archived_at or current_model.archived_at:
                         raise ProviderError("CONFIG_NOT_READY", "Provider 或模型已停用")
-                    if auth_mode == "bearer":
+                    if auth_mode != "none":
                         credential = db.get(ApiCredential, credential_id) if credential_id else None
                         if not credential or credential.status not in {"active", "retired"}:
                             raise ProviderError("CREDENTIAL_REVOKED", "该作品使用的 API 凭据已撤销")
                 try:
-                    key = read_secret(credential_ref) if auth_mode == "bearer" else ""
+                    key = read_secret(credential_ref) if auth_mode != "none" else ""
                 except Exception as exc:
                     raise ProviderError("CREDENTIAL_STORE_UNAVAILABLE", "系统凭据存储暂不可用") from exc
-                if auth_mode == "bearer" and not key:
+                if auth_mode != "none" and not key:
                     raise ProviderError("CREDENTIAL_NOT_CONFIGURED", "请先配置 API 凭据")
                 with session_scope() as db:
                     call = db.get(LlmCall, call_id)

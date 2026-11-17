@@ -65,11 +65,19 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
     };
   }, []);
 
+  const selectedProtocol = protocols.find((item) => item.code === fields.protocol);
   const protocolLabel =
-    protocols.find((item) => item.code === fields.protocol)?.label ??
+    selectedProtocol?.label ??
     (fields.protocol === 'openai_chat_completions'
       ? 'OpenAI Chat Completions'
-      : 'OpenAI Responses');
+      : fields.protocol === 'gemini_generate_content'
+        ? 'Google Gemini API · Generate Content'
+        : 'OpenAI Responses');
+  const authLabel: Record<ProviderFields['auth_mode'], string> = {
+    bearer: 'Bearer API Key',
+    none: '无认证',
+    api_key_header: 'Google API Key Header',
+  };
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -80,7 +88,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
       saved = provider
         ? await providerApi.update(provider.id, fields, provider.revision)
         : await providerApi.create(fields, keyInput.current?.value.trim());
-      if (provider && fields.auth_mode === 'bearer' && keyInput.current?.value.trim())
+      if (provider && fields.auth_mode !== 'none' && keyInput.current?.value.trim())
         await providerApi.credential(saved.id, keyInput.current.value.trim(), saved.revision);
       setFields(fieldsOf(saved));
       await onSaved(saved.id);
@@ -181,9 +189,15 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                 aria-label="API 协议"
                 value={fields.protocol}
                 disabled={!protocols.length || !!provider}
-                onChange={(event) =>
-                  update('protocol', event.target.value as ProviderFields['protocol'])
-                }
+                onChange={(event) => {
+                  const protocol = event.target.value as ProviderFields['protocol'];
+                  const descriptor = protocols.find((item) => item.code === protocol);
+                  update('protocol', protocol);
+                  if (descriptor) {
+                    update('auth_mode', descriptor.default_auth_mode);
+                    if (descriptor.default_base_url) update('base_url', descriptor.default_base_url);
+                  }
+                }}
               >
                 {!protocols.length && <option value={fields.protocol}>正在加载协议…</option>}
                 {protocols.map((item) => (
@@ -204,12 +218,16 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
               maxLength={500}
               value={fields.base_url}
               onChange={(event) => update('base_url', event.target.value)}
-              placeholder="https://api.example.com/v1"
+              placeholder={selectedProtocol?.default_base_url || 'https://api.example.com/v1'}
             />
             <small>
               填写 API 根地址，系统会按协议追加{' '}
-              {fields.protocol === 'openai_chat_completions' ? '/chat/completions' : '/responses'}{' '}
-              或 /models。
+              {fields.protocol === 'openai_chat_completions'
+                ? '/chat/completions'
+                : fields.protocol === 'gemini_generate_content'
+                  ? '/models/{model}:streamGenerateContent'
+                  : '/responses'}{' '}
+              {fields.protocol === 'gemini_generate_content' ? '及 /models。' : '或 /models。'}
             </small>
           </label>
           <div className="settings-fields">
@@ -223,14 +241,17 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                   if (keyInput.current) keyInput.current.value = '';
                 }}
               >
-                <option value="bearer">Bearer API Key</option>
-                <option value="none">无认证</option>
+                {(selectedProtocol?.auth_modes || ['bearer', 'none']).map((mode) => (
+                  <option key={mode} value={mode}>
+                    {authLabel[mode]}
+                  </option>
+                ))}
               </select>
             </label>
           </div>
-          {fields.auth_mode === 'bearer' && (
+          {fields.auth_mode !== 'none' && (
             <label>
-              API Key{' '}
+              {fields.auth_mode === 'api_key_header' ? 'Google API Key ' : 'API Key '}
               <span className="credential-state">
                 {provider?.credential_configured
                   ? '已配置 · 版本 ' + provider.credential_version
@@ -368,7 +389,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                               dirty ||
                               !provider.enabled ||
                               !model.enabled ||
-                              (provider.auth_mode === 'bearer' && !provider.credential_configured)
+                              (provider.auth_mode !== 'none' && !provider.credential_configured)
                             }
                             onClick={() => void test(model)}
                           >
