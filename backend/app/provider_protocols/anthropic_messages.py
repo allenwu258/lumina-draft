@@ -23,7 +23,7 @@ class AnthropicMessagesAdapter(ProviderAdapter):
     protocol = "anthropic_messages"
     label = "Anthropic Claude · Messages API"
     auth_modes = ("bearer", "api_key_header")
-    default_auth_mode = "bearer"
+    default_auth_mode = "api_key_header"
     default_base_url = "https://api.anthropic.com/v1"
 
     @staticmethod

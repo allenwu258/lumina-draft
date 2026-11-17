@@ -21,6 +21,7 @@ def request(**overrides):
         "model": "claude-sonnet-4-5",
         "instructions": "system instructions",
         "prompt": "user prompt",
+        "auth_mode": AnthropicMessagesAdapter.default_auth_mode,
     }
     values.update(overrides)
     return ProviderRequest(**values)
@@ -140,6 +141,9 @@ async def test_messages_api_builds_request_and_normalizes_stream(
     assert sent.headers[expected_header] == (
         "Bearer secret" if auth_mode == "bearer" else "secret"
     )
+    assert (
+        "x-api-key" if auth_mode == "bearer" else "authorization"
+    ) not in sent.headers
     assert sent.headers["anthropic-version"] == ANTHROPIC_VERSION
     assert body["model"] == "claude-sonnet-4-5"
     assert body["max_tokens"] == 12000
@@ -208,7 +212,8 @@ async def test_messages_api_respects_optional_output_limits_and_omits_empty_syst
     else:
         assert body["max_tokens"] == expected_limit
     assert "system" not in body
-    assert requests[0].headers["authorization"] == "Bearer secret"
+    assert requests[0].headers["x-api-key"] == "secret"
+    assert "authorization" not in requests[0].headers
     assert result[-1].kind == "completed"
 
 

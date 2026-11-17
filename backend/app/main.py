@@ -230,7 +230,11 @@ def update_provider(body: ProviderUpdate):
         provider_fields = ProviderPatch(
             expected_revision=revision, name=body.name, protocol=endpoint.protocol,
             base_url=body.base_url,
-            auth_mode=(get_protocol_adapter(endpoint.protocol).default_auth_mode if body.api_key else endpoint.auth_mode),
+            auth_mode=(
+                get_protocol_adapter(endpoint.protocol).default_auth_mode
+                if body.api_key and endpoint.auth_mode == "none"
+                else endpoint.auth_mode
+            ),
             allow_private_http=endpoint.allow_private_http,
             enabled=body.enabled,
         )

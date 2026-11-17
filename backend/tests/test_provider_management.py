@@ -388,14 +388,14 @@ def test_gemini_protocol_defaults_to_header_auth_and_model_specific_tiers(
     assert wrong_auth.status_code == 422
 
 
-def test_anthropic_protocol_defaults_to_bearer_and_messages_api(managed_client):
+def test_anthropic_protocol_defaults_to_header_auth_and_messages_api(managed_client):
     client = managed_client
     protocols = {
         item["code"]: item for item in client.get(PREFIX + "/protocols").json()["items"]
     }
     descriptor = protocols["anthropic_messages"]
     assert descriptor["auth_modes"] == ["bearer", "api_key_header"]
-    assert descriptor["default_auth_mode"] == "bearer"
+    assert descriptor["default_auth_mode"] == "api_key_header"
     assert descriptor["default_base_url"] == "https://api.anthropic.com/v1"
 
     created = client.post(
@@ -407,7 +407,7 @@ def test_anthropic_protocol_defaults_to_bearer_and_messages_api(managed_client):
         },
     )
     assert created.status_code == 201, created.text
-    assert created.json()["auth_mode"] == "bearer"
+    assert created.json()["auth_mode"] == "api_key_header"
 
     capabilities = {
         "effort": {
@@ -443,6 +443,86 @@ def test_anthropic_protocol_defaults_to_bearer_and_messages_api(managed_client):
     assert [
         tier["code"] for tier in empty_capability_model.json()["reasoning_tiers"]
     ] == ["off"]
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "expected_mode", "expected_header"),
+    [(None, "api_key_header", "x-api-key"), ("bearer", "bearer", "authorization")],
+)
+def test_anthropic_creation_auth_is_used_for_model_discovery(
+    managed_client, monkeypatch, auth_mode, expected_mode, expected_header
+):
+    client = managed_client
+    body = {
+        "name": "Anthropic Auth",
+        "protocol": "anthropic_messages",
+        "base_url": "https://api.anthropic.com/v1",
+        "api_key": "test-api-key",
+    }
+    if auth_mode is not None:
+        body["auth_mode"] = auth_mode
+    response = client.post(PREFIX + "/providers", json=body)
+    assert response.status_code == 201, response.text
+    provider = response.json()
+    assert provider["auth_mode"] == expected_mode
+    assert provider["credential_configured"]
+
+    requests = []
+    client_type = httpx.AsyncClient
+
+    def respond(http_request):
+        requests.append(http_request)
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    monkeypatch.setattr(
+        "backend.app.provider_protocols.anthropic_messages.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    discovered = client.post(
+        PREFIX
+        + f"/providers/{provider['id']}/discover-models?expected_revision={provider['revision']}"
+    )
+    assert discovered.status_code == 200, discovered.text
+    assert len(requests) == 1
+    assert requests[0].headers[expected_header] == (
+        "Bearer test-api-key" if expected_mode == "bearer" else "test-api-key"
+    )
+    other_header = "x-api-key" if expected_mode == "bearer" else "authorization"
+    assert other_header not in requests[0].headers
+
+
+@pytest.mark.parametrize("auth_mode", ["bearer", "api_key_header"])
+def test_legacy_anthropic_credential_rotation_preserves_auth_mode(
+    managed_client, auth_mode
+):
+    client = managed_client
+    provider = create_provider(
+        client,
+        protocol="anthropic_messages",
+        auth_mode=auth_mode,
+        api_key="original-key",
+    )
+    model = create_model(client, provider, remote="claude-test")
+    with session_scope() as db:
+        db.add(
+            BusinessRoute(code="default", model_id=model["id"], reasoning_tier="off")
+        )
+
+    response = client.put(
+        "/api/v1/settings/llm/default",
+        json={
+            "name": "Updated Anthropic Provider",
+            "base_url": provider["base_url"],
+            "model": model["remote_model_id"],
+            "api_key": "rotated-key",
+            "enabled": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    updated = client.get(PREFIX + f"/providers/{provider['id']}").json()
+    assert updated["auth_mode"] == auth_mode
+    assert updated["credential_version"] == 2
+    assert updated["credential_configured"]
 
 
 def test_legacy_default_provider_update_preserves_chat_protocol(managed_client):
