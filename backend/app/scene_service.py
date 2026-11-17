@@ -20,7 +20,9 @@ from sqlalchemy import select
 
 from .db import PageTask, PageScene, Presentation, SceneConversionJob, loads, utcnow
 from .schemas import DesignCanvas
-from .tailwind_profile import TAILWIND_PROFILE, compiled_tailwind_css
+# Keep the legacy symbol available for integrations/tests that patch the
+# frozen profile loader while routing new pages through css_for_html().
+from .tailwind_profile import compiled_tailwind_css, css_for_html
 from .workflows import DESIGN, PPT, WORKFLOWS, PPT_CANVAS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -239,7 +241,8 @@ def summary(db, page: PageTask) -> dict:
 
 
 def ensure_page_scene(
-    db, page: PageTask, expected_source_hash: str, *, retry=False
+    db, page: PageTask, expected_source_hash: str, *, retry=False,
+    frozen_css: str | None = None,
 ) -> dict:
     """Shared preview/export/generation entry; caller owns the write transaction."""
     actual = source_hash(db, page)
@@ -293,7 +296,7 @@ def ensure_page_scene(
                 page.run_id,
             )
             return summary(db, page)
-    enqueue_tx(db, page, retry=retry)
+    enqueue_tx(db, page, retry=retry, frozen_css=frozen_css)
     return summary(db, page)
 
 
@@ -321,12 +324,10 @@ def enqueue_tx(
     elif prior and prior.page_task_id == page.id and prior.html_hash == page.html_hash:
         css = prior.css
     else:
-        root = BeautifulSoup(page.html, "html.parser").find(id="ppt-page")
-        css = (
-            compiled_tailwind_css()
-            if root and root.get("data-css-profile") == TAILWIND_PROFILE
-            else ""
-        )
+        # The Composer is intentionally allowed to emit arbitrary valid
+        # Tailwind utilities. Compile candidates for this exact page instead
+        # of selecting a finite profile stylesheet by class membership.
+        css = css_for_html(page.html)
     css_hash = digest(css)
     converter, canvas = page_target(db, page)
     environment = environment_key() if converter == CONVERTER_VERSION else environment_key(canvas)

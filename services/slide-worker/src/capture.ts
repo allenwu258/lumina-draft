@@ -27,20 +27,12 @@ export const canonical = (v: unknown): string =>
         )
       : value,
   );
-const PAGE_RASTER_FALLBACK_CODES = new Set([
-  "CSS_EFFECT_OMITTED",
-  "CSS_TRANSFORM_OMITTED",
-  "CSS_LIST_MARKER_OMITTED",
-  "CSS_PSEUDO_CONTENT_OMITTED",
-  "CSS_TEXT_STYLE_OMITTED",
-  "CSS_TEXT_TRANSFORM_OMITTED",
-  "CSS_BORDER_STYLE_APPROXIMATED",
-  "CSS_PER_SIDE_DASHED_BORDER_APPROXIMATED",
-  "CSS_ELLIPTICAL_RADIUS_APPROXIMATED",
-  "CSS_INSET_SHADOW_OMITTED",
-  "CSS_SHADOW_OMITTED",
-  "SVG_EFFECT_OMITTED",
-]);
+// Unsupported effects are reported by extractDOM and retained as native
+// content wherever possible. The converter no longer turns a whole page into
+// a bitmap merely because one local effect, transform or border is approximate.
+// A page raster remains an explicit last-resort path for future capabilities,
+// but no current diagnostic opts into it automatically.
+const PAGE_RASTER_FALLBACK_CODES = new Set<string>();
 export async function convert(
   input: {
     html: string;

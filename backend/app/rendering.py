@@ -15,6 +15,37 @@ def html_hash(html: str) -> str:
     return hashlib.sha256(html.encode("utf-8")).hexdigest()
 
 
+def normalize_html(html: str) -> tuple[str, list[str]]:
+    """Apply only deterministic, safe repairs before HTML admission.
+
+    This is intentionally narrower than a general HTML sanitizer. It keeps the
+    original content when possible, removes only the exact Tailwind CDN loader
+    that the platform replaces locally, and adds an empty head when the model
+    omitted that structural container. Unknown scripts/resources remain a hard
+    failure and are never silently deleted.
+    """
+    if not html or len(html.encode("utf-8")) > MAX_HTML_BYTES:
+        return html, []
+    soup = BeautifulSoup(html, "html.parser")
+    actions: list[str] = []
+    scripts = list(soup.find_all("script"))
+    for script in scripts:
+        attrs = {str(key).lower(): value for key, value in script.attrs.items()}
+        source = str(attrs.get("src", "")).strip()
+        if (
+            source == "https://cdn.tailwindcss.com"
+            and set(attrs) == {"src"}
+            and not script.get_text(strip=True)
+        ):
+            script.decompose()
+            actions.append("KNOWN_TAILWIND_CDN_REMOVED_OFFLINE")
+    if soup.find("html") and soup.find("body") and not soup.find("head"):
+        head = soup.new_tag("head")
+        soup.html.insert(0, head)
+        actions.append("MISSING_EMPTY_HEAD_ADDED")
+    return (str(soup) if actions else html), actions
+
+
 def validate_html(
     html: str, *, canvas: tuple[int, int] = PPT_CANVAS, require_profile: bool = False
 ) -> tuple[bool, str]:
@@ -32,9 +63,10 @@ def validate_html(
     profile = root.get("data-css-profile")
     if require_profile and (profile != TAILWIND_PROFILE or root.name != "main" or root.parent != soup.body):
         return False, "设计页面必须使用受控 CSS profile，并以 main#ppt-page 作为主画布"
-    if profile and profile != TAILWIND_PROFILE:
-        return False, "不支持的页面 CSS profile"
-    if profile == TAILWIND_PROFILE:
+    # PPT Composer pages are intentionally not coupled to a finite class catalog.
+    # The design workflow still opts into the historical strict contract through
+    # require_profile=True; ordinary PPT pages are compiled and checked later.
+    if require_profile and profile == TAILWIND_PROFILE:
         valid, reason = validate_tailwind_page(soup, root, canvas)
         if not valid:
             return valid, reason

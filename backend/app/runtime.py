@@ -22,7 +22,7 @@ from .providers import (
     stream_responses,
 )
 from .provider_management import MODEL_LIMITER, ConfigurationError, configuration_hash, resolve_business_route, resolve_model_config
-from .rendering import html_hash, validate_html
+from .rendering import html_hash, normalize_html, validate_html
 from .schemas import OutlineDocument
 from .secrets import read_secret
 from .workflows import DESIGN, PPT, WORKFLOWS, WorkflowSpec, scheduled_model_id
@@ -650,7 +650,7 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
                 number = task.page_number
             await emit_event(presentation_id, "page.queued", {"page_task_id": task_id, "page_number": number, "queue_reason": "MODEL_CAPACITY"}, run_id)
             result = await run_graph(PAGE_GRAPHS[workflow.code], {"task_id": task_id, "run_id": run_id, "error": reason})
-            html = result["result"]
+            html, normalizations = normalize_html(result["result"])
             valid, reason = validate_html(html, canvas=canvas, require_profile=workflow == DESIGN)
             if valid:
                 break
@@ -659,15 +659,28 @@ async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
         if not valid:
             raise ProviderError("INVALID_HTML", reason)
         digest = html_hash(html)
+        # Record deterministic best-effort repairs separately from model output
+        # so callers can explain why the persisted source differs from the raw
+        # response without treating the repair as a model retry.
         from .scene_service import ensure_page_scene, WAKE
+        from .tailwind_profile import css_for_html
+        css = css_for_html(html)
         async with EVENT_WRITE_LOCK:
             with session_scope() as db:
                 task, run = db.get(PageTask, task_id), db.get(Run, run_id)
                 if not task or task.run_id != run_id or not run or run.status != "RUNNING":
                     raise asyncio.CancelledError()
                 task.status, task.html, task.html_hash, task.error, task.error_code = "SUCCEEDED", html, digest, None, None
-                append_event_tx(db, presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED"}, run_id)
-                ensure_page_scene(db, task, task.html_hash, retry=True)
+                if normalizations:
+                    append_event_tx(
+                        db,
+                        presentation_id,
+                        "page.normalized",
+                        {"page_task_id": task_id, "page_number": number, "actions": normalizations},
+                        run_id,
+                    )
+                append_event_tx(db, presentation_id, "page.completed", {"page_task_id": task_id, "page_number": number, "html_hash": digest, "status": "SUCCEEDED", "normalizations": normalizations}, run_id)
+                ensure_page_scene(db, task, task.html_hash, retry=True, frozen_css=css)
         WAKE.set()
         await EVENT_BUS.notify(presentation_id)
     except asyncio.CancelledError:

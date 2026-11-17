@@ -353,60 +353,13 @@ test("unsupported visual effects are bounded best-effort diagnostics", async () 
       (d) => d.code === "CSS_EFFECT_OMITTED" && d.details.properties === "filter",
     ),
   );
-  assert.ok(
-    scene.nodes.some((n) => n.kind === "image" && n.frame.width === 800 && n.frame.height === 450),
-    "visual degradation is preserved as a page-sized source raster",
-  );
-  const fallback = scene.diagnostics.find((d) => d.code === "FULL_PAGE_RASTER_FALLBACK");
-  assert.equal(fallback?.details.strategy, "full-page-raster");
-  assert.equal(fallback?.details.editability, "page-image");
   const rasterText = scene.textInventory.find((item) => item.sourceText === "retained text");
-  assert.equal(rasterText?.reason, "page-raster");
-  assert.equal(rasterText?.target.kind, "asset");
-  const rasterAsset = scene.assets.find((asset) => asset.id === rasterText?.target.assetId);
-  assert.equal(rasterAsset?.mediaType, "image/png");
-  assert.deepEqual([rasterAsset?.width, rasterAsset?.height], [800, 450]);
+  assert.equal(rasterText?.reason, null);
+  assert.equal(rasterText?.target.kind, "text");
+  assert.ok(scene.nodes.some((n) => n.kind === "text" && n.text.sourceText === "retained text"));
+  assert.ok(!scene.diagnostics.some((d) => d.code === "FULL_PAGE_RASTER_FALLBACK"));
   const pptPlan = planPptxPage(scene);
-  assert.equal(pptPlan.elements.length, 1);
-  assert.equal(pptPlan.elements[0].kind, "image");
-  const pngFile = join(temp, "best-effort-effect", rasterAsset.file);
-  assert.ok((await readdir(join(temp, "best-effort-effect"))).includes(rasterAsset.file), `expected ${pngFile}`);
-  const rasterBytes = await readFile(pngFile);
-  const raster = PNG.sync.read(rasterBytes);
-  assert.deepEqual([raster.width, raster.height], [800, 450]);
-  const invalid = structuredClone(scene);
-  invalid.diagnostics = invalid.diagnostics.filter((d) => d.code !== "FULL_PAGE_RASTER_FALLBACK");
-  assert.throws(() => assertScene(invalid), /SCENE_INVENTORY_TARGET|SCENE_PAGE_RASTER_CONTRACT/);
-  const preview = await browser.newPage({ viewport: { width: 800, height: 450 } });
-  try {
-    await preview.setContent('<html><body style="margin:0"><canvas></canvas></body></html>');
-    await preview.addScriptTag({ content: bundle });
-    await preview.evaluate(async ({ scene, imageBase64 }) => {
-      const renderer = new window.SceneRenderer(document.querySelector("canvas"));
-      await renderer.load(
-        scene,
-        async (asset) => {
-          const binary = atob(imageBase64);
-          return window.decodeAsset(Uint8Array.from(binary, (char) => char.charCodeAt(0)), asset.mediaType);
-        },
-        async () => {},
-      );
-      renderer.resize(800, 450, 1);
-      renderer.render();
-    }, { scene, imageBase64: rasterBytes.toString("base64") });
-    const previewPng = PNG.sync.read(await preview.locator("canvas").screenshot());
-    assert.deepEqual(previewPng.data, raster.data, "Scene Canvas must render the page-raster asset exactly");
-  } finally {
-    await preview.close();
-  }
-  const sourcePage = await browser.newPage({ viewport: { width: 800, height: 450 } });
-  try {
-    await sourcePage.setContent(html);
-    const source = PNG.sync.read(await sourcePage.locator("#ppt-page").screenshot());
-    assert.deepEqual(raster.data, source.data, "fallback pixels must match the frozen source render");
-  } finally {
-    await sourcePage.close();
-  }
+  assert.ok(pptPlan.elements.some((element) => element.kind === "text" && element.text === "retained text"));
   assert.ok(
     (
       await convert(input(tailwind("<p>next page</p>")), {
@@ -431,9 +384,9 @@ test("list markers, pseudo content and unverified utility styles are reported", 
   assert.ok(codes.has("CSS_LIST_MARKER_OMITTED"));
   assert.ok(codes.has("CSS_PSEUDO_CONTENT_OMITTED"));
   assert.ok(codes.has("STYLE_PROFILE_UNVERIFIED"));
-  assert.ok(scene.diagnostics.some((d) => d.code === "FULL_PAGE_RASTER_FALLBACK"));
-  assert.ok(scene.textInventory.some((t) => t.sourceText === "list text remains" && t.reason === "page-raster"));
-  assert.ok(scene.textInventory.some((t) => t.sourceText === "paragraph remains" && t.reason === "page-raster"));
+  assert.ok(!scene.diagnostics.some((d) => d.code === "FULL_PAGE_RASTER_FALLBACK"));
+  assert.ok(scene.textInventory.some((t) => t.sourceText === "list text remains" && t.reason === null));
+  assert.ok(scene.textInventory.some((t) => t.sourceText === "paragraph remains" && t.reason === null));
 });
 test("unverified utility styles are diagnosed without forcing rasterization", async () => {
   const html = tailwind('<p class="text-ppt-title">Still editable</p>')

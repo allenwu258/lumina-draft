@@ -584,20 +584,31 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
           { pseudo, contentType: p.content.startsWith("url(") ? "image" : "text" },
         );
     }
-    const individualTransform =
-      s.getPropertyValue("translate") !== "none" ||
-      s.getPropertyValue("rotate") !== "none" ||
-      !["none", "1"].includes(s.getPropertyValue("scale"));
-    if (s.transform !== "none" || individualTransform) {
-      const onlyTranslation = !individualTransform && translationMatrix(s.transform);
-      if (!onlyTranslation)
-        diagnostic(
-          "CSS_TRANSFORM_OMITTED",
-          sourcePath,
-          "The transformed bounding box is retained, but rotation, scale, and other transform effects are not represented.",
-          { transform: s.transform === "none" ? "individual-transform" : s.transform },
-        );
-    }
+    // Browser geometry already includes CSS transforms. A pure translation is
+    // therefore represented by the final DOM rect and needs no Scene-level
+    // transform (Tailwind v4 commonly emits the individual `translate`
+    // property for -translate-x/-translate-y utilities). Only rotation,
+    // scale, skew, perspective, or a non-translation matrix needs a visual
+    // degradation diagnostic.
+    const translate = s.getPropertyValue("translate").trim();
+    const rotate = s.getPropertyValue("rotate").trim();
+    const scale = s.getPropertyValue("scale").trim();
+    const noRotation = rotate === "" || rotate === "none" || /^(?:0(?:deg|rad|turn)|0)$/.test(rotate);
+    const unitScale = scale === "" || scale === "none" || scale === "1" || scale === "1 1";
+    const individualOnlyTranslation =
+      noRotation && unitScale;
+    if (!translationMatrix(s.transform) || !individualOnlyTranslation)
+      diagnostic(
+        "CSS_TRANSFORM_OMITTED",
+        sourcePath,
+        "The transformed bounding box is retained, but rotation, scale, skew, perspective, and other non-translation effects are not represented.",
+        {
+          transform: s.transform,
+          translate: translate || "none",
+          rotate: rotate || "none",
+          scale: scale || "none",
+        },
+      );
     const omittedEffects: string[] = [];
     if (s.filter !== "none") omittedEffects.push("filter");
     if (s.backdropFilter !== "none") omittedEffects.push("backdrop-filter");
@@ -790,11 +801,14 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
   const utilityLike = classTokens.filter((value) =>
     /^(?:flex|grid|block|inline-flex|hidden|absolute|relative|fixed|sticky|items-|justify-|gap-|space-|p-|px-|py-|pt-|pb-|m-|mx-|my-|mt-|mb-|w-|h-|min-w-|max-w-|min-h-|max-h-|bg-|text-(?:xs|sm|base|lg|xl|[2-9]xl|left|right|center|justify)-|font-|leading-|rounded|border|shadow|opacity-|overflow-|whitespace-|z-)/.test(value),
   );
-  if (!root.hasAttribute("data-css-profile") && utilityLike.length)
+  const hasCompiledStylesheet = Boolean(
+    document.querySelector("style[data-tailwind-profile], style[data-tailwind-runtime]"),
+  );
+  if (!root.hasAttribute("data-css-profile") && utilityLike.length && !hasCompiledStylesheet)
     diagnostic(
       "STYLE_PROFILE_UNVERIFIED",
       "main",
-      "Utility-style classes are present without a frozen CSS profile marker; verify that the intended stylesheet was included in the captured HTML.",
+      "Utility-style classes are present without a compiled Tailwind stylesheet marker; verify that the intended stylesheet was included in the captured HTML.",
       { classCount: utilityLike.length, examples: [...new Set(utilityLike)].slice(0, 8).join(" ") },
     );
   await element(root, id(root, "group"));

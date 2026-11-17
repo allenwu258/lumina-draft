@@ -17,9 +17,9 @@ os.environ.pop("DS_API_KEY", None)
 
 from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
-from backend.app.rendering import validate_html  # noqa: E402
+from backend.app.rendering import normalize_html, validate_html  # noqa: E402
 from backend.app.prompts import COMPOSER_PROMPT  # noqa: E402
-from backend.app.tailwind_profile import COMPOSER_UTILITIES, TAILWIND_CLASSES, TAILWIND_PROFILE, preview_html  # noqa: E402
+from backend.app.tailwind_profile import COMPOSER_UTILITIES, TAILWIND_CLASSES, TAILWIND_PROFILE, css_for_html, preview_html  # noqa: E402
 from backend.app.db import Conversation, ConversationMessage, engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
 
 
@@ -48,37 +48,37 @@ def test_html_contract_rejects_active_content():
     assert validate_html(legacy_html()) == (True, "ok")
 
 
-def test_tailwind_profile_is_enforced_and_shared_with_composer():
+def test_html_normalization_is_bounded_and_auditable():
+    raw = '<!doctype html><html><body><script src="https://cdn.tailwindcss.com"></script><main id="ppt-page" style="width:800px;height:450px">safe</main></body></html>'
+    normalized, actions = normalize_html(raw)
+    assert actions == ["KNOWN_TAILWIND_CDN_REMOVED_OFFLINE", "MISSING_EMPTY_HEAD_ADDED"]
+    assert "cdn.tailwindcss.com" not in normalized
+    assert validate_html(normalized)[0]
+    unknown = raw.replace("https://cdn.tailwindcss.com", "https://example.com/a.js")
+    unchanged, actions = normalize_html(unknown)
+    assert actions == ["MISSING_EMPTY_HEAD_ADDED"] and unchanged != unknown
+    assert not validate_html(unchanged)[0]
+
+
+def test_composer_does_not_enforce_a_finite_tailwind_profile():
     assert validate_html(valid_html()) == (True, "ok")
-    assert TAILWIND_PROFILE in COMPOSER_PROMPT
-    assert all(token in COMPOSER_PROMPT for token in ("bg-ppt-background", "flex", "text-ppt-title"))
+    assert f'data-css-profile="{TAILWIND_PROFILE}"' not in COMPOSER_PROMPT
+    assert "class 白名单" in COMPOSER_PROMPT
     assert len(TAILWIND_CLASSES) == len(set(TAILWIND_CLASSES))
-    assert not validate_html(valid_html().replace("items-center", "items-unregistered"))[0]
-    assert not validate_html(valid_html().replace(f'data-css-profile="{TAILWIND_PROFILE}"', 'data-css-profile="unknown"'))[0]
-    assert not validate_html(valid_html().replace("class=\"flex items-center gap-4 bg-ppt-surface p-4\"", 'style="display:flex"'))[0]
+    assert validate_html(valid_html().replace("items-center", "items-unregistered"))[0]
+    assert validate_html(valid_html().replace(f'data-css-profile="{TAILWIND_PROFILE}"', 'data-css-profile="unknown"'))[0]
+    assert validate_html(valid_html().replace("class=\"flex items-center gap-4 bg-ppt-surface p-4\"", 'style="display:flex"'))[0]
     rendered = preview_html(valid_html())
     assert 'data-tailwind-profile="tailwind-ppt-v1"' in rendered
     assert ".flex{" in rendered
     assert preview_html(legacy_html()) == legacy_html()
 
 
-def test_composer_is_single_paragraph_with_an_exact_utility_catalog():
+def test_composer_is_single_paragraph_without_an_injected_utility_catalog():
     assert len(COMPOSER_PROMPT.splitlines()) == 1
     assert '\\' not in COMPOSER_PROMPT
-    assert f'data-css-profile="{TAILWIND_PROFILE}"' in COMPOSER_PROMPT
-
-    def expand(token):
-        group = re.search(r"\{([^{}]+)\}", token)
-        if group is None:
-            return [token]
-        return [
-            item for option in group[1].split(",")
-            for item in expand(token[:group.start()] + option + token[group.end():])
-        ]
-
-    expanded = [item for token in COMPOSER_UTILITIES.split() for item in expand(token)]
-    assert len(expanded) == len(set(expanded))
-    assert set(expanded) == set(TAILWIND_CLASSES)
+    assert f'data-css-profile="{TAILWIND_PROFILE}"' not in COMPOSER_PROMPT
+    assert COMPOSER_UTILITIES not in COMPOSER_PROMPT
 
 
 def test_expanded_composer_utilities_pass_the_html_contract():
@@ -89,7 +89,7 @@ def test_expanded_composer_utilities_pass_the_html_contract():
     )
     assert body in html
     assert validate_html(html) == (True, "ok")
-    assert not validate_html(html.replace("text-[30px]", "text-[301px]"))[0]
+    assert validate_html(html.replace("text-[30px]", "text-[301px]"))[0]
 
 
 @pytest.mark.parametrize("utility", [
@@ -101,15 +101,30 @@ def test_real_failed_output_utility_families_are_admitted(utility):
     assert validate_html(html) == (True, "ok")
 
 
-def test_unregistered_utility_error_names_unique_classes_and_bounds_details():
+def test_unregistered_utility_tokens_are_admitted_for_later_compiler_diagnostics():
     html = valid_html().replace("items-center", "items-center unknown-z unknown-a unknown-z")
     valid, reason = validate_html(html)
-    assert not valid
-    assert "unknown-a、unknown-z" in reason
-    assert reason.count("unknown-z") == 1
+    assert valid and reason == "ok"
     many = " ".join(f"unregistered-{n}-" + "x" * 80 for n in range(100))
     valid, reason = validate_html(valid_html().replace("items-center", many))
-    assert not valid and len(reason) < 500
+    assert valid and reason == "ok"
+
+
+def test_runtime_tailwind_compilation_handles_arbitrary_composer_utilities():
+    html = legacy_html().replace(
+        "Legacy page",
+        '<div class="grid grid-cols-[1fr_205px] bg-[#102B3D] text-[17px]">自由布局</div>',
+    )
+    css = css_for_html(html)
+    assert ".grid" in css
+    assert "grid-template-columns" in css
+    assert "#102B3D" in css
+    rendered = preview_html(html, css=css)
+    assert 'data-tailwind-profile="tailwind-ppt-v1"' in rendered
+    assert "grid-template-columns" in rendered
+    early_preview = preview_html(html)
+    assert 'data-tailwind-runtime="true"' in early_preview
+    assert "grid-template-columns" in early_preview
 
 
 def document():
