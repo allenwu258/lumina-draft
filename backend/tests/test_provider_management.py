@@ -308,6 +308,7 @@ def test_provider_protocols_are_discoverable_and_chat_completions_is_persisted(
         "openai_responses",
         "openai_chat_completions",
         "gemini_generate_content",
+        "anthropic_messages",
     }
     provider = create_provider(client, protocol="openai_chat_completions")
     assert provider["protocol"] == "openai_chat_completions"
@@ -385,6 +386,63 @@ def test_gemini_protocol_defaults_to_header_auth_and_model_specific_tiers(
         },
     )
     assert wrong_auth.status_code == 422
+
+
+def test_anthropic_protocol_defaults_to_bearer_and_messages_api(managed_client):
+    client = managed_client
+    protocols = {
+        item["code"]: item for item in client.get(PREFIX + "/protocols").json()["items"]
+    }
+    descriptor = protocols["anthropic_messages"]
+    assert descriptor["auth_modes"] == ["bearer", "api_key_header"]
+    assert descriptor["default_auth_mode"] == "bearer"
+    assert descriptor["default_base_url"] == "https://api.anthropic.com/v1"
+
+    created = client.post(
+        PREFIX + "/providers",
+        json={
+            "name": "Anthropic Provider",
+            "protocol": "anthropic_messages",
+            "base_url": descriptor["default_base_url"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["auth_mode"] == "bearer"
+
+    capabilities = {
+        "effort": {
+            "supported": True,
+            "low": {"supported": True},
+            "high": {"supported": True},
+        }
+    }
+    model_response = client.post(
+        PREFIX + f"/providers/{created.json()['id']}/models",
+        json={
+            "remote_model_id": "claude-sonnet-4-5",
+            "capabilities": capabilities,
+        },
+    )
+    assert model_response.status_code == 201, model_response.text
+    model = model_response.json()
+    assert model["capabilities"] == capabilities
+    assert model["capability_source"] == "provider_api"
+    assert [tier["code"] for tier in model["reasoning_tiers"]] == [
+        "off",
+        "low",
+        "high",
+    ]
+
+    empty_capability_model = client.post(
+        PREFIX + f"/providers/{created.json()['id']}/models",
+        json={"remote_model_id": "claude-unknown", "capabilities": {}},
+    )
+    assert empty_capability_model.status_code == 201, empty_capability_model.text
+    assert empty_capability_model.json()["capabilities"] == {}
+    assert empty_capability_model.json()["capability_source"] == "provider_api"
+    assert [
+        tier["code"] for tier in empty_capability_model.json()["reasoning_tiers"]
+    ] == ["off"]
 
 
 def test_legacy_default_provider_update_preserves_chat_protocol(managed_client):

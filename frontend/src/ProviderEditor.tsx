@@ -72,11 +72,14 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
       ? 'OpenAI Chat Completions'
       : fields.protocol === 'gemini_generate_content'
         ? 'Google Gemini API · Generate Content'
-        : 'OpenAI Responses');
+        : fields.protocol === 'anthropic_messages'
+          ? 'Anthropic Claude · Messages API'
+          : 'OpenAI Responses');
   const authLabel: Record<ProviderFields['auth_mode'], string> = {
     bearer: 'Bearer API Key',
     none: '无认证',
-    api_key_header: 'Google API Key Header',
+    api_key_header:
+      fields.protocol === 'anthropic_messages' ? 'x-api-key Header' : 'Google API Key Header',
   };
 
   async function save(event: FormEvent) {
@@ -167,7 +170,7 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
         <header>
           <div>
             <h2>{provider?.name || '添加 Provider'}</h2>
-            <p>{provider ? '编辑 Provider 连接与认证信息' : '创建一个 OpenAI API 协议连接'}</p>
+            <p>{provider ? '编辑 Provider 连接与认证信息' : '创建一个模型 Provider 连接'}</p>
           </div>
           <span className="settings-badge">{protocolLabel}</span>
         </header>
@@ -226,8 +229,12 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
                 ? '/chat/completions'
                 : fields.protocol === 'gemini_generate_content'
                   ? '/models/{model}:streamGenerateContent'
-                  : '/responses'}{' '}
-              {fields.protocol === 'gemini_generate_content' ? '及 /models。' : '或 /models。'}
+                  : fields.protocol === 'anthropic_messages'
+                    ? '/messages'
+                    : '/responses'}{' '}
+              {fields.protocol === 'gemini_generate_content' || fields.protocol === 'anthropic_messages'
+                ? '及 /models。'
+                : '或 /models。'}
             </small>
           </label>
           <div className="settings-fields">
@@ -251,7 +258,11 @@ export function ProviderEditor({ provider, onSaved, onArchived, refresh }: Props
           </div>
           {fields.auth_mode !== 'none' && (
             <label>
-              {fields.auth_mode === 'api_key_header' ? 'Google API Key ' : 'API Key '}
+              {fields.auth_mode === 'api_key_header'
+                ? fields.protocol === 'anthropic_messages'
+                  ? 'Anthropic API Key '
+                  : 'Google API Key '
+                : 'API Key '}
               <span className="credential-state">
                 {provider?.credential_configured
                   ? '已配置 · 版本 ' + provider.credential_version
@@ -545,6 +556,7 @@ function DiscoveryDialog({
             context_window_tokens: item.context_window_tokens,
             max_output_tokens: item.max_output_tokens,
             model_concurrency: item.model_concurrency,
+            ...(item.capabilities ? { capabilities: item.capabilities } : {}),
           },
           item.metadata_source,
         );

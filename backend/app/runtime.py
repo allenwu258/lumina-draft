@@ -293,6 +293,7 @@ class ProviderGateway:
                     json_schema=schema,
                     reasoning_effort=config.get("reasoning_effort"),
                     max_output_tokens=max_output_tokens,
+                    model_max_output_tokens=config.get("max_output_tokens"),
                     auth_mode=auth_mode,
                     allow_private_http=allow_private_http,
                     structured_output_mode=config.get(

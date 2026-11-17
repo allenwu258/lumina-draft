@@ -6,6 +6,7 @@ need to know how a provider transports messages or streams events.
 """
 
 from .base import ProviderAdapter, ProviderError, ProviderEvent, ProviderRequest
+from .anthropic_messages import AnthropicMessagesAdapter
 from .openai_chat_completions import OpenAIChatCompletionsAdapter
 from .openai_responses import OpenAIResponsesAdapter
 from .gemini_generate_content import GeminiGenerateContentAdapter
@@ -16,6 +17,7 @@ PROTOCOL_REGISTRY = ProviderProtocolRegistry()
 PROTOCOL_REGISTRY.register(OpenAIResponsesAdapter())
 PROTOCOL_REGISTRY.register(OpenAIChatCompletionsAdapter())
 PROTOCOL_REGISTRY.register(GeminiGenerateContentAdapter())
+PROTOCOL_REGISTRY.register(AnthropicMessagesAdapter())
 
 
 def get_protocol_adapter(protocol: str) -> ProviderAdapter:
@@ -34,6 +36,7 @@ __all__ = [
     "OpenAIResponsesAdapter",
     "OpenAIChatCompletionsAdapter",
     "GeminiGenerateContentAdapter",
+    "AnthropicMessagesAdapter",
     "PROTOCOL_REGISTRY",
     "ProviderAdapter",
     "ProviderError",

@@ -47,11 +47,11 @@ def validate_endpoint(base_url: str, allow_private_http: bool = False) -> str:
     ):
         raise ProviderError("INVALID_ENDPOINT", "接入地址格式无效")
     if parts.path.rstrip("/").endswith(
-        ("/responses", "/chat/completions", "/models")
+        ("/responses", "/chat/completions", "/messages", "/models")
     ):
         raise ProviderError(
             "INVALID_ENDPOINT",
-            "请填写 API 根地址，不包含 /responses、/chat/completions 或 /models",
+            "请填写 API 根地址，不包含 /responses、/chat/completions、/messages 或 /models",
         )
     if parts.scheme == "https":
         pass

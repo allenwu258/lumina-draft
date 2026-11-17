@@ -40,6 +40,9 @@ class ProviderRequest:
     json_schema: dict[str, Any] | None = None
     reasoning_effort: str | None = None
     max_output_tokens: int | None = None
+    # Model metadata ceiling is separate from an explicit per-call generation
+    # budget. Protocols that require a token limit can apply both ceilings.
+    model_max_output_tokens: int | None = None
     auth_mode: str = "bearer"
     allow_private_http: bool = False
     structured_output_mode: str = "native_json_schema"
@@ -69,6 +72,11 @@ class ProviderRequest:
                 if self.max_output_tokens is not None
                 else {}
             ),
+            **(
+                {"model_max_output_tokens": self.model_max_output_tokens}
+                if self.model_max_output_tokens is not None
+                else {}
+            ),
         }
 
 
@@ -81,11 +89,18 @@ class ProviderAdapter(ABC):
     default_auth_mode: ClassVar[str] = "bearer"
     default_base_url: ClassVar[str | None] = None
 
-    def default_reasoning_tiers(self, model_id: str) -> list[dict[str, Any]]:
+    def default_reasoning_tiers(
+        self, model_id: str, capabilities: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         return [
             {"code": "off", "label": "Off", "api_value": None, "sort_order": 0},
             {"code": "low", "label": "Low", "api_value": "low", "sort_order": 1},
-            {"code": "medium", "label": "Medium", "api_value": "medium", "sort_order": 2},
+            {
+                "code": "medium",
+                "label": "Medium",
+                "api_value": "medium",
+                "sort_order": 2,
+            },
             {"code": "high", "label": "High", "api_value": "high", "sort_order": 3},
         ]
 

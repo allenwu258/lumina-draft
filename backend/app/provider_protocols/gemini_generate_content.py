@@ -427,7 +427,9 @@ class GeminiGenerateContentAdapter(ProviderAdapter):
             )
         return results
 
-    def default_reasoning_tiers(self, model_id: str) -> list[dict[str, Any]]:
+    def default_reasoning_tiers(
+        self, model_id: str, capabilities: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         model = model_id.lower()
         if model.startswith("models/"):
             model = model[len("models/") :]

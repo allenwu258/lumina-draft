@@ -5,7 +5,7 @@ import json
 import re
 import time
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -156,6 +156,7 @@ class ModelCreate(BaseModel):
     display_name: str | None = Field(default=None, max_length=200)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
+    capabilities: dict[str, Any] | None = None
     model_concurrency: int = Field(default=1, ge=1, le=32)
     metadata_source: Literal["provider_api", "catalog", "manual", "unknown"] = "manual"
 
@@ -171,6 +172,11 @@ class ModelCreate(BaseModel):
     def require_remote_id(self):
         if not self.remote_model_id.strip():
             raise ValueError("Model ID 不能为空")
+        if (
+            self.capabilities is not None
+            and len(json.dumps(self.capabilities, ensure_ascii=False)) > 65536
+        ):
+            raise ValueError("模型能力信息超过允许大小")
         return self
 
 
@@ -732,9 +738,17 @@ def create_model(provider_id: str, body: ModelCreate):
             max_output_tokens=body.max_output_tokens,
             max_concurrency=body.model_concurrency,
             capabilities_json=dumps(
-                {"text_input": True, "multimodal_input": True, "tool_calling": True}
+                body.capabilities
+                if body.capabilities is not None
+                else {
+                    "text_input": True,
+                    "multimodal_input": True,
+                    "tool_calling": True,
+                }
             ),
-            capability_source="assumed",
+            capability_source=(
+                "provider_api" if body.capabilities is not None else "assumed"
+            ),
             metadata_source=body.metadata_source,
         )
         db.add(model)
@@ -747,7 +761,7 @@ def create_model(provider_id: str, body: ModelCreate):
         )
         db.add(binding)
         tiers = get_protocol_adapter(endpoint.protocol).default_reasoning_tiers(
-            body.remote_model_id
+            body.remote_model_id, body.capabilities
         )
         for order, tier in enumerate(tiers):
             db.add(
@@ -1125,6 +1139,7 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
             seen.add(item["id"].strip())
             context = item.get("context_length", item.get("context_window_tokens"))
             output = item.get("max_output_tokens")
+            capabilities = item.get("capabilities")
             candidates.append(
                 {
                     "remote_model_id": item["id"].strip(),
@@ -1137,8 +1152,15 @@ async def discover_models(provider_id: str, expected_revision: int = Query(ge=1)
                         output if type(output) is int and output > 0 else None
                     ),
                     "model_concurrency": 1,
+                    **(
+                        {"capabilities": capabilities}
+                        if isinstance(capabilities, dict)
+                        else {}
+                    ),
                     "metadata_source": (
-                        "provider_api" if context or output else "unknown"
+                        "provider_api"
+                        if context or output or isinstance(capabilities, dict)
+                        else "unknown"
                     ),
                     "already_added": item["id"].strip() in existing,
                 }

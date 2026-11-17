@@ -197,7 +197,7 @@ export function ModelEditor({ providerId, model: initialModel, onClose, onSaved 
             <small>
               {model
                 ? '元数据来源：' + model.metadata_source + ' · revision ' + model.revision
-                : '创建后默认提供 Off / Low / Medium / High'}
+                : '创建后根据 Provider 返回的模型能力配置思考档位；能力未知时仅提供 Off。'}
             </small>
             <button className="primary-button" type="submit">
               {busy === 'model' ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}

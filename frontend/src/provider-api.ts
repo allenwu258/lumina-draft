@@ -30,6 +30,7 @@ export type ProviderModel = {
   enabled: boolean;
   revision: number;
   metadata_source: string;
+  capabilities?: Record<string, unknown>;
   capability_source: string;
   reasoning_tiers: ReasoningTier[];
   last_test: ModelTest | null;
@@ -37,7 +38,8 @@ export type ProviderModel = {
 export type ProviderProtocol =
   | 'openai_responses'
   | 'openai_chat_completions'
-  | 'gemini_generate_content';
+  | 'gemini_generate_content'
+  | 'anthropic_messages';
 export type ProviderAuthMode = 'bearer' | 'none' | 'api_key_header';
 export type ProviderProtocolDescriptor = {
   code: ProviderProtocol;
@@ -73,7 +75,11 @@ export type ModelFields = Pick<
   | 'max_output_tokens'
   | 'model_concurrency'
 >;
-export type ModelCandidate = ModelFields & { metadata_source: string; already_added: boolean };
+export type ModelCandidate = ModelFields & {
+  metadata_source: string;
+  already_added: boolean;
+  capabilities?: Record<string, unknown>;
+};
 export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html' | 'design_outline' | 'design_html';
 export type ResolvedRoute = {
   provider_id: string;
@@ -171,7 +177,11 @@ export const providerApi = {
       `/providers/${id}/discover-models?expected_revision=${revision}`,
       'POST',
     ),
-  addModel: (id: string, fields: ModelFields, source = 'manual') =>
+  addModel: (
+    id: string,
+    fields: ModelFields & { capabilities?: Record<string, unknown> },
+    source = 'manual',
+  ) =>
     send<ProviderModel>(`/providers/${id}/models`, 'POST', { ...fields, metadata_source: source }),
   updateModel: (id: string, fields: ModelFields, enabled: boolean, revision: number) =>
     send<ProviderModel>(`/models/${id}`, 'PATCH', {
