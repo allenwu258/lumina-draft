@@ -174,16 +174,39 @@ async def test_messages_api_builds_request_and_normalizes_stream(
 
 
 @pytest.mark.asyncio
-async def test_messages_api_defaults_required_output_limit_and_omits_empty_system(
+@pytest.mark.parametrize(
+    ("call_limit", "model_limit", "expected_limit"),
+    [
+        (None, None, None),
+        (12000, None, 12000),
+        (None, 2048, 2048),
+        (None, 32768, 32768),
+        (12000, 8192, 8192),
+        (4096, 8192, 4096),
+    ],
+)
+async def test_messages_api_respects_optional_output_limits_and_omits_empty_system(
     monkeypatch,
+    call_limit,
+    model_limit,
+    expected_limit,
 ):
     requests = install_stream_transport(monkeypatch, message_events("OK"))
     result = [
         event
-        async for event in AnthropicMessagesAdapter().stream(request(instructions=""))
+        async for event in AnthropicMessagesAdapter().stream(
+            request(
+                instructions="",
+                max_output_tokens=call_limit,
+                model_max_output_tokens=model_limit,
+            )
+        )
     ]
     body = json.loads(requests[0].content)
-    assert body["max_tokens"] == 8192
+    if expected_limit is None:
+        assert "max_tokens" not in body
+    else:
+        assert body["max_tokens"] == expected_limit
     assert "system" not in body
     assert requests[0].headers["authorization"] == "Bearer secret"
     assert result[-1].kind == "completed"
@@ -483,29 +506,29 @@ def test_anthropic_reasoning_tiers_are_model_family_specific():
         "max",
         "xhigh",
     ]
-    assert (
-        AnthropicMessagesAdapter.build_body(request(model_max_output_tokens=2048))[
-            "max_tokens"
-        ]
-        == 2048
-    )
-    assert (
-        AnthropicMessagesAdapter.build_body(
-            request(max_output_tokens=12000, model_max_output_tokens=8192)
-        )["max_tokens"]
-        == 8192
-    )
-    assert (
-        AnthropicMessagesAdapter.build_body(
-            request(max_output_tokens=4096, model_max_output_tokens=8192)
-        )["max_tokens"]
-        == 4096
-    )
     assert adapter.build_body(request(reasoning_effort="thinking:adaptive"))[
         "thinking"
     ] == {"type": "adaptive"}
     with pytest.raises(ProviderError) as exc:
         adapter.build_body(
             request(reasoning_effort="thinking:budget:8192", max_output_tokens=8192)
+        )
+    assert exc.value.code == "INVALID_REASONING_BUDGET"
+
+
+def test_anthropic_thinking_budget_does_not_introduce_an_output_limit():
+    body = AnthropicMessagesAdapter.build_body(
+        request(reasoning_effort="thinking:budget:16384")
+    )
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 16384}
+    assert "max_tokens" not in body
+
+
+def test_anthropic_thinking_budget_respects_model_output_limit():
+    with pytest.raises(ProviderError) as exc:
+        AnthropicMessagesAdapter.build_body(
+            request(
+                reasoning_effort="thinking:budget:2048", model_max_output_tokens=2048
+            )
         )
     assert exc.value.code == "INVALID_REASONING_BUDGET"

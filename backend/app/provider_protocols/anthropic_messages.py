@@ -14,7 +14,6 @@ from .transport import MAX_EVENT_BYTES, bounded_lines, fetch_json, validate_endp
 
 
 ANTHROPIC_VERSION = "2026-10-21"
-DEFAULT_MAX_OUTPUT_TOKENS = 8192
 MAX_MODEL_PAGES = 100
 
 
@@ -31,12 +30,12 @@ class AnthropicMessagesAdapter(ProviderAdapter):
     def build_body(request: ProviderRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": request.model,
-            # The Messages API requires max_tokens. 8192 is the fallback;
-            # explicit budgets and the catalog's model ceiling both apply.
-            "max_tokens": _effective_max_tokens(request),
             "messages": [{"role": "user", "content": request.prompt}],
             "stream": True,
         }
+        max_tokens = _effective_max_tokens(request)
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         if request.instructions:
             body["system"] = request.instructions
         if request.json_schema is not None:
@@ -57,8 +56,7 @@ class AnthropicMessagesAdapter(ProviderAdapter):
                 body["thinking"] = {"type": "adaptive"}
             elif kind == "budget":
                 budget = int(value)
-                max_tokens = body["max_tokens"]
-                if budget >= max_tokens:
+                if max_tokens is not None and budget >= max_tokens:
                     raise ProviderError(
                         "INVALID_REASONING_BUDGET",
                         "Anthropic Thinking Token Budget 必须小于最大输出 Token 数",
@@ -884,8 +882,12 @@ _SUPPORTED_STRING_FORMATS = {
 }
 
 
-def _effective_max_tokens(request: ProviderRequest) -> int:
-    requested = request.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS
+def _effective_max_tokens(request: ProviderRequest) -> int | None:
+    # Omit an unconfigured limit rather than inventing a generation budget.
+    # Anthropic-compatible endpoints can supply their own default; the native
+    # Messages API requires callers to configure max_tokens explicitly.
+    if request.max_output_tokens is None:
+        return request.model_max_output_tokens
     if request.model_max_output_tokens is None:
-        return requested
-    return min(requested, request.model_max_output_tokens)
+        return request.max_output_tokens
+    return min(request.max_output_tokens, request.model_max_output_tokens)
