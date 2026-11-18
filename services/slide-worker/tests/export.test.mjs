@@ -97,6 +97,49 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
   }
 });
 
+test("CSS gradient backgrounds export as image objects while text stays native", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "lumina-pptx-background-"));
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const html =
+      '<!doctype html><html><body style="margin:0"><main id="ppt-page" style="position:relative;width:800px;height:450px;background:linear-gradient(90deg,#102030,#406080);font-family:Arial"><h1 style="margin:0;position:absolute;left:40px;top:36px;font-size:32px;color:white">Editable gradient title</h1></main></body></html>';
+    const captureDir = join(temp, "capture");
+    const scene = await convert(
+      { html, htmlHash: hash(html), cssHash: hash("") },
+      { browser, outputDir: captureDir },
+    );
+    const output = join(temp, "out");
+    await mkdir(output);
+    const report = await writePptx(
+      {
+        title: "Gradient background",
+        inputHash: "b".repeat(64),
+        pages: [
+          {
+            scene,
+            sceneId: "gradient",
+            assets: Object.fromEntries(
+              scene.assets.map((asset) => [asset.id, join(captureDir, asset.file)]),
+            ),
+          },
+        ],
+      },
+      output,
+      resolve,
+      browser,
+    );
+    const page = report.pages[0];
+    assert.equal(page.rasterRegions, 0);
+    assert.equal(page.nativeImageCount, 1);
+    assert.equal(page.fullPageRasterCount, 0);
+    assert.ok(page.nativeTexts.join("").includes("Editable gradient title"));
+    assert.ok((await readFile(join(output, "presentation.pptx"))).length > 5000);
+  } finally {
+    await browser.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("composite Scene export preserves outside native text and transparent regions", async () => {
   const temp = await mkdtemp(join(tmpdir(), "lumina-pptx-composite-"));
   const browser = await chromium.launch({ headless: true });

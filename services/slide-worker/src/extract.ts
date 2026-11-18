@@ -13,6 +13,16 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
   paintOps: SceneIR["paintOps"];
   textInventory: SceneIR["textInventory"];
   diagnostics: SceneIR["diagnostics"];
+  pageBackground: string;
+  pageBackgroundCapture: boolean;
+  backgrounds: {
+    captureId: string;
+    assetId: string;
+    nodeId: string;
+    sourcePath: string;
+    frame: Rect;
+    fallbackFill: string;
+  }[];
   images: {
     id: string;
     data: string;
@@ -47,7 +57,15 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       pixelWidth: number;
       pixelHeight: number;
     }[] = [],
-    fonts = new Set<string>();
+    fonts = new Set<string>(),
+    backgrounds: {
+      captureId: string;
+      assetId: string;
+      nodeId: string;
+      sourcePath: string;
+      frame: Rect;
+      fallbackFill: string;
+    }[] = [];
   let count = 0;
   let droppedDiagnosticCount = 0;
   const MAX_DIAGNOSTICS = 512;
@@ -113,6 +131,82 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
   };
   const transparent = (c: string) =>
     c === "transparent" || c === "rgba(0, 0, 0, 0)";
+  const backgroundImageInfo = (value: string) => {
+    const gradients = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i.test(value);
+    const urls = [...value.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)].map(
+      (match) => match[2].trim(),
+    );
+    const dataImages = urls.filter((url) => /^data:image\//i.test(url));
+    return {
+      capture: gradients || dataImages.length > 0,
+      externalCount: urls.length - dataImages.length,
+      kind: gradients ? "gradient" : dataImages.length ? "data-image" : "url",
+    };
+  };
+  const htmlStyle = getComputedStyle(document.documentElement);
+  const bodyStyle = getComputedStyle(document.body);
+  const htmlPaintsCanvas =
+    htmlStyle.backgroundImage !== "none" || !transparent(htmlStyle.backgroundColor);
+  const canvasStyle = htmlPaintsCanvas ? htmlStyle : bodyStyle;
+  const outerBackgrounds = [
+    { sourcePath: "document/html", style: htmlStyle },
+    { sourcePath: "document/body", style: bodyStyle },
+  ];
+  let pageBackgroundCapture = false;
+  for (const outer of outerBackgrounds) {
+    if (outer.style.backgroundImage === "none") continue;
+    const info = backgroundImageInfo(outer.style.backgroundImage);
+    if (info.capture) {
+      pageBackgroundCapture = true;
+      diagnostic(
+        "CSS_PAGE_BACKGROUND_LOCAL_ASSET",
+        outer.sourcePath,
+        "The document background image is retained as a background-only page asset; page text and content remain separate Scene elements.",
+        { strategy: "page-background-image", layerKind: info.kind, editability: "background-image" },
+        "info",
+      );
+    }
+    if (info.externalCount)
+      diagnostic(
+        "CSS_BACKGROUND_RESOURCE_OMITTED",
+        outer.sourcePath,
+        "Network CSS background resources are blocked during conversion; supported gradient and data-image layers are retained.",
+        { resourceCount: info.externalCount, strategy: "blocked-network" },
+      );
+  }
+  const pageBackground = transparent(canvasStyle.backgroundColor)
+    ? "white"
+    : canvasStyle.backgroundColor;
+  const blockedBackgroundCount = Number(
+    document.documentElement.getAttribute("data-lumina-blocked-background-count") || 0,
+  );
+  if (blockedBackgroundCount > 0)
+    diagnostic(
+      "CSS_BACKGROUND_RESOURCE_OMITTED",
+      "document/styles",
+      "External CSS background images were removed before layout because network resources are blocked during conversion; local gradients and data images remain available.",
+      { resourceCount: blockedBackgroundCount, strategy: "blocked-network-before-layout" },
+    );
+  const blockedSvgReferenceCount = Number(
+    document.documentElement.getAttribute("data-lumina-blocked-svg-reference-count") || 0,
+  );
+  if (blockedSvgReferenceCount > 0)
+    diagnostic(
+      "SVG_EXTERNAL_REFERENCE_OMITTED",
+      "document/svg",
+      "External SVG resource references were removed before layout because network resources are blocked during conversion; local fragment and data-image references are retained.",
+      { resourceCount: blockedSvgReferenceCount, strategy: "blocked-network-before-layout" },
+    );
+  const blockedCssReferenceCount = Number(
+    document.documentElement.getAttribute("data-lumina-blocked-css-reference-count") || 0,
+  );
+  if (blockedCssReferenceCount > 0)
+    diagnostic(
+      "CSS_RESOURCE_REFERENCE_OMITTED",
+      "document/styles",
+      "External CSS resource references were removed before layout because network resources are blocked during conversion; local fragment and data-image references are retained.",
+      { resourceCount: blockedCssReferenceCount, strategy: "blocked-network-before-layout" },
+    );
   const radius = (v: string, size: number) =>
     v.endsWith("%") ? (parseFloat(v) * size) / 100 : parseFloat(v) || 0;
   const radii = (s: CSSStyleDeclaration, r: Rect, sourcePath: string) =>
@@ -767,7 +861,6 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     if (s.mixBlendMode !== "normal") omittedEffects.push("mix-blend-mode");
     if (s.clipPath !== "none") omittedEffects.push("clip-path");
     if (s.maskImage !== "none") omittedEffects.push("mask-image");
-    if (s.backgroundImage !== "none") omittedEffects.push("background-image");
     if (omittedEffects.length)
       diagnostic(
         "CSS_EFFECT_OMITTED",
@@ -818,6 +911,55 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     const isBlock = !["inline", "contents"].includes(s.display),
       owner = isBlock ? groupId : parentOwner;
     const rad = radii(s, r, sourcePath);
+    if (s.backgroundImage !== "none" && s.visibility === "visible") {
+      const info = backgroundImageInfo(s.backgroundImage);
+      if (info.externalCount)
+        diagnostic(
+          "CSS_BACKGROUND_RESOURCE_OMITTED",
+          sourcePath,
+          "Network CSS background resources are blocked during conversion; supported gradient and data-image layers are retained.",
+          { resourceCount: info.externalCount, strategy: "blocked-network" },
+        );
+      if (info.capture) {
+        if (
+          backgrounds.length >= 32 ||
+          r.width <= 0 ||
+          r.height <= 0 ||
+          r.width * r.height > 8_000_000 ||
+          r.x >= width ||
+          r.y >= height ||
+          r.x + r.width <= 0 ||
+          r.y + r.height <= 0
+        ) {
+          diagnostic(
+            "CSS_BACKGROUND_CAPTURE_LIMIT",
+            sourcePath,
+            "This CSS background image exceeded the bounded local-capture budget and was omitted; surrounding page content remains editable.",
+            { width: r.width, height: r.height, strategy: "bounded-local-background" },
+          );
+        } else {
+          const captureId = `element-${backgrounds.length}`;
+          const nodeId = id(el, "background-image");
+          const assetId = id(el, "background-asset");
+          el.setAttribute("data-lumina-background-capture", captureId);
+          backgrounds.push({
+            captureId,
+            assetId,
+            nodeId,
+            sourcePath,
+            frame: r,
+            fallbackFill: s.backgroundColor,
+          });
+          diagnostic(
+            "CSS_BACKGROUND_IMAGE_LOCAL_ASSET",
+            sourcePath,
+            "This CSS background image is retained as a local image layer; the element's text, geometry, and other content remain separate Scene objects.",
+            { captureId, strategy: "element-background-image", layerKind: info.kind, editability: "background-image" },
+            "info",
+          );
+        }
+      }
+    }
     const clipped =
       ["hidden", "clip", "scroll", "auto"].includes(s.overflowX) ||
       ["hidden", "clip", "scroll", "auto"].includes(s.overflowY);
@@ -830,6 +972,9 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       opacity: parseFloat(s.opacity),
       clip: null,
     };
+    const capturedBackground = backgrounds.at(-1)?.sourcePath === sourcePath
+      ? backgrounds.at(-1)
+      : undefined;
     if (group.kind === "table") {
       const cells = [...el.querySelectorAll("tr")]
         .filter((tr) => tr.closest("table") === el)
@@ -921,6 +1066,16 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
         paintOps.push({ op: "draw", nodeId });
       }
     }
+    if (capturedBackground) {
+      nodes.push({
+        id: capturedBackground.nodeId,
+        sourcePath,
+        kind: "image",
+        frame: r,
+        assetId: capturedBackground.assetId,
+      });
+      paintOps.push({ op: "draw", nodeId: capturedBackground.nodeId });
+    }
     // An element's overflow clips descendants, not its own box shadow.
     const clipId = groupId + "_overflow";
     if (clipped) {
@@ -1006,6 +1161,9 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     paintOps,
     textInventory,
     diagnostics,
+    pageBackground,
+    pageBackgroundCapture,
+    backgrounds,
     images,
     fonts: [...fonts].sort(),
     paintGroups,

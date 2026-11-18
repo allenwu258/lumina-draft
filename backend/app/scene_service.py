@@ -26,9 +26,9 @@ from .tailwind_profile import compiled_tailwind_css, css_for_html
 from .workflows import DESIGN, PPT, WORKFLOWS, PPT_CANVAS
 
 ROOT = Path(__file__).resolve().parents[2]
-CONVERTER_VERSION = "dom-canvas-0.4.3"
+CONVERTER_VERSION = "dom-canvas-0.4.4"
 SCENE_VERSION = "0.4.0"
-DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.3"
+DESIGN_CONVERTER_VERSION = "dom-canvas-0.5.4"
 DESIGN_SCENE_VERSION = "0.5.0"
 SUPPORTED_CONVERTERS = (CONVERTER_VERSION, DESIGN_CONVERTER_VERSION)
 SCENE_VERSIONS = {
@@ -36,9 +36,11 @@ SCENE_VERSIONS = {
     "dom-canvas-0.4.0": SCENE_VERSION,
     "dom-canvas-0.4.1": SCENE_VERSION,
     "dom-canvas-0.4.2": SCENE_VERSION,
+    "dom-canvas-0.4.3": SCENE_VERSION,
     "dom-canvas-0.5.0": DESIGN_SCENE_VERSION,
     "dom-canvas-0.5.1": DESIGN_SCENE_VERSION,
     "dom-canvas-0.5.2": DESIGN_SCENE_VERSION,
+    "dom-canvas-0.5.3": DESIGN_SCENE_VERSION,
     CONVERTER_VERSION: SCENE_VERSION,
     DESIGN_CONVERTER_VERSION: DESIGN_SCENE_VERSION,
 }

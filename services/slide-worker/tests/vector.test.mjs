@@ -90,6 +90,75 @@ test("capture preserves document language and inherited body style", async () =>
   assert.equal(style.color, "rgb(37, 99, 235)");
 });
 
+test("transparent page uses the document canvas background color", async () => {
+  const scene = await capture(
+    html("<p>Body background remains visible</p>", "#ppt-page{background:transparent}body{background:#123456}"),
+    "body-background-color",
+  );
+  assert.equal(scene.page.background, "rgb(18, 52, 86)");
+});
+
+test("element CSS gradients are captured as background-only assets and keep text editable", async () => {
+  const scene = await capture(
+    html(
+      '<div style="position:absolute;inset:0;background:linear-gradient(90deg,#ff0000,#0000ff)"><span style="position:absolute;left:100px;top:100px;color:white;font:28px Arial">Gradient foreground text</span></div>',
+    ),
+    "element-gradient-background",
+  );
+  const imageNode = scene.nodes.find(
+    (node) => node.kind === "image" && node.sourcePath !== "main",
+  );
+  assert.ok(imageNode);
+  const asset = scene.assets.find((candidate) => candidate.id === imageNode.assetId);
+  assert.equal(asset.mediaType, "image/png");
+  assert.ok(asset.bakedEffects.includes("css-background-image"));
+  const png = PNG.sync.read(await readFile(join(temp, "element-gradient-background", asset.file)));
+  assert.equal(png.width, 800);
+  assert.equal(png.height, 450);
+  for (let offset = 0; offset < png.data.length; offset += 4) {
+    const [red, green, blue, alpha] = png.data.subarray(offset, offset + 4);
+    assert.ok(alpha === 0 || !(red > 250 && green > 250 && blue > 250));
+  }
+  const text = scene.nodes.find(
+    (node) => node.kind === "text" && node.text.sourceText === "Gradient foreground text",
+  );
+  assert.ok(text);
+  assert.equal(
+    scene.textInventory.find((item) => item.sourceText === text.text.sourceText).target.kind,
+    "text",
+  );
+  const plan = planPptxPage(scene);
+  assert.ok(plan.elements.some((element) => element.kind === "image" && element.node.id === imageNode.id));
+  assert.ok(plan.elements.some((element) => element.kind === "text" && element.text === "Gradient foreground text"));
+  assert.ok(!plan.elements.some((element) => element.kind === "raster"));
+  assert.ok(scene.diagnostics.some((item) => item.code === "CSS_BACKGROUND_IMAGE_LOCAL_ASSET"));
+});
+
+test("document gradient is captured as a page background layer without flattening page text", async () => {
+  const scene = await capture(
+    html(
+      '<p style="position:absolute;left:30px;top:40px;font:24px Arial;color:#fff">Document background text</p>',
+      "#ppt-page{background:transparent}body{background:linear-gradient(90deg,#102030,#405060)}",
+    ),
+    "document-gradient-background",
+  );
+  const imageNode = scene.nodes.find(
+    (node) => node.kind === "image" && node.id === "page_background_image",
+  );
+  assert.ok(imageNode);
+  const asset = scene.assets.find((candidate) => candidate.id === imageNode.assetId);
+  const png = PNG.sync.read(await readFile(join(temp, "document-gradient-background", asset.file)));
+  assert.equal(png.width, 800);
+  assert.equal(png.height, 450);
+  assert.notDeepEqual(
+    [...png.data.subarray(0, 3)],
+    [...png.data.subarray((png.width - 1) * 4, (png.width - 1) * 4 + 3)],
+  );
+  assert.ok(scene.nodes.some((node) => node.kind === "text" && node.text.sourceText === "Document background text"));
+  assert.ok(!scene.assets.some((candidate) => candidate.bakedEffects.includes("full-page-composite")));
+  assert.ok(scene.diagnostics.some((item) => item.code === "CSS_PAGE_BACKGROUND_LOCAL_ASSET"));
+});
+
 test("Windows font map tries installed stack names before aliases and defaults", () => {
   const style = {
     fontFamily: '"PingFang SC", Arial',
@@ -204,6 +273,7 @@ test("complex SVG effects remain vector assets and unsafe URL references are omi
   assert.doesNotMatch(svg, /example\.invalid/);
   assert.ok(scene.diagnostics.some((item) => item.code === "SVG_EFFECT_RETAINED_ASSET"));
   assert.ok(scene.diagnostics.some((item) => item.code === "SVG_EXTERNAL_REFERENCE_OMITTED"));
+  assert.ok(scene.diagnostics.some((item) => item.code === "CSS_BACKGROUND_RESOURCE_OMITTED"));
 });
 
 test("complex clipped geometry emits SVG while ordinary and outside-page text retain correct coverage", async () => {

@@ -73,6 +73,137 @@ export async function convert(
     );
     await page.evaluate((html) => {
       const parsed = new DOMParser().parseFromString(html, "text/html");
+      let blockedBackgroundCount = 0;
+      let blockedSvgReferenceCount = 0;
+      let blockedCssReferenceCount = 0;
+      const splitLayers = (value: string) => {
+        const layers: string[] = [];
+        let start = 0,
+          depth = 0,
+          quote = "",
+          escaped = false;
+        for (let index = 0; index < value.length; index++) {
+          const char = value[index];
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (quote) {
+            if (char === quote) quote = "";
+          } else if (char === "'" || char === '"') quote = char;
+          else if (char === "(") depth++;
+          else if (char === ")") depth = Math.max(0, depth - 1);
+          else if (char === "," && depth === 0) {
+            layers.push(value.slice(start, index).trim());
+            start = index + 1;
+          }
+        }
+        layers.push(value.slice(start).trim());
+        return layers.filter(Boolean);
+      };
+      const sanitizeBackground = (declaration: CSSStyleDeclaration) => {
+        const shorthand = declaration.getPropertyValue("background");
+        const image =
+          declaration.getPropertyValue("background-image") ||
+          (shorthand
+            ? (() => {
+                const probe = parsed.createElement("span").style;
+                probe.setProperty("background", shorthand);
+                return probe.getPropertyValue("background-image");
+              })()
+            : "");
+        if (!image || !/url\(/i.test(image)) return;
+        const layers = splitLayers(image);
+        const safeLayers = layers.filter((layer) => {
+          const urls = [...layer.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)];
+          const external = urls.some(
+            (match) => !/^data:image\//i.test(match[2].trim()),
+          );
+          if (external) blockedBackgroundCount++;
+          return !external;
+        });
+        if (safeLayers.length !== layers.length)
+          declaration.setProperty(
+            "background-image",
+            safeLayers.length ? safeLayers.join(", ") : "none",
+            "important",
+          );
+      };
+      const sanitizeCssUrls = (declaration: CSSStyleDeclaration) => {
+        sanitizeBackground(declaration);
+        for (const property of Array.from({ length: declaration.length }, (_, index) => declaration.item(index))) {
+          if (property === "background" || property === "background-image") continue;
+          const value = declaration.getPropertyValue(property);
+          const sanitized = value.replace(
+            /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
+            (reference, _quote, rawTarget) => {
+              const target = String(rawTarget).trim();
+              if (target.startsWith("#") || /^data:image\//i.test(target))
+                return reference;
+              blockedCssReferenceCount++;
+              return "none";
+            },
+          );
+          if (sanitized !== value)
+            declaration.setProperty(property, sanitized, "important");
+        }
+      };
+      const visitRules = (rules: CSSRuleList) => {
+        for (const rule of rules) {
+          if ("style" in rule && rule.style instanceof CSSStyleDeclaration)
+            sanitizeCssUrls(rule.style);
+          if ("cssRules" in rule && rule.cssRules)
+            visitRules(rule.cssRules as CSSRuleList);
+        }
+      };
+      for (const element of [parsed.documentElement, parsed.body, ...parsed.querySelectorAll("*")]) {
+        sanitizeCssUrls((element as HTMLElement).style);
+        if (element.namespaceURI === "http://www.w3.org/2000/svg")
+          for (const attribute of [...element.attributes]) {
+            if (/^(?:xlink:)?href$/i.test(attribute.name)) {
+              if (
+                !attribute.value.startsWith("#") &&
+                !/^data:image\//i.test(attribute.value)
+              ) {
+                element.removeAttribute(attribute.name);
+                blockedSvgReferenceCount++;
+              }
+              continue;
+            }
+            if (!/url\(/i.test(attribute.value)) continue;
+            const sanitized = attribute.value.replace(
+              /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
+              (reference, _quote, rawTarget) => {
+                const target = String(rawTarget).trim();
+                if (target.startsWith("#") || /^data:image\//i.test(target))
+                  return reference;
+                blockedSvgReferenceCount++;
+                return "none";
+              },
+            );
+            if (sanitized !== attribute.value)
+              element.setAttribute(attribute.name, sanitized);
+          }
+      }
+      for (const style of parsed.querySelectorAll("style"))
+        try {
+          if (style.sheet) visitRules(style.sheet.cssRules);
+        } catch {
+          blockedBackgroundCount++;
+        }
+      if (blockedBackgroundCount)
+        parsed.documentElement.setAttribute(
+          "data-lumina-blocked-background-count",
+          String(blockedBackgroundCount),
+        );
+      if (blockedSvgReferenceCount)
+        parsed.documentElement.setAttribute(
+          "data-lumina-blocked-svg-reference-count",
+          String(blockedSvgReferenceCount),
+        );
+      if (blockedCssReferenceCount)
+        parsed.documentElement.setAttribute(
+          "data-lumina-blocked-css-reference-count",
+          String(blockedCssReferenceCount),
+        );
       // Language and body styles affect inherited fonts and all downstream geometry.
       // Copy presentation facts only; author event handlers are never attached.
       for (const [source, target] of [
@@ -197,8 +328,162 @@ export async function convert(
         item.target = { kind: "asset", nodeId, assetId };
       }
     }
-    if (!pageRaster)
-      data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
+    const backgroundAssets: {
+      id: string;
+      nodeId: string;
+      groupId?: string;
+      captureId?: string;
+      bytes: Buffer;
+      width: number;
+      height: number;
+      bakedEffect: string;
+      fallbackFill?: string;
+    }[] = [];
+    const pngSize = (bytes: Buffer, expected?: CanvasSize) => {
+      if (
+        bytes.length < 24 ||
+        !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      )
+        throw new Error("BACKGROUND_PNG_INVALID");
+      const imageWidth = bytes.readUInt32BE(16);
+      const imageHeight = bytes.readUInt32BE(20);
+      if (
+        imageWidth <= 0 ||
+        imageHeight <= 0 ||
+        imageWidth > 8192 ||
+        imageHeight > 8192 ||
+        imageWidth * imageHeight > 8_000_000 ||
+        (expected && (imageWidth !== expected.width || imageHeight !== expected.height))
+      )
+        throw new Error("BACKGROUND_PNG_DIMENSIONS");
+      return { width: imageWidth, height: imageHeight };
+    };
+    const markBackgroundFailure = (captureId?: string) => {
+      const diagnostic = data.diagnostics.find(
+        (item) =>
+          item.code === "CSS_BACKGROUND_IMAGE_LOCAL_ASSET" &&
+          item.details?.captureId === captureId,
+      );
+      if (diagnostic) {
+        diagnostic.code = "CSS_BACKGROUND_CAPTURE_FAILED";
+        diagnostic.message = "The local CSS background image could not be captured; its solid fallback and other page content were retained.";
+        diagnostic.severity = "warning";
+        if (diagnostic.details) delete diagnostic.details.captureId;
+      }
+      if (!captureId)
+        for (const item of data.diagnostics)
+          if (item.code === "CSS_PAGE_BACKGROUND_LOCAL_ASSET") {
+            item.code = "CSS_BACKGROUND_CAPTURE_FAILED";
+            item.message = "The document background image could not be captured; its solid fallback and page content were retained.";
+            item.severity = "warning";
+          }
+    };
+    const removeBackgroundNode = (
+      nodeId: string,
+      groupId?: string,
+      fallbackFill?: string,
+    ) => {
+      const removed = new Set([nodeId, ...(groupId ? [groupId] : [])]);
+      data.nodes = data.nodes.filter((node) => !removed.has(node.id));
+      data.paintOps = data.paintOps.filter((op) => !removed.has(op.nodeId));
+      data.paintGroups = data.paintGroups.filter((group) => !removed.has(group.id));
+      if (fallbackFill && !/^transparent$|^rgba\(0, 0, 0, 0\)$/.test(fallbackFill)) {
+        const shape = data.nodes.find(
+          (node) => node.kind === "shape" && node.sourcePath === data.backgrounds.find((item) => item.nodeId === nodeId)?.sourcePath,
+        );
+        if (shape?.kind === "shape") shape.fill = fallbackFill;
+      }
+    };
+    if (!pageRaster && data.pageBackgroundCapture) {
+      try {
+        const screenshot = await page.screenshot({
+          type: "png",
+          omitBackground: true,
+          animations: "disabled",
+          timeout: 5000,
+          style: "html,body{visibility:visible!important;background-color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}html *,body *{visibility:hidden!important}html::before,html::after,body::before,body::after{content:none!important}",
+        });
+        const size = pngSize(screenshot, { width, height });
+        if (screenshot.length > 8 * 1024 * 1024)
+          throw new Error("BACKGROUND_PNG_SIZE");
+        const nodeId = "page_background_image";
+        const groupId = "page_background_group";
+        const assetId = "page_background_asset";
+        const frame = { x: 0, y: 0, width, height };
+        data.nodes.unshift(
+          {
+            id: groupId,
+            sourcePath: "main",
+            kind: "group",
+            tagName: "background",
+            frame,
+            opacity: 1,
+            clip: null,
+          },
+          { id: nodeId, sourcePath: "main", kind: "image", frame, assetId },
+        );
+        data.paintOps.unshift(
+          { op: "begin", nodeId: groupId },
+          { op: "draw", nodeId },
+          { op: "end", nodeId: groupId },
+        );
+        data.paintGroups.unshift({
+          id: groupId,
+          context: false,
+          positioned: false,
+          z: 0,
+        });
+        backgroundAssets.push({
+          id: assetId,
+          nodeId,
+          groupId,
+          bytes: screenshot,
+          width: size.width,
+          height: size.height,
+          bakedEffect: "css-page-background",
+        });
+      } catch {
+        markBackgroundFailure();
+      }
+    }
+    if (!pageRaster) {
+      for (const background of data.backgrounds) {
+        try {
+          const selector = `[data-lumina-background-capture="${background.captureId}"]`;
+          const screenshot = await page.locator(selector).screenshot({
+            type: "png",
+            scale: "css",
+            omitBackground: true,
+            animations: "disabled",
+            timeout: 5000,
+            style: `html,html *{opacity:1!important}html,body{background:transparent!important}*{visibility:hidden!important}${selector}{visibility:visible!important;background-color:transparent!important;background-clip:padding-box!important;border-color:transparent!important;box-shadow:none!important;outline:none!important;text-shadow:none!important;-webkit-text-fill-color:transparent!important;-webkit-text-stroke-color:transparent!important;text-decoration-color:transparent!important}${selector} *{visibility:hidden!important}${selector}::before,${selector}::after{content:none!important}`,
+          });
+          const size = pngSize(screenshot);
+          if (screenshot.length > 4 * 1024 * 1024)
+            throw new Error("BACKGROUND_PNG_SIZE");
+          backgroundAssets.push({
+            id: background.assetId,
+            nodeId: background.nodeId,
+            captureId: background.captureId,
+            fallbackFill: background.fallbackFill,
+            bytes: screenshot,
+            width: size.width,
+            height: size.height,
+            bakedEffect: "css-background-image",
+          });
+        } catch {
+          removeBackgroundNode(background.nodeId, undefined, background.fallbackFill);
+          markBackgroundFailure(background.captureId);
+        }
+      }
+      await page
+        .locator("[data-lumina-background-capture]")
+        .evaluateAll((elements) =>
+          elements.forEach((element) =>
+            element.removeAttribute("data-lumina-background-capture"),
+          ),
+        );
+    }
     await mkdir(runtime.outputDir, { recursive: true });
     const assets: SceneIR["assets"] = [];
     let totalBytes = 0;
@@ -246,6 +531,36 @@ export async function convert(
         ],
       });
     }
+    let backgroundBytes = 0;
+    for (const background of backgroundAssets) {
+      const maxAssetBytes = background.groupId ? 8 : 4;
+      if (
+        background.bytes.length > maxAssetBytes * 1024 * 1024 ||
+        backgroundBytes + background.bytes.length > 12 * 1024 * 1024 ||
+        totalBytes + background.bytes.length > 32 * 1024 * 1024
+      ) {
+        removeBackgroundNode(background.nodeId, background.groupId, background.fallbackFill);
+        markBackgroundFailure(background.captureId);
+        continue;
+      }
+      const file = `${background.id}.png`;
+      await writeFile(join(runtime.outputDir, file), background.bytes);
+      totalBytes += background.bytes.length;
+      backgroundBytes += background.bytes.length;
+      assets.push({
+        id: background.id,
+        mediaType: "image/png",
+        sha256: hash(background.bytes),
+        byteLength: background.bytes.length,
+        width: background.width,
+        height: background.height,
+        file,
+        coveredNodeIds: [background.nodeId],
+        bakedEffects: [background.bakedEffect],
+      });
+    }
+    if (!pageRaster)
+      data.paintOps = orderPaint(data.nodes, data.paintOps, data.paintGroups);
     const fontMetrics = await page.evaluate((fonts) => {
       const ctx = document.createElement("canvas").getContext("2d")!;
       return fonts.map((font) => {
@@ -274,7 +589,7 @@ export async function convert(
         dpr: 1,
         fontSignature: hash(canonical(fontMetrics)),
       },
-      page: { width, height, background: "white" },
+      page: { width, height, background: data.pageBackground },
       nodes: data.nodes,
       paintOps: data.paintOps,
       assets,

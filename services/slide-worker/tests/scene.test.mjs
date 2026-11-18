@@ -239,6 +239,58 @@ test("Canvas consumes only SceneIR/assets and matches independent HTML regions a
     await page.close();
   }
 });
+test("Scene Canvas preserves document and element gradient backgrounds", async () => {
+  const html = `<!doctype html><html><head><style>
+    html,body{margin:0}body{background:linear-gradient(90deg,#102030,#405060)}
+    #ppt-page{position:relative;width:800px;height:450px;overflow:hidden;background:transparent}
+    #panel{position:absolute;left:150px;top:110px;width:420px;height:220px;border-radius:18px;background-color:#22c55e;background-image:radial-gradient(circle at 25% 30%,#facc15,transparent)}
+    #title{position:absolute;left:30px;top:30px;color:white;font:24px Arial}
+  </style></head><body><main id="ppt-page"><div id="panel"></div><p id="title">Background fidelity</p></main></body></html>`;
+  const outputDir = join(temp, "gradient-renderer");
+  const captured = await convert(input(html), { browser, outputDir });
+  const assets = Object.fromEntries(
+    await Promise.all(
+      captured.assets.map(async (asset) => [
+        asset.id,
+        (await readFile(join(outputDir, asset.file))).toString("base64"),
+      ]),
+    ),
+  );
+  const page = await browser.newPage({ viewport: { width: 800, height: 450 } });
+  try {
+    await page.setContent(html);
+    const expected = PNG.sync.read(await page.locator("#ppt-page").screenshot());
+    await page.setContent('<html><body style="margin:0"><canvas></canvas></body></html>');
+    await page.addScriptTag({ content: bundle });
+    await page.evaluate(async ({ scene, assets }) => {
+      const renderer = new window.SceneRenderer(document.querySelector("canvas"));
+      window.renderer?.dispose();
+      window.renderer = renderer;
+      await renderer.load(
+        scene,
+        async (asset) => window.decodeAsset(
+          Uint8Array.from(atob(assets[asset.id]), (character) => character.charCodeAt(0)),
+          asset.mediaType,
+        ),
+        async () => {},
+      );
+      renderer.resize(800, 450, 1);
+      renderer.render();
+    }, { scene: captured, assets });
+    const actual = PNG.sync.read(await page.locator("canvas").screenshot());
+    for (const [x, y] of [[15, 15], [790, 15], [40, 380], [153, 113], [180, 140], [360, 180], [545, 310], [700, 400]]) {
+      const offset = (y * 800 + x) * 4;
+      const actualRgb = actual.data.subarray(offset, offset + 3);
+      const expectedRgb = expected.data.subarray(offset, offset + 3);
+      assert.ok(
+        [...actualRgb].every((value, channel) => Math.abs(value - expectedRgb[channel]) <= 3),
+        `background pixel ${x},${y}: ${[...actualRgb]} vs ${[...expectedRgb]}`,
+      );
+    }
+  } finally {
+    await page.close();
+  }
+});
 test("mixed direct text, blocks, invisible text and collapsed whitespace retain unique provenance", async () => {
   const s = await convert(
     input(
