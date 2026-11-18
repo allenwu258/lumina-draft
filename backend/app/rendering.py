@@ -5,6 +5,7 @@ import re
 from bs4 import BeautifulSoup
 import tinycss2
 from .tailwind_profile import TAILWIND_CLASS_SET, TAILWIND_PROFILE
+from .font_map import normalize_font_html
 from .workflows import PPT_CANVAS
 
 
@@ -43,7 +44,11 @@ def normalize_html(html: str) -> tuple[str, list[str]]:
         head = soup.new_tag("head")
         soup.html.insert(0, head)
         actions.append("MISSING_EMPTY_HEAD_ADDED")
-    return (str(soup) if actions else html), actions
+    normalized = str(soup) if actions else html
+    normalized, fonts_changed = normalize_font_html(normalized)
+    if fonts_changed:
+        actions.append("WINDOWS_FONT_FAMILY_NORMALIZED")
+    return normalized, actions
 
 
 def validate_html(

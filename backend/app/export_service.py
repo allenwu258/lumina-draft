@@ -26,6 +26,7 @@ from .db import (
     utcnow,
 )
 from .workflows import PPT
+from .font_map import FONT_MAP_VERSION
 from .scene_service import (
     ROOT,
     SCENE_TARGET,
@@ -38,7 +39,7 @@ from .scene_service import (
     validate_scene,
 )
 
-EXPORT_VERSION = "scene-pptx-0.2.0"
+EXPORT_VERSION = "scene-pptx-0.2.2"
 EXPORT_ROOT = Path(os.getenv("PPTX_EXPORT_DIR", ROOT / "data" / "exports")).resolve()
 MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
@@ -288,7 +289,14 @@ def advance_tx(db, record):
         ready = sum(bool(p.get("scene")) for p in manifest["pages"])
         if ready == len(manifest["pages"]):
             record.input_hash = digest(
-                canonical([manifest, record.export_version, "installed-fonts-v1"])
+                canonical(
+                    [
+                        manifest,
+                        record.export_version,
+                        "installed-fonts-v2",
+                        FONT_MAP_VERSION,
+                    ]
+                )
             )
             record.status, record.queued_at = "QUEUED", utcnow()
             event_tx(db, record, "queued")
@@ -644,8 +652,12 @@ def install_result(record, token, output: Path, staged: dict):
                 {
                     "scene_id": p["sceneId"],
                     "native_text_count": len(p["nativeTexts"]),
+                    "native_text_character_count": p.get("nativeTextCharacterCount", 0),
+                    "native_fragments": p.get("nativeFragments", []),
                     "raster_regions": p["rasterRegions"],
                     "fonts": p.get("fonts", []),
+                    "font_map_version": p.get("fontMapVersion"),
+                    "font_faces": p.get("fontFaces", []),
                     "svg_regions": p.get("svgRegions", []),
                     "raster_details": p.get("rasterDetails", []),
                     "invisible_node_ids": p.get("invisibleNodeIds", []),
@@ -653,7 +665,15 @@ def install_result(record, token, output: Path, staged: dict):
                     "vector_text_count": p.get("vectorTextCount", 0),
                     "raster_asset_text_count": p.get("rasterAssetTextCount", 0),
                     "raster_text_count": p.get("rasterTextCount", 0),
+                    "svg_text_character_count": p.get("svgTextCharacterCount", 0),
+                    "raster_text_character_count": p.get("rasterTextCharacterCount", 0),
                     "compatibility_png_count": p.get("compatibilityPngCount", 0),
+                    "native_shape_count": p.get("nativeShapeCount", 0),
+                    "native_image_count": p.get("nativeImageCount", 0),
+                    "source_svg_count": p.get("sourceSvgCount", 0),
+                    "generated_vector_region_count": p.get("generatedVectorRegionCount", 0),
+                    "local_raster_region_count": p.get("localRasterRegionCount", 0),
+                    "full_page_raster_count": p.get("fullPageRasterCount", 0),
                 }
                 for p in report["pages"]
             ],

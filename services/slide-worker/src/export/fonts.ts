@@ -1,6 +1,7 @@
-import { readdirSync, existsSync } from "node:fs";
+import { readdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { openSync, type Font } from "fontkit";
 import type { TextStyle } from "@lumina/scene-core";
 
@@ -9,22 +10,89 @@ type Face = {
   postscript: string;
   family: string;
   full: string;
+  faceIndex: number;
   weight: number;
   italic: boolean;
 };
 export type ResolvedFont = {
   family: string;
   postscript: string;
+  fileSha256: string;
   ascent: number;
   descent: number;
   unitsPerEm: number;
   width: number;
   bold: boolean;
   weight: number;
+  requestedWeight: number;
+  faceWeight: number;
+  italic: boolean;
 };
-const normalize = (s: string) => s.replace(/[\s"'-]/g, "").toLowerCase();
+const normalize = (s: string) =>
+  s.trim().replace(/["']/g, "").replace(/\s+/g, " ").toLowerCase();
+type FontMap = {
+  version: string;
+  defaults: { cjk: string[]; western: string[]; stack: string[] };
+  generics: Record<string, string[]>;
+  aliases: Record<string, string>;
+  symbolFamilies: string[];
+};
+const WINDOWS_FONT_MAP: FontMap = JSON.parse(
+  readFileSync(
+    new URL("../../../../packages/scene-core/contracts/font-map-win32.json", import.meta.url),
+    "utf8",
+  ),
+);
+export const FONT_MAP_VERSION = WINDOWS_FONT_MAP.version;
+const windowsAliases = new Map(
+  Object.entries(WINDOWS_FONT_MAP.aliases).map(([name, target]) => [
+    normalize(name),
+    target,
+  ]),
+);
+const windowsGenerics = new Map(
+  Object.entries(WINDOWS_FONT_MAP.generics).map(([name, targets]) => [
+    normalize(name),
+    targets,
+  ]),
+);
+function familyList(value: string): string[] {
+  const result: string[] = [];
+  let current = "",
+    quote = "",
+    escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+    } else if (char === "\\") {
+      current += char;
+      escaped = true;
+    } else if (quote && char === quote) {
+      current += char;
+      quote = "";
+    } else if (!quote && (char === "'" || char === '"')) {
+      current += char;
+      quote = char;
+    } else if (!quote && char === ",") {
+      if (current.trim()) result.push(current.trim().replace(/^(["'])(.*)\1$/, "$2"));
+      current = "";
+    } else current += char;
+  }
+  if (current.trim()) result.push(current.trim().replace(/^(["'])(.*)\1$/, "$2"));
+  return result;
+}
 let faces: Face[] | undefined;
 const loaded = new Map<string, Font>();
+const fileHashes = new Map<string, string>();
+function fontFileSha256(path: string): string {
+  let value = fileHashes.get(path);
+  if (!value) {
+    value = createHash("sha256").update(readFileSync(path)).digest("hex");
+    fileHashes.set(path, value);
+  }
+  return value;
+}
 function installed(): Face[] {
   if (faces) return faces;
   faces = [];
@@ -54,12 +122,14 @@ function installed(): Face[] {
       if (!/\.(ttf|otf|ttc)$/i.test(item.name)) continue;
       try {
         const font = openSync(path);
-        for (const face of "fonts" in font ? font.fonts : [font]) {
+        const fontFaces = "fonts" in font ? font.fonts : [font];
+        for (const [faceIndex, face] of fontFaces.entries()) {
           faces!.push({
             path,
             postscript: face.postscriptName,
             family: face.familyName,
             full: face.fullName,
+            faceIndex,
             weight:
               face["OS/2"]?.usWeightClass ||
               (/bold/i.test(face.subfamilyName) ? 700 : 400),
@@ -75,44 +145,59 @@ function installed(): Face[] {
   return faces;
 }
 function load(face: Face): Font {
-  let font = loaded.get(face.postscript);
+  const key = `${face.path}#${face.faceIndex}`;
+  let font = loaded.get(key);
   if (!font) {
     const value = openSync(face.path);
     const selected =
       "fonts" in value
-        ? value.fonts.find((f) => f.postscriptName === face.postscript)
+        ? value.fonts[face.faceIndex]
         : (value as Font);
-    if (!selected) throw new Error(`FONT_UNAVAILABLE: ${face.postscript}`);
+    if (!selected || selected.postscriptName !== face.postscript)
+      throw new Error(`FONT_UNAVAILABLE: ${face.postscript}`);
     font = selected;
     if (loaded.size >= 16) loaded.delete(loaded.keys().next().value!);
-    loaded.set(face.postscript, font);
+    loaded.set(key, font);
   }
   return font;
 }
 
 export function resolveFont(style: TextStyle, text: string): ResolvedFont {
-  const generic = /^(sans-serif|system-ui|serif|monospace)$/i;
-  const candidates = style.fontFamily
-    .split(",")
-    .map((s) => s.trim().replace(/^["']|["']$/g, ""));
-  const defaults =
-    process.platform === "win32"
-      ? ["Microsoft YaHei", "Arial"]
-      : ["Noto Sans CJK SC", "DejaVu Sans", "Arial"];
-  const families = candidates.flatMap((c) =>
-    generic.test(c) ? defaults : [c],
-  );
+  const candidates = familyList(style.fontFamily);
+  const isWindows = process.platform === "win32";
+  const defaults = isWindows
+    ? WINDOWS_FONT_MAP.defaults.stack
+    : ["Noto Sans CJK SC", "DejaVu Sans", "Arial"];
+  const installedFaces = installed();
+  const exact = isWindows
+    ? candidates.filter((candidate) =>
+        installedFaces.some(
+          (face) =>
+            normalize(face.family) === normalize(candidate) ||
+            normalize(face.full) === normalize(candidate),
+        ),
+      )
+    : candidates;
+  const aliases = isWindows
+    ? candidates
+        .filter((candidate) => !exact.some((name) => normalize(name) === normalize(candidate)))
+        .flatMap((candidate) => windowsAliases.get(normalize(candidate)) || [])
+    : [];
+  const generics = isWindows
+    ? candidates.flatMap((candidate) => windowsGenerics.get(normalize(candidate)) || [])
+    : [];
+  const families = [...new Set([...exact, ...aliases, ...generics, ...defaults])];
   // Browser glyph fallback can select symbol faces absent from CSS font-family.
   families.push(
-    ...defaults,
-    ...(process.platform === "win32" ? ["Noto Sans SC"] : ["Noto Sans CJK SC"]),
+    ...(isWindows ? WINDOWS_FONT_MAP.symbolFamilies : ["Noto Sans Symbols", "DejaVu Sans"]),
   );
-  families.push(
-    ...(process.platform === "win32"
-      ? ["Segoe UI Symbol", "Segoe UI Emoji", "Segoe UI"]
-      : ["Noto Sans Symbols", "DejaVu Sans"]),
-  );
-  const weight = Number(style.fontWeight) >= 600 ? 700 : 400;
+  const parsedWeight = Number.parseFloat(style.fontWeight);
+  const requestedWeight = Number.isFinite(parsedWeight)
+    ? Math.max(100, Math.min(900, parsedWeight))
+    : /bold/i.test(style.fontWeight)
+      ? 700
+      : 400;
+  const weight = requestedWeight >= 600 ? 700 : 400;
   const chars = [...text].filter((c) => !/[\s\u200b-\u200d\ufe0f]/u.test(c));
   for (const family of families) {
     const choices = installed()
@@ -123,15 +208,16 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
       )
       .sort(
         (a, b) =>
-          Math.abs(a.weight - weight) +
+          Math.abs(a.weight - requestedWeight) +
           (a.italic !== (style.fontStyle === "italic") ? 1000 : 0) -
-          (Math.abs(b.weight - weight) +
+          (Math.abs(b.weight - requestedWeight) +
             (b.italic !== (style.fontStyle === "italic") ? 1000 : 0)),
       );
     for (const face of choices) {
       let font = load(face);
       // OOXML exposes regular/bold. Measure the same face/weight that the writer requests.
-      if (font.variationAxes?.wght) font = font.getVariation({ wght: weight });
+      if (font.variationAxes?.wght)
+        font = font.getVariation({ wght: requestedWeight });
       if (!chars.every((c) => font.hasGlyphForCodePoint(c.codePointAt(0)!)))
         continue;
       const advance = font
@@ -140,11 +226,15 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
       return {
         family: face.family,
         postscript: face.postscript,
+        fileSha256: fontFileSha256(face.path),
         ascent: font.ascent,
         descent: font.descent,
         unitsPerEm: font.unitsPerEm,
         bold: weight >= 600,
         weight,
+        requestedWeight,
+        faceWeight: face.weight,
+        italic: face.italic,
         width:
           (advance * style.fontSize) / font.unitsPerEm +
           [...text].length * style.letterSpacing,

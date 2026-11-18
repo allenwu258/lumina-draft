@@ -97,6 +97,20 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       return false;
     }
   };
+  const textTransformIsTranslationOnly = (style: CSSStyleDeclaration) => {
+    const rotate = style.getPropertyValue("rotate").trim();
+    const scale = style.getPropertyValue("scale").trim();
+    const noRotation =
+      rotate === "" || rotate === "none" || /^(?:0(?:deg|rad|turn)|0)$/.test(rotate);
+    const unitScale =
+      scale === "" || scale === "none" || scale === "1" || scale === "1 1";
+    return (
+      translationMatrix(style.transform) &&
+      noRotation &&
+      unitScale &&
+      style.perspective === "none"
+    );
+  };
   const transparent = (c: string) =>
     c === "transparent" || c === "rgba(0, 0, 0, 0)";
   const radius = (v: string, size: number) =>
@@ -136,7 +150,7 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       });
     else for (const c of n.childNodes) hiddenText(c, reason);
   }
-  function text(n: Text, owner: string) {
+  function text(n: Text, owner: string, svgFill?: string) {
     const sourceText = n.data,
       p = n.parentElement!,
       s = styleOf(p),
@@ -158,7 +172,7 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       fontSize: parseFloat(s.fontSize),
       fontWeight: s.fontWeight,
       fontStyle: s.fontStyle,
-      color: s.color,
+      color: svgFill ?? s.color,
       letterSpacing:
         s.letterSpacing === "normal" ? 0 : parseFloat(s.letterSpacing),
       decoration: s.textDecorationLine,
@@ -369,13 +383,128 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     return result;
   }
   let svgPixels = 0;
-  async function svg(el: SVGElement, r: Rect) {
+  async function svg(el: SVGElement, r: Rect, owner: string) {
     if (r.width <= 0 || r.height <= 0 || styleOf(el).visibility !== "visible") {
       hiddenText(el, "invisible-svg");
       return;
     }
     if (r.width > 4096 || r.height > 4096 || r.width * r.height > 8_000_000)
       throw new Error("SVG_ASSET_LIMIT");
+    const svgText = [...el.querySelectorAll("text")].filter(
+      (textElement) => !textElement.closest("defs"),
+    );
+    const svgTextNodes: Text[] = [];
+    for (const textElement of svgText) {
+      const walker = document.createTreeWalker(textElement, NodeFilter.SHOW_TEXT);
+      let node: Node | null;
+      while ((node = walker.nextNode())) svgTextNodes.push(node as Text);
+    }
+    const textOnlyTags = new Set(["text", "tspan", "g", "defs", "style", "title", "desc"]);
+    const drawableElements = [...el.querySelectorAll("*")].filter(
+      (node) => !node.closest("defs") && !["style", "title", "desc"].includes(node.tagName.toLowerCase()),
+    );
+    const rootStyle = styleOf(el);
+    const viewBox = (el as SVGSVGElement).viewBox?.baseVal;
+    const unitViewBox =
+      !viewBox ||
+      viewBox.width <= 0 ||
+      viewBox.height <= 0 ||
+      (Math.abs(viewBox.width - r.width) < 0.5 &&
+        Math.abs(viewBox.height - r.height) < 0.5);
+    const simpleTextOnly =
+      svgText.length > 0 &&
+      drawableElements.every((node) => textOnlyTags.has(node.tagName.toLowerCase())) &&
+      !el.hasAttribute("transform") &&
+      textTransformIsTranslationOnly(rootStyle) &&
+      rootStyle.filter === "none" &&
+      rootStyle.mask === "none" &&
+      rootStyle.maskImage === "none" &&
+      rootStyle.clipPath === "none" &&
+      rootStyle.mixBlendMode === "normal" &&
+      rootStyle.textShadow === "none" &&
+      unitViewBox &&
+      svgTextNodes.every((node) => {
+        const element = node.parentElement!;
+        const style = styleOf(element);
+        const tag = element.tagName.toLowerCase();
+        let ancestor: Element | null = element;
+        let ancestryIsSimple = true;
+        while (ancestor && ancestor !== el) {
+          const ancestorTag = ancestor.tagName.toLowerCase();
+          const ancestorStyle = styleOf(ancestor);
+          if (
+            !["text", "tspan", "g"].includes(ancestorTag) ||
+            ancestorStyle.display === "none" ||
+            ancestorStyle.opacity !== "1" ||
+            ancestorStyle.filter !== "none" ||
+            ancestorStyle.mask !== "none" ||
+            ancestorStyle.maskImage !== "none" ||
+            ancestorStyle.clipPath !== "none" ||
+            ancestorStyle.mixBlendMode !== "normal" ||
+            ancestorStyle.textShadow !== "none" ||
+            ancestor.hasAttribute("transform") ||
+            !textTransformIsTranslationOnly(ancestorStyle)
+          ) {
+            ancestryIsSimple = false;
+            break;
+          }
+          if (["text", "tspan"].includes(ancestorTag)) {
+            const scalarCoordinates = ["x", "y", "dx", "dy"].every((name) => {
+              const value = ancestor!.getAttribute(name);
+              return !value || value.trim().split(/[\s,]+/).length === 1;
+            });
+            if (
+              !scalarCoordinates ||
+              ancestor.hasAttribute("textLength") ||
+              ancestor.hasAttribute("lengthAdjust")
+            ) {
+              ancestryIsSimple = false;
+              break;
+            }
+          }
+          ancestor = ancestor.parentElement;
+        }
+        return (
+          ancestryIsSimple &&
+          Boolean(node.data) &&
+          ["text", "tspan"].includes(tag) &&
+          !element.closest("textPath") &&
+          style.display !== "none" &&
+          style.visibility === "visible" &&
+          style.fill !== "none" &&
+          !style.fill.includes("url(") &&
+          style.fillOpacity === "1" &&
+          style.opacity === "1" &&
+          style.stroke === "none" &&
+          style.filter === "none" &&
+          style.mask === "none" &&
+          style.maskImage === "none" &&
+          style.clipPath === "none" &&
+          style.textShadow === "none" &&
+          style.mixBlendMode === "normal" &&
+          textTransformIsTranslationOnly(style) &&
+          style.writingMode === "horizontal-tb" &&
+          style.direction === "ltr" &&
+          style.fontVariant === "normal" &&
+          style.fontVariantCaps === "normal" &&
+          style.fontStretch === "100%" &&
+          ["normal", "0px"].includes(style.wordSpacing) &&
+          ["auto", "alphabetic", "baseline"].includes(style.dominantBaseline) &&
+          ["auto", "alphabetic", "baseline"].includes(style.alignmentBaseline)
+        );
+      });
+    if (simpleTextOnly) {
+      for (const node of svgTextNodes)
+        text(node, owner, styleOf(node.parentElement!).fill);
+      diagnostic(
+        "SVG_TEXT_NATIVE",
+        path(el),
+        "Simple SVG text was converted into editable Scene text.",
+        { textNodeCount: svgTextNodes.filter((node) => node.data.trim()).length },
+        "info",
+      );
+      return;
+    }
     const clone = el.cloneNode(true) as SVGElement;
     const originals = [el, ...el.querySelectorAll("*")],
       copies = [clone, ...clone.querySelectorAll("*")];
@@ -414,6 +543,12 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       "marker-start",
       "marker-mid",
       "marker-end",
+      "filter",
+      "mask",
+      "mask-image",
+      "mask-type",
+      "mix-blend-mode",
+      "text-shadow",
       "paint-order",
       "vector-effect",
       "overflow",
@@ -433,21 +568,30 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
     originals.forEach((e, i) => {
       const style = styleOf(e),
         copy = copies[i] as SVGElement;
-      const omittedEffects: string[] = [];
-      if (style.filter !== "none") omittedEffects.push("filter");
-      if (style.maskImage !== "none") omittedEffects.push("mask-image");
-      if (style.mixBlendMode !== "normal") omittedEffects.push("mix-blend-mode");
-      if (style.textShadow !== "none") omittedEffects.push("text-shadow");
-      if (omittedEffects.length) {
+      const retainedEffects: string[] = [];
+      if (style.filter !== "none") retainedEffects.push("filter");
+      if (style.mask !== "none") retainedEffects.push("mask");
+      if (style.maskImage !== "none") retainedEffects.push("mask-image");
+      if (style.mixBlendMode !== "normal") retainedEffects.push("mix-blend-mode");
+      if (style.textShadow !== "none") retainedEffects.push("text-shadow");
+      if (retainedEffects.length) {
         diagnostic(
-          "SVG_EFFECT_OMITTED",
+          "SVG_EFFECT_RETAINED_ASSET",
           path(e),
-          "Unsupported SVG effects were removed from this vector asset; the remaining SVG content is retained.",
-          { properties: omittedEffects.join(",") },
+          "Complex SVG effects are retained in the vector asset and PNG fallback; the content is not converted into editable text or shapes.",
+          { properties: retainedEffects.join(","), editability: "asset" },
         );
-        for (const name of ["filter", "mask", "mask-image", "mix-blend-mode", "text-shadow"]) {
+      }
+      for (const name of ["href", "xlink:href"]) {
+        const reference = copy.getAttribute(name)?.trim();
+        if (reference && !reference.startsWith("#")) {
           copy.removeAttribute(name);
-          copy.style.removeProperty(name);
+          diagnostic(
+            "SVG_EXTERNAL_REFERENCE_OMITTED",
+            path(e),
+            "An external SVG resource reference was removed; the remaining vector asset is retained.",
+            { attribute: name },
+          );
         }
       }
       copy.removeAttribute("class");
@@ -455,13 +599,21 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       for (const prop of props) {
         let value = style.getPropertyValue(prop);
         if (/^(fill|stroke|color|stop-color)$/.test(prop)) value = srgb(value);
-        // Computed URLs may be absolute. Assets are standalone and only local references survive.
         value = value.replace(
-          /url\(\s*["']?[^#)]*#([^"')]+)["']?\s*\)/g,
-          "url(#$1)",
+          /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
+          (reference, doubleQuoted, singleQuoted, bare) => {
+            const target = String(doubleQuoted ?? singleQuoted ?? bare ?? "").trim();
+            if (/^#[a-zA-Z_][a-zA-Z0-9_.:-]*$/.test(target))
+              return `url(${target})`;
+            diagnostic(
+              "SVG_EXTERNAL_REFERENCE_OMITTED",
+              path(e),
+              "An external or malformed SVG URL reference was removed; the remaining vector asset is retained.",
+              { property: prop },
+            );
+            return "none";
+          },
         );
-        if (value.includes("url(") && !/^url\(#[a-zA-Z0-9_.:-]+\)$/.test(value))
-          throw new Error("UNSUPPORTED_SVG_REFERENCE");
         if (value) {
           if (copy.hasAttribute(prop)) copy.removeAttribute(prop);
           copy.style.setProperty(prop, value);
@@ -785,7 +937,7 @@ export async function extractDOM({ width, height }: CanvasSize): Promise<{
       paintOps.push({ op: "begin", nodeId: clipId });
     }
     if (el instanceof SVGElement && el.tagName.toLowerCase() === "svg") {
-      await svg(el, r);
+      await svg(el, r, groupId);
     } else {
       const children = [...el.childNodes];
       for (const child of children) {

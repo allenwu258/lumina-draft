@@ -18,6 +18,7 @@ os.environ.pop("DS_API_KEY", None)
 from backend.app import main, provider_api, runtime  # noqa: E402
 from backend.app.providers import ProviderEvent  # noqa: E402
 from backend.app.rendering import normalize_html, validate_html  # noqa: E402
+from backend.app.font_map import normalize_font_stack  # noqa: E402
 from backend.app.prompts import COMPOSER_PROMPT  # noqa: E402
 from backend.app.tailwind_profile import COMPOSER_UTILITIES, TAILWIND_CLASSES, TAILWIND_PROFILE, css_for_html, preview_html  # noqa: E402
 from backend.app.db import Conversation, ConversationMessage, engine, Job, LlmCall, Presentation, loads, session_scope  # noqa: E402
@@ -58,6 +59,29 @@ def test_html_normalization_is_bounded_and_auditable():
     unchanged, actions = normalize_html(unknown)
     assert actions == ["MISSING_EMPTY_HEAD_ADDED"] and unchanged != unknown
     assert not validate_html(unchanged)[0]
+
+
+def test_windows_font_map_prefers_exact_names_then_aliases_and_defaults():
+    mapped = normalize_font_stack('"PingFang SC", Arial, sans-serif', {"Arial"})
+    assert mapped.startswith("Arial, \"Microsoft YaHei\"")
+    assert "Segoe UI" in mapped
+    assert normalize_font_stack('"Unregistered Typeface"', set()) == 'Arial, "Microsoft YaHei"'
+
+
+def test_windows_font_map_rewrites_font_family_and_shorthand_in_html(monkeypatch):
+    from backend.app import font_map
+
+    monkeypatch.setattr(
+        font_map,
+        "installed_win32_families",
+        lambda: frozenset({"arial", "microsoft yahei"}),
+    )
+    raw = '<!doctype html><html><head><style>#ppt-page{width:800px;height:450px;font-family:PingFang SC,Arial}h1{font:italic 20px/1.2 Inter}</style></head><body><main id="ppt-page" style="font-family:Noto Sans SC"><h1>Font</h1></main></body></html>'
+    normalized, actions = normalize_html(raw)
+    assert "WINDOWS_FONT_FAMILY_NORMALIZED" in actions
+    assert "font-family:Arial, \"Microsoft YaHei\"" in normalized
+    assert 'font:italic 20px/1.2 Arial, "Microsoft YaHei"' in normalized
+    assert 'font-family:"Microsoft YaHei", Arial' in normalized
 
 
 def test_composer_does_not_enforce_a_finite_tailwind_profile():
@@ -113,11 +137,13 @@ def test_unregistered_utility_tokens_are_admitted_for_later_compiler_diagnostics
 def test_runtime_tailwind_compilation_handles_arbitrary_composer_utilities():
     html = legacy_html().replace(
         "Legacy page",
-        '<div class="grid grid-cols-[1fr_205px] bg-[#102B3D] text-[17px]">自由布局</div>',
+        '<div class="grid grid-cols-[1fr_205px] bg-[#102B3D] text-[17px] font-sans">自由布局</div>',
     )
     css = css_for_html(html)
     assert ".grid" in css
     assert "grid-template-columns" in css
+    assert "Segoe UI" in css
+    assert "ui-sans-serif" not in css
     assert "#102B3D" in css
     rendered = preview_html(html, css=css)
     assert 'data-tailwind-profile="tailwind-ppt-v1"' in rendered
@@ -231,7 +257,9 @@ def test_end_to_end_and_idempotency(client):
     assert usage["total_tokens"] == 90
     assert usage["total_unreported_calls"] == 1
     response = client.get(f"/api/v1/page-tasks/{snapshot['pages'][0]['id']}/html")
-    assert response.text == valid_html()
+    normalized_html, actions = normalize_html(valid_html())
+    assert "WINDOWS_FONT_FAMILY_NORMALIZED" in actions
+    assert response.text == normalized_html
     assert "sandbox" in response.headers["content-security-policy"]
     assert client.get("/api/v1/settings/llm/default").json()["credential_configured"]
     assert "secret" not in client.get("/api/v1/settings/llm/default").text

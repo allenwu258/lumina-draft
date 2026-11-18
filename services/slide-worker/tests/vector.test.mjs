@@ -90,6 +90,122 @@ test("capture preserves document language and inherited body style", async () =>
   assert.equal(style.color, "rgb(37, 99, 235)");
 });
 
+test("Windows font map tries installed stack names before aliases and defaults", () => {
+  const style = {
+    fontFamily: '"PingFang SC", Arial',
+    fontSize: 18,
+    fontWeight: "400",
+    fontStyle: "normal",
+    letterSpacing: 0,
+  };
+  assert.equal(resolveFont(style, "Latin").family, "Arial");
+  assert.equal(resolveFont(style, "中文").family, "Microsoft YaHei");
+  assert.equal(
+    resolveFont({ ...style, fontFamily: '"Unknown Typeface"' }, "中文").family,
+    "Microsoft YaHei",
+  );
+});
+
+test("mixed-script text is always split into the first covering font runs", async () => {
+  const scene = await capture(
+    html(
+      '<p style="position:absolute;left:20px;top:20px;font:24px Arial, Microsoft YaHei">Latin 中文</p>',
+    ),
+    "mixed-font-runs",
+  );
+  const node = scene.nodes.find(
+    (candidate) => candidate.kind === "text" && candidate.text.sourceText === "Latin 中文",
+  );
+  const fragment = node.text.lines[0].fragments[0];
+  fragment.measuredWidth = [...fragment.displayText].length * 9;
+  const resolver = (style, text) => {
+    const cjk = /[\u3400-\u9fff]/u.test(text);
+    return {
+      family: cjk ? "CjkFace" : "LatinFace",
+      postscript: cjk ? "CjkFace-Regular" : "LatinFace-Regular",
+      fileSha256: (cjk ? "b" : "a").repeat(64),
+      ascent: 800,
+      descent: 200,
+      unitsPerEm: 1000,
+      width: [...text].length * 9,
+      bold: false,
+      weight: 400,
+      requestedWeight: 400,
+      faceWeight: 400,
+      italic: false,
+    };
+  };
+  const plan = planPptxPage(scene, resolver);
+  const runs = plan.elements.filter((element) => element.kind === "text");
+  assert.equal(runs.map((run) => run.text).join(""), fragment.displayText);
+  assert.deepEqual(
+    [...new Set(runs.map((run) => run.font.family))],
+    ["LatinFace", "CjkFace"],
+  );
+});
+
+test("text-only SVG becomes editable native text", async () => {
+  const scene = await capture(
+    html(
+      '<svg width="240" height="80"><text x="20" y="52" fill="#2563eb" font-family="Arial" font-size="24">Editable SVG 文字</text></svg>',
+    ),
+    "simple-svg-text",
+  );
+  const inventory = scene.textInventory.find(
+    (item) => item.sourceText === "Editable SVG 文字",
+  );
+  assert.equal(inventory.target.kind, "text");
+  assert.equal(scene.assets.length, 0);
+  const node = scene.nodes.find(
+    (candidate) => candidate.kind === "text" && candidate.text.sourceText === inventory.sourceText,
+  );
+  assert.equal(node.text.paragraphs[0].runs[0].style.color, "rgb(37, 99, 235)");
+  assert.ok(scene.diagnostics.some((item) => item.code === "SVG_TEXT_NATIVE"));
+});
+
+test("plain SVG groups preserve editable text while transformed groups remain vector assets", async () => {
+  const editable = await capture(
+    html(
+      '<svg width="240" height="80"><g fill="#2563eb"><text x="20" y="52" font-family="Arial" font-size="24">Grouped text</text></g></svg>',
+    ),
+    "grouped-svg-text",
+  );
+  assert.equal(
+    editable.textInventory.find((item) => item.sourceText === "Grouped text").target.kind,
+    "text",
+  );
+  assert.equal(editable.assets.length, 0);
+
+  const transformed = await capture(
+    html(
+      '<svg width="240" height="80"><g transform="scale(1.2)"><text x="20" y="52" font-size="24">Transformed text</text></g></svg>',
+    ),
+    "transformed-svg-text",
+  );
+  assert.equal(
+    transformed.textInventory.find((item) => item.sourceText === "Transformed text").target.kind,
+    "asset",
+  );
+  assert.ok(!transformed.diagnostics.some((item) => item.code === "SVG_TEXT_NATIVE"));
+});
+
+test("complex SVG effects remain vector assets and unsafe URL references are omitted locally", async () => {
+  const scene = await capture(
+    html(
+      '<svg width="180" height="90"><defs><filter id="soft"><feGaussianBlur stdDeviation="1"/></filter></defs><rect width="80" height="70" fill="#2563eb" style="filter:url(#soft);background-image:url(https://example.invalid/remote.png)"/><rect x="95" width="80" height="70" fill="url(https://example.invalid/remote.svg#paint)"/></svg>',
+    ),
+    "svg-effects",
+  );
+  const asset = scene.assets.find((item) => item.mediaType === "image/svg+xml");
+  assert.ok(asset);
+  assert.ok(scene.assets.find((item) => item.id === asset.fallbackAssetId));
+  const svg = await readFile(join(temp, "svg-effects", asset.file), "utf8");
+  assert.match(svg, /filter:\s*url\((?:&quot;)?#soft(?:&quot;)?\)/);
+  assert.doesNotMatch(svg, /example\.invalid/);
+  assert.ok(scene.diagnostics.some((item) => item.code === "SVG_EFFECT_RETAINED_ASSET"));
+  assert.ok(scene.diagnostics.some((item) => item.code === "SVG_EXTERNAL_REFERENCE_OMITTED"));
+});
+
 test("complex clipped geometry emits SVG while ordinary and outside-page text retain correct coverage", async () => {
   const source = html(
     '<div style="position:absolute;left:20px;top:30px;width:230px;height:150px;border-radius:25px 8px 32px 15px;border:8px solid #2563eb;background:#bfdbfe"></div><div style="position:absolute;left:300px;top:30px;width:100px;height:100px;overflow:hidden;border-radius:30px"><div style="width:160px;height:160px;background:#f97316"></div></div><p style="position:absolute;left:20px;top:260px;font:20px Arial">Visible text</p><p style="position:absolute;left:900px;top:50px;font:20px Arial">Outside text</p>',
@@ -194,5 +310,28 @@ test("font failure only flattens its display fragment and shadows keep the body 
     report.pages[0].rasterNodeIds.length,
     0,
     "shadow-only bitmap must not count the foreground as flattened",
+  );
+});
+
+test("PPTX-inexpressible font weights flatten only their source fragment", async () => {
+  const scene = await capture(
+    html(
+      '<p style="position:absolute;left:20px;top:20px;font:500 20px Arial">Medium weight</p><p style="position:absolute;left:20px;top:70px;font:400 20px Arial">Regular weight</p>',
+    ),
+    "font-weight-fallback",
+  );
+  const plan = planPptxPage(scene);
+  assert.ok(
+    plan.elements.some(
+      (element) => element.kind === "raster" && element.region.reasonCode === "FONT_WEIGHT",
+    ),
+  );
+  assert.ok(
+    plan.elements.some((element) => element.kind === "text" && element.text === "Regular weight"),
+  );
+  assert.ok(
+    plan.elements.every(
+      (element) => element.kind !== "text" || element.text !== "Medium weight",
+    ),
   );
 });

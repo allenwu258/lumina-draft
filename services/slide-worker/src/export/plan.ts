@@ -295,29 +295,21 @@ export function planPptxPage(
           const style = runs.get(fragment.runId)!.style,
             fragmentKey = `${n.id}/${lineIndex}/${fragmentIndex}`;
           try {
-            let parts: { text: string; font: ResolvedFont }[];
-            try {
-              parts = [
-                {
-                  text: fragment.displayText,
-                  font: fontResolver(style, fragment.displayText),
-                },
-              ];
-            } catch (error) {
-              if (!String(error).includes("FONT_UNAVAILABLE")) throw error;
-              parts = splitFontRuns(style, fragment.displayText, fontResolver);
-            }
-            let width = parts.reduce((sum, part) => sum + part.font.width, 0);
+            const requestedWeight = Number.parseFloat(style.fontWeight);
+            if (
+              Number.isFinite(requestedWeight) &&
+              ![400, 700].includes(requestedWeight)
+            )
+              throw new Error("FONT_STYLE_UNSUPPORTED: weight");
+            const parts = splitFontRuns(
+              style,
+              fragment.displayText,
+              fontResolver,
+            );
+            const width = parts.reduce((sum, part) => sum + part.font.width, 0);
             if (
               Math.abs(width - fragment.measuredWidth) >
-              Math.max(2, fragment.measuredWidth * 0.035)
-            ) {
-              parts = splitFontRuns(style, fragment.displayText, fontResolver);
-              width = parts.reduce((sum, part) => sum + part.font.width, 0);
-            }
-            if (
-              Math.abs(width - fragment.measuredWidth) >
-              Math.max(2, fragment.measuredWidth * 0.035)
+              Math.max(1, fragment.measuredWidth * 0.015)
             )
               throw new Error("FONT_UNAVAILABLE: metrics");
             let x = fragment.frame.x;
@@ -336,12 +328,24 @@ export function planPptxPage(
               x += part.font.width;
             }
           } catch (error) {
-            if (!String(error).includes("FONT_UNAVAILABLE")) throw error;
-            raster([n], "字体度量差异", "FONT_METRICS", false, {
+            const message = String(error);
+            if (
+              !message.includes("FONT_UNAVAILABLE") &&
+              !message.includes("FONT_STYLE_UNSUPPORTED")
+            )
+              throw error;
+            const unsupportedWeight = message.includes("FONT_STYLE_UNSUPPORTED");
+            raster(
+              [n],
+              unsupportedWeight ? "PPTX 无法保留指定字重" : "字体度量差异",
+              unsupportedWeight ? "FONT_WEIGHT" : "FONT_METRICS",
+              false,
+              {
               frame: fragment.frame,
               fragmentKeys: [fragmentKey],
               cover: false,
-            });
+              },
+            );
           }
         }
     }

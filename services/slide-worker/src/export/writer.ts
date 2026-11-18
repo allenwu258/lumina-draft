@@ -9,6 +9,7 @@ import { hash } from "../capture.js";
 import { serializePresentation, type SlidePacket } from "./serialize.js";
 import { color } from "./color.js";
 import { rasterRegions, readSceneAssets } from "./raster.js";
+import { FONT_MAP_VERSION } from "./fonts.js";
 
 export type ExportInput = {
   warnings?: string[];
@@ -39,10 +40,30 @@ export async function writePptx(
     ...value,
     transparency: 100 - (100 - value.transparency) * opacity,
   });
+  const characters = (value: string) => [...value].length;
   const reports: {
       sceneId: string;
       nativeTexts: string[];
-      nativeFragments: { nodeId: string; fragmentKey: string; text: string }[];
+      nativeFragments: {
+        nodeId: string;
+        fragmentKey: string;
+        text: string;
+        baseline: number;
+        requestedFontFamily: string;
+        fontFamily: string;
+        postscriptName: string;
+        fontFileSha256: string;
+        fontSize: number;
+        letterSpacing: number;
+        requestedWeight: number;
+        faceWeight: number;
+        bold: boolean;
+        italic: boolean;
+        ascent: number;
+        descent: number;
+        unitsPerEm: number;
+        measuredWidth: number;
+      }[];
       coveredNodeIds: string[];
       rasterNodeIds: string[];
       invisibleNodeIds: string[];
@@ -61,6 +82,25 @@ export async function writePptx(
       rasterAssetTextCount: number;
       rasterTextCount: number;
       compatibilityPngCount: number;
+      fontMapVersion: string;
+      fontFaces: {
+        family: string;
+        postscriptName: string;
+        fontFileSha256: string;
+        requestedWeight: number;
+        faceWeight: number;
+        italic: boolean;
+        uses: number;
+      }[];
+      nativeTextCharacterCount: number;
+      svgTextCharacterCount: number;
+      rasterTextCharacterCount: number;
+      nativeShapeCount: number;
+      nativeImageCount: number;
+      sourceSvgCount: number;
+      generatedVectorRegionCount: number;
+      localRasterRegionCount: number;
+      fullPageRasterCount: number;
     }[] = [],
     warnings: string[] = [...(input.warnings || [])];
   for (const [index, page] of input.pages.entries()) {
@@ -101,7 +141,8 @@ export async function writePptx(
       const svgRegions: (typeof reports)[number]["svgRegions"] = [];
       const nativeFragments: (typeof reports)[number]["nativeFragments"] = [];
       const nativeTexts: string[] = [],
-        fonts = new Set<string>();
+        fonts = new Set<string>(),
+        fontFaces = new Map<string, (typeof reports)[number]["fontFaces"][number]>();
       let ri = 0;
       for (const e of plan.elements) {
         if (e.kind === "raster") {
@@ -184,8 +225,36 @@ export async function writePptx(
             nodeId: e.nodeId,
             fragmentKey: e.fragmentKey,
             text: e.text,
+            baseline: e.baseline,
+            requestedFontFamily: e.style.fontFamily,
+            fontFamily: e.font.family,
+            postscriptName: e.font.postscript,
+            fontFileSha256: e.font.fileSha256,
+            fontSize: e.style.fontSize,
+            letterSpacing: e.style.letterSpacing,
+            requestedWeight: e.font.requestedWeight,
+            faceWeight: e.font.faceWeight,
+            bold: e.font.bold,
+            italic: e.font.italic,
+            ascent: e.font.ascent,
+            descent: e.font.descent,
+            unitsPerEm: e.font.unitsPerEm,
+            measuredWidth: e.font.width,
           });
           fonts.add(e.font.family);
+          const faceKey = `${e.font.postscript}:${e.font.fileSha256}:${e.font.requestedWeight}:${e.font.italic}`;
+          const face = fontFaces.get(faceKey);
+          if (face) face.uses++;
+          else
+            fontFaces.set(faceKey, {
+              family: e.font.family,
+              postscriptName: e.font.postscript,
+              fontFileSha256: e.font.fileSha256,
+              requestedWeight: e.font.requestedWeight,
+              faceWeight: e.font.faceWeight,
+              italic: e.font.italic,
+              uses: 1,
+            });
           continue;
         }
         const n = e.node,
@@ -264,6 +333,36 @@ export async function writePptx(
       const vectorTextCount = visibleAssetText.filter((t) =>
         vectorIds.has(t.nodeId),
       ).length;
+      const rasterFragmentKeys = new Set(
+        regions.flatMap((region) => region.fragmentKeys || []),
+      );
+      const wholeRasterNodeIds = new Set(
+        regions
+          .filter((region) => !region.fragmentKeys?.length)
+          .flatMap((region) => region.nodeIds),
+      );
+      const rasterTextFragments = new Map<string, string>();
+      for (const node of page.scene.nodes) {
+        if (node.kind !== "text") continue;
+        for (const [lineIndex, line] of node.text.lines.entries())
+          for (const [fragmentIndex, fragment] of line.fragments.entries()) {
+            const key = `${node.id}/${lineIndex}/${fragmentIndex}`;
+            if (
+              wholeRasterNodeIds.has(node.id) ||
+              rasterFragmentKeys.has(key)
+            )
+              rasterTextFragments.set(key, fragment.displayText);
+          }
+      }
+      const svgTextCharacters = page.scene.textInventory
+        .filter((item) => item.reason === "svg-asset")
+        .reduce((sum, item) => sum + characters(item.sourceText), 0);
+      const pageRasterCharacters = page.scene.textInventory
+        .filter((item) => item.reason === "page-raster")
+        .reduce((sum, item) => sum + characters(item.sourceText), 0);
+      const fullPageRasterCount = page.scene.assets.filter((asset) =>
+        asset.bakedEffects.includes("full-page-composite"),
+      ).length;
       reports.push({
         sceneId: page.sceneId,
         nativeTexts,
@@ -287,6 +386,24 @@ export async function writePptx(
             n.kind === "text" && regions.some((r) => r.nodeIds.includes(n.id)),
         ).length,
         compatibilityPngCount: svgRegions.length,
+        fontMapVersion: FONT_MAP_VERSION,
+        fontFaces: [...fontFaces.values()],
+        nativeTextCharacterCount: nativeTexts.reduce(
+          (sum, text) => sum + characters(text),
+          0,
+        ),
+        svgTextCharacterCount: svgTextCharacters,
+        rasterTextCharacterCount:
+          [...rasterTextFragments.values()].reduce(
+            (sum, text) => sum + characters(text),
+            0,
+          ) + pageRasterCharacters,
+        nativeShapeCount: plan.elements.filter((e) => e.kind === "shape").length,
+        nativeImageCount: plan.elements.filter((e) => e.kind === "image").length,
+        sourceSvgCount: svgRegions.filter((region) => region.reasonCode === "SOURCE_SVG").length,
+        generatedVectorRegionCount: svgRegions.filter((region) => region.reasonCode !== "SOURCE_SVG").length,
+        localRasterRegionCount: regions.filter((region) => !region.shadowOnly).length,
+        fullPageRasterCount,
       });
       const assetTextCount = reports.at(-1)!.assetTextCount;
       if (assetTextCount)

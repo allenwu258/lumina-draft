@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from bs4 import BeautifulSoup
+from .font_map import normalize_font_html, normalize_font_stylesheet
 
 
 _ROOT = Path(__file__).resolve().parent
@@ -132,17 +133,18 @@ def css_for_html(html: str) -> str:
         root = BeautifulSoup(html, "html.parser").find("main", id="ppt-page")
         classes = html_classes(html)
         if root and root.get("data-css-profile") == TAILWIND_PROFILE and set(classes) <= TAILWIND_CLASS_SET:
-            return compiled_tailwind_css()
-        return compile_tailwind_candidates(classes)
+            return normalize_font_stylesheet(compiled_tailwind_css())
+        return normalize_font_stylesheet(compile_tailwind_candidates(classes))
     except (RuntimeError, ValueError, OSError) as exc:
         # A local compiler outage or an unsafe/oversized candidate must not
         # erase a page's usable legacy styles. The unresolved class remains in
         # the source and the converter retains its best-effort diagnostics.
         log.warning("Tailwind runtime compilation fell back to the frozen profile: %s", exc)
-        return compiled_tailwind_css()
+        return normalize_font_stylesheet(compiled_tailwind_css())
 
 
 def preview_html(html: str, *, css: str | None = None) -> str:
+    html, _ = normalize_font_html(html)
     soup = BeautifulSoup(html, "html.parser")
     root = soup.find("main", id="ppt-page")
     if root is None:

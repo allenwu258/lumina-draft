@@ -36,6 +36,12 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
       browser,
     );
     assert.equal(report.pages[0].rasterRegions, 0);
+    assert.equal(report.pages[0].fontMapVersion, "font-map-win32-v2");
+    assert.ok(report.pages[0].nativeTextCharacterCount > 0);
+    assert.ok(report.pages[0].fontFaces.length > 0);
+    assert.match(report.pages[0].fontFaces[0].postscriptName, /.+/);
+    assert.match(report.pages[0].fontFaces[0].fontFileSha256, /^[a-f0-9]{64}$/);
+    assert.ok(Number.isFinite(report.pages[0].nativeFragments[0].baseline));
     assert.ok(
       report.pages[0].nativeTexts.join("").includes("中文标题 English"),
     );
