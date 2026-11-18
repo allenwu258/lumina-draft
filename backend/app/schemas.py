@@ -32,6 +32,7 @@ class CreatePresentationRequest(BaseModel):
     user_request: str = Field(min_length=1, max_length=20_000)
     options: CreateOptions | DesignOptions = Field(default_factory=CreateOptions)
     entry_mode: Literal["agent", "ppt", "design", "image"] = "ppt"
+    interaction_mode: Literal["single_turn", "multi_turn"] = "single_turn"
 
     @field_validator("user_request")
     @classmethod
@@ -43,6 +44,8 @@ class CreatePresentationRequest(BaseModel):
 
     @model_validator(mode="after")
     def match_options_to_mode(self):
+        if self.interaction_mode == "multi_turn" and self.entry_mode != "agent":
+            raise ValueError("多轮对话需要选择 Agent 模式")
         if self.entry_mode == "design" and not isinstance(self.options, DesignOptions):
             raise ValueError("设计生成需要指定画布宽高")
         if self.entry_mode != "design" and isinstance(self.options, DesignOptions):

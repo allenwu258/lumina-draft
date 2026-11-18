@@ -265,6 +265,35 @@ def test_end_to_end_and_idempotency(client):
     assert "secret" not in client.get("/api/v1/settings/llm/default").text
 
 
+def test_multi_turn_identity_and_cancellation(client, monkeypatch):
+    from backend.app.agent import leader
+
+    monkeypatch.setattr(leader, "launch", lambda turn_id: None)
+    base = "/api/v1/presentations"
+    create = {"entry_mode": "agent", "interaction_mode": "multi_turn", "user_request": "董事会讨论"}
+    headers = {"Idempotency-Key": "agent-session-first"}
+    first = client.post(base, json=create, headers=headers)
+    assert first.status_code == 202, first.text
+    result = first.json()
+    assert client.post(base, json=create, headers=headers).json() == result
+    work = f"{base}/{result['presentation_id']}"
+    message = {"text": "核对当前作品", "client_request_id": "follow-up"}
+    assert client.post(work + "/turns", json=message).status_code == 409
+    assert client.post(work + f"/turns/{result['turn_id']}/cancel").json()["state"] == "CANCELLED"
+    second = client.post(work + "/turns", json=message)
+    assert second.status_code == 202
+    assert client.post(work + "/turns", json=message).json() == second.json()
+    assert client.post(work + "/turns", json=dict(message, text="不同内容")).status_code == 409
+    snapshot = client.get(work).json()
+    assert snapshot["presentation"]["status"] == "DRAFT"
+    assert snapshot["latest_run"] is snapshot["latest_outline"] is None
+    assert snapshot["conversation"]["active_leader_turn_id"] == second.json()["turn_id"]
+    chat = client.get(f"/api/v1/conversations/{result['conversation_id']}").json()
+    assert [turn["presentation_id"] for turn in chat["turns"]] == [result["presentation_id"]] * 2
+    assert [msg["kind"] for msg in chat["messages"]] == ["text", "cancelled", "text"]
+    assert client.post(work + f"/turns/{second.json()['turn_id']}/cancel").status_code == 200
+
+
 def test_entry_modes_and_persisted_special_messages(client):
     missing_canvas = client.post("/api/v1/presentations", json={"user_request": "Design a poster", "entry_mode": "design"})
     assert missing_canvas.status_code == 422

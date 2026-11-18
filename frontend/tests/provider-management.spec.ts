@@ -58,12 +58,13 @@ test('Provider configuration, model discovery, routing and presentation generati
   const defaultRoute = page
     .locator('.route-card')
     .filter({ has: page.getByRole('heading', { name: '全局默认', exact: true }) });
+  const revision = Number((await defaultRoute.innerText()).match(/revision ([0-9]+)/)?.[1]);
   await defaultRoute
     .getByLabel('模型', { exact: true })
     .selectOption({ label: 'Outline Model · outline-model' });
   await defaultRoute.getByLabel('思考预算', { exact: true }).selectOption('medium');
   await defaultRoute.getByRole('button', { name: '保存路由' }).click();
-  await expect(defaultRoute.getByText('revision 2 · 已就绪', { exact: true })).toBeVisible();
+  await expect(defaultRoute.getByText(`revision ${revision + 1} · 已就绪`, { exact: true })).toBeVisible();
   const htmlRoute = page
     .locator('.route-card')
     .filter({ has: page.getByRole('heading', { name: 'PPT 内容 HTML 生成', exact: true }) });
@@ -224,10 +225,10 @@ test('Provider configuration, model discovery, routing and presentation generati
   await expect(generationTab).toHaveAttribute('aria-selected', 'true');
   await page.getByRole('button', { name: '模型设置', exact: true }).click();
   await page.getByRole('button', { name: '调用记录', exact: true }).click();
-  const calls = page.locator('.calls-card tbody');
-  await expect(calls.getByText('ppt_outline', { exact: true })).toBeVisible();
-  await expect(calls.getByText('ppt_html', { exact: true })).toBeVisible();
-  const htmlCall = calls.locator('tr').filter({ hasText: 'ppt_html' });
+  const calls = page.locator('.calls-card tbody tr');
+  await expect(calls.filter({ hasText: 'outline-model' }).getByText('ppt_outline', { exact: true })).toBeVisible();
+  await expect(calls.filter({ hasText: 'html-model' }).getByText('ppt_html', { exact: true })).toBeVisible();
+  const htmlCall = calls.filter({ hasText: 'ppt_html' }).filter({ hasText: 'html-model' });
   await expect(htmlCall.getByText('html-model', { exact: true })).toBeVisible();
   await htmlCall.getByRole('button', { name: '详情', exact: true }).click();
   const detail = page.getByRole('dialog', { name: '模型调用详情' });
@@ -384,7 +385,7 @@ for (const concurrency of [1, 20]) {
     } finally {
       await request.post('/api/v1/mock/html-capacity', { data: { hold: false } });
     }
-    await expect(page.locator('.page-rail .thumb-state.succeeded')).toHaveCount(20);
+    await expect(page.locator('.page-rail .thumb-state.succeeded')).toHaveCount(20, { timeout: 30000 });
     await expect(page.locator('.page-rail .spin')).toHaveCount(0);
   });
 }

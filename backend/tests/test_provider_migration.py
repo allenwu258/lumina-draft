@@ -175,7 +175,7 @@ def test_upgrade_preserves_routes_credentials_and_snapshots(
             )
             assert db.get(Job, "old-job").model_id == "model"
             assert {r.code for r in db.scalars(select(BusinessRouteOverride))} == {
-                "ppt_outline", "ppt_html", "design_outline", "design_html",
+                "ppt_outline", "ppt_html", "design_outline", "design_html", "agent_leader",
             }
             assert len(db.scalars(select(SchemaMigration)).all()) == 2
             assert len(db.scalars(select(ApiProvider)).all()) == 1

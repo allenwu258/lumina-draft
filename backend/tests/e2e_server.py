@@ -53,6 +53,20 @@ async def fake_stream(**kwargs):
     schema = kwargs.get("json_schema") or {}
     if "ok" in schema.get("properties", {}):
         text = '{"ok":true}'
+    elif "action" in schema.get("properties", {}):
+        context = json.loads(kwargs["prompt"])
+        if context["user"] in {"请起草整份大纲", "将渠道分析放最后"}:
+            decision = {"action": "draft_outline", "text": context["user"]}
+        elif not context["recent"]:
+            decision = {"action": "clarify", "text": "这次汇报希望董事会决定什么？",
+                        "memory": [{"key": "audience", "quote": "董事会"}]}
+        elif not context["observations"]:
+            decision = {"action": "inspect_ppt", "view": "deck"}
+        else:
+            audience = context["memory"]["audience"]["quote"]
+            pages = context["observations"][0]["result"]["pages"]
+            decision = {"action": "reply", "text": f"面向{audience}，当前作品有 {len(pages)} 页。"}
+        text = json.dumps(decision, ensure_ascii=False)
     elif schema:
         text = json.dumps(
             {
@@ -105,6 +119,18 @@ async def fake_stream(**kwargs):
             await _html_release.wait()
         finally:
             _active_html -= 1
+    if "slides" in schema.get("properties", {}) and "基准大纲" in kwargs["prompt"]:
+        task = json.loads(kwargs["prompt"].split("用户需求：\n", 1)[1].split("\n\n附加选项：", 1)[0])
+        doc = json.loads(text)
+        if task["本轮用户要求"] == "将渠道分析放最后":
+            base = task["基准大纲"]
+            assert base["slides"][0]["title"] == "渠道分析"
+            doc["slides"] = list(reversed(base["slides"]))
+        else:
+            doc["slides"] = [dict(doc["slides"][0], title=title) for title in ("渠道分析", "行动计划")]
+        for number, slide in enumerate(doc["slides"], 1):
+            slide["page_number"] = number
+        text = json.dumps(doc, ensure_ascii=False)
     if "DesignPlanner" in kwargs.get("instructions", ""):
         doc = json.loads(text)
         doc["slides"] = [dict(doc["slides"][0], page_number=n, title=f"设计 {n}") for n in (1, 2)]

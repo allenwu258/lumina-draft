@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm.exc import StaleDataError
 
 from .db import BusinessRoute, Conversation, ConversationMessage, ConversationTurn, Event, GenerationSettingsRecord, IdempotencyRecord, Job, LlmCall, Outline, PageTask, PageScene, SceneConversionJob, Presentation, Run, dumps, init_db, legacy_reasoning_tier, loads, resolve_default, session_scope, utcnow
@@ -27,6 +27,8 @@ from .scene_runtime import HEALTH as SCENE_HEALTH, scene_scheduler
 from .scene_service import summary as scene_summary, cancel_conversions, source_hash as page_source_hash
 from .export_api import router as export_router
 from . import export_service
+from .director_commands import enqueue_director, freeze_route
+from .agent import leader, turns as agent_turns
 from .db import PptxExport
 
 
@@ -35,11 +37,13 @@ async def lifespan(app: FastAPI):
     init_db()
     stop = asyncio.Event()
     task = asyncio.create_task(scheduler(stop))
+    leader.recover()
     scene_task = asyncio.create_task(scene_scheduler(stop))
     try:
         yield
     finally:
         stop.set()
+        await leader.shutdown()
         scene_task.cancel()
         try:
             await asyncio.wait_for(task, timeout=3)
@@ -51,6 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lumina Draft API", version="0.1.0", lifespan=lifespan)
 app.include_router(scene_router)
+app.include_router(agent_turns.router)
 app.include_router(export_router)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
 API = "/api/v1"
@@ -149,6 +154,7 @@ def conversation_projection(db, presentation: Presentation, outline: Outline | N
             .order_by(ConversationMessage.seq)
         ).all()]
     confirmed = bool(outline and outline.confirmed)
+    active_turn = agent_turns.active_leader(db, conversation.id) if conversation and presentation.entry_mode == "agent" else None
     has_generation = any(run.kind == "GENERATION" for run in runs)
     status = presentation.status
     return {
@@ -157,8 +163,9 @@ def conversation_projection(db, presentation: Presentation, outline: Outline | N
         "interaction_mode": conversation.interaction_mode if conversation else "single_turn",
         "state": conversation.state if conversation else "ACTIVE",
         "messages": messages,
+        "active_leader_turn_id": active_turn,
         "allowed_actions": {
-            "send_message": False,
+            "send_message": conversation is not None and presentation.entry_mode == "agent" and active_turn is None and (conversation.interaction_mode == "multi_turn" or not any(r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"} for r in runs)),
             "edit_outline": status == "WAITING_CONFIRMATION",
             "confirm_outline": status == "WAITING_CONFIRMATION" and not confirmed,
             "cancel_run": status in {"PLANNING", "GENERATING"},
@@ -310,7 +317,9 @@ def get_conversation(conversation_id: str):
 
 @app.post(f"{API}/presentations", status_code=202)
 async def create_presentation(body: CreatePresentationRequest, idempotency_key: str | None = Header(default=None, max_length=200)):
-    request_hash = canonical_hash(body.model_dump())
+    request_hash = canonical_hash(body.model_dump(exclude={"interaction_mode"} if body.interaction_mode == "single_turn" else set()))
+    if body.interaction_mode == "multi_turn":
+        return await agent_turns.create_work(body, idempotency_key, request_hash)
     workflow = ENTRY_WORKFLOWS.get(body.entry_mode)
     if not workflow:
         fail("WORKFLOW_NOT_AVAILABLE", "图片生成尚未开放", 409)
@@ -369,16 +378,7 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         )
         db.add(presentation)
         db.flush()
-        run = Run(presentation_id=presentation.id, kind="DIRECTOR", status="QUEUED")
-        db.add(run)
-        db.flush()
-        db.add(Job(
-            run_id=run.id,
-            presentation_id=presentation.id,
-            kind="DIRECTOR",
-            model_id=scheduled_model_id(snapshot, "DIRECTOR", workflow.code),
-            status="QUEUED",
-        ))
+        run = enqueue_director(db, presentation)
         turn = ConversationTurn(
             conversation_id=conversation.id,
             turn_no=1,
@@ -411,6 +411,7 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
         )
         db.add_all([user_message, activity_message])
         db.flush()
+        run.turn_id = turn.id
         turn.input_message_id = user_message.id
         conversation.last_message_seq = 2
         conversation.latest_turn_no = 1
@@ -469,6 +470,15 @@ def get_presentation(presentation_id: str):
         return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq, "export_source": export_source, "latest_export": export_service.export_dict(latest_export) if latest_export else None}
 
 
+@app.get(f"{API}/presentations/{{presentation_id}}/outlines/{{outline_id}}")
+def get_outline_version(presentation_id: str, outline_id: str):
+    with session_scope() as db:
+        outline = db.get(Outline, outline_id)
+        if not outline or outline.presentation_id != presentation_id:
+            fail("NOT_FOUND", "大纲版本不存在", 404)
+        return outline_dict(outline)
+
+
 @app.get(f"{API}/presentations/{{presentation_id}}/usage")
 def presentation_usage(presentation_id: str):
     with session_scope() as db:
@@ -497,6 +507,7 @@ def presentation_usage(presentation_id: str):
 async def update_outline(presentation_id: str, body: UpdateOutlineRequest):
     document = body.document.model_dump()
     with session_scope() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
         old = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
@@ -514,7 +525,15 @@ async def update_outline(presentation_id: str, body: UpdateOutlineRequest):
                 ConversationMessage.kind == "outline_card",
             ).order_by(ConversationMessage.seq.desc()))
             if card:
-                card.payload_json = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "READY"})
+                payload = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "READY"})
+                conversation = db.get(Conversation, p.conversation_id)
+                if conversation.interaction_mode == "multi_turn":
+                    conversation.last_message_seq += 1
+                    db.add(ConversationMessage(conversation_id=conversation.id, turn_id=card.turn_id,
+                                               seq=conversation.last_message_seq, role="assistant", kind="outline_card",
+                                               status="READY", payload_json=payload))
+                else:
+                    card.payload_json = payload
         result = outline_dict(outline)
     await emit_event(presentation_id, "outline.updated", {"outline_id": result["id"], "content_hash": result["content_hash"]})
     return result
@@ -523,6 +542,7 @@ async def update_outline(presentation_id: str, body: UpdateOutlineRequest):
 @app.post(f"{API}/presentations/{{presentation_id}}/confirm", status_code=202)
 async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
     with session_scope() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
         outline = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
@@ -531,6 +551,12 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
             return {"presentation_id": p.id, "run_id": run.id, "status": p.status}
         if p.status != "WAITING_CONFIRMATION": fail("INVALID_STATE", "当前不能确认说明书")
         if not outline or outline.id != body.outline_id or outline.content_hash != body.content_hash: fail("OUTLINE_VERSION_CONFLICT", "说明书已更新，请刷新")
+        chat = db.get(Conversation, p.conversation_id) if p.conversation_id else None
+        if chat and chat.interaction_mode == "multi_turn" and not scheduled_model_id(loads(p.config_snapshot_json), "GENERATION", p.workflow_code):
+            try:
+                freeze_route(db, p, WORKFLOWS[p.workflow_code].page_route)
+            except ConfigurationError as exc:
+                fail(exc.code, str(exc), exc.status_code)
         document = loads(outline.document_json)
         outline.confirmed, p.status = True, "GENERATING"
         run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")
@@ -555,7 +581,9 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
                     ConversationMessage.kind == "outline_card",
                 ).order_by(ConversationMessage.seq.desc()))
                 if card:
-                    card.payload_json = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "CONFIRMED"})
+                    turn = db.get(ConversationTurn, card.turn_id)
+                    card.payload_json = dumps({**loads(card.payload_json), "status": "CONFIRMED"})
+                run.turn_id = turn.id
                 next_seq = conversation.last_message_seq + 1
                 db.add(ConversationMessage(
                     conversation_id=conversation.id,
@@ -588,20 +616,12 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
 @app.post(f"{API}/presentations/{{presentation_id}}/retry", status_code=202)
 async def retry_presentation(presentation_id: str):
     with session_scope() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
         previous = db.scalar(select(Run).where(Run.presentation_id == p.id).order_by(Run.created_at.desc()))
         if p.status in {"FAILED", "CANCELLED"} and previous.kind == "DIRECTOR":
-            run = Run(presentation_id=p.id, kind="DIRECTOR", status="QUEUED")
-            p.status = "PLANNING"
-            db.add(run)
-            db.flush()
-            db.add(Job(
-                run_id=run.id,
-                presentation_id=p.id,
-                kind="DIRECTOR",
-                model_id=scheduled_model_id(loads(p.config_snapshot_json), run.kind, p.workflow_code),
-            ))
+            run = enqueue_director(db, p, turn_id=previous.turn_id, request=previous.director_input)
             retry_kind = "activity"
         elif p.status in {"PARTIAL_FAILED", "CANCELLED"} and previous.kind == "GENERATION":
             run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")
@@ -623,7 +643,10 @@ async def retry_presentation(presentation_id: str):
         if p.conversation_id:
             conversation = db.get(Conversation, p.conversation_id)
             turn = db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == p.id).order_by(ConversationTurn.turn_no.desc()))
+            if previous.turn_id:
+                turn = db.get(ConversationTurn, previous.turn_id)
             if conversation and turn:
+                run.turn_id = turn.id
                 seq = conversation.last_message_seq + 1
                 db.add(ConversationMessage(
                     conversation_id=conversation.id,

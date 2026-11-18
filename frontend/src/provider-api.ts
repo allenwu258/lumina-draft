@@ -80,7 +80,7 @@ export type ModelCandidate = ModelFields & {
   already_added: boolean;
   capabilities?: Record<string, unknown>;
 };
-export type RouteCode = 'default' | 'ppt_outline' | 'ppt_html' | 'design_outline' | 'design_html';
+export type RouteCode = 'default' | 'agent_leader' | 'ppt_outline' | 'ppt_html' | 'design_outline' | 'design_html';
 export type ResolvedRoute = {
   provider_id: string;
   provider_name: string;
@@ -238,7 +238,7 @@ export function modelAvailability(
   if (code) {
     const checks = model.last_test?.stale ? [] : model.last_test?.checks || [];
     const required =
-      code === 'ppt_outline' || code === 'design_outline'
+      code === 'ppt_outline' || code === 'design_outline' || code === 'agent_leader'
         ? ['streaming_text', 'structured_output']
         : ['streaming_text'];
     if (

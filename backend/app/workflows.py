@@ -36,6 +36,7 @@ DESIGN = WorkflowSpec(
 WORKFLOWS = {workflow.code: workflow for workflow in (PPT, DESIGN)}
 ENTRY_WORKFLOWS = {"ppt": PPT, "agent": PPT, "design": DESIGN}
 ROUTE_LABELS = {
+    "agent_leader": "Agent 会话助手",
     "default": "全局默认",
     PPT.outline_route: "PPT 大纲生成",
     PPT.page_route: "PPT 内容 HTML 生成",

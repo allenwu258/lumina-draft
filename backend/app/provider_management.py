@@ -252,7 +252,7 @@ def route_issues(db, config: dict[str, Any], *, require_test: bool = True) -> li
         }
         required = (
             ["streaming_text", "structured_output"]
-            if config["business_code"] in OUTLINE_ROUTES
+            if config["business_code"] in OUTLINE_ROUTES | {"agent_leader"}
             else ["streaming_text"]
         )
         if (

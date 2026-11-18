@@ -137,6 +137,7 @@ class ProviderGateway:
         resolved_config: dict[str, Any] | None = None,
         instructions: str | None = None,
         max_output_tokens: int | None = None,
+        turn_id: str | None = None,
     ) -> str:
         with session_scope() as db:
             presentation = db.get(Presentation, presentation_id) if presentation_id else None
@@ -191,6 +192,7 @@ class ProviderGateway:
             # remains protocol-agnostic; the registry owns protocol support.
             get_protocol_adapter(protocol)
             call = LlmCall(
+                turn_id=turn_id,
                 presentation_id=presentation_id,
                 purpose=purpose,
                 model=model,
@@ -245,7 +247,7 @@ class ProviderGateway:
         try:
             if presentation_id:
                 await emit_event(presentation_id, "llm.queued", {"call_id": call_id, "model_id": model_id, "queue_reason": "MODEL_CAPACITY"}, run_id)
-            async with MODEL_LIMITER.acquire(model_id, run_id=run_id or purpose, timeout_seconds=settings.model_queue_timeout_seconds):
+            async with MODEL_LIMITER.acquire(model_id, run_id=run_id or turn_id or purpose, timeout_seconds=settings.model_queue_timeout_seconds):
                 admitted_at = time.monotonic()
                 queue_duration_ms = int((time.monotonic() - queued_at) * 1000)
                 # Configuration can be revoked or disabled while waiting for a slot.
@@ -395,6 +397,12 @@ class ProviderGateway:
             raise ProviderError(error_code or "MODEL_INCOMPLETE", error or "模型未完成输出")
         return final_text if final_text is not None else "".join(output)
 
+    async def decide(self, context, decision_type, instructions, config, turn_id, presentation_id):
+        output = await self._stream(dumps(context), presentation_id, "agent_leader", decision_type.model_json_schema(),
+                                    business_code="agent_leader", resolved_config=config, instructions=instructions,
+                                    turn_id=turn_id)
+        return decision_type.model_validate_json(output)
+
     async def complete_json(self, prompt: str, presentation_id: str, purpose: str, run_id: str | None = None, business_code: str = "ppt_outline", *, instructions: str | None = None) -> dict[str, Any]:
         schema = OutlineDocument.model_json_schema()
         text = await self._stream(prompt, presentation_id, purpose, schema, run_id=run_id, business_code=business_code, instructions=instructions)
@@ -485,7 +493,7 @@ def sync_conversation_run(run_id: str, status: str, *, error: str | None = None)
         if not presentation or not presentation.conversation_id:
             return
         conversation = db.get(Conversation, presentation.conversation_id)
-        turn = db.scalar(
+        turn = db.get(ConversationTurn, run.turn_id) if run.turn_id else db.scalar(
             select(ConversationTurn)
             .where(ConversationTurn.presentation_id == presentation.id)
             .order_by(ConversationTurn.turn_no.desc())
@@ -532,7 +540,9 @@ def sync_conversation_run(run_id: str, status: str, *, error: str | None = None)
                 run.kind == "GENERATION" and status in {"SUCCEEDED", "READY"}
             ):
                 turn.completed_at = utcnow()
-        if status in {"SUCCEEDED", "READY"} and run.kind == "GENERATION":
+        if conversation.interaction_mode == "multi_turn":
+            conversation.state = "ACTIVE"
+        elif status in {"SUCCEEDED", "READY"} and run.kind == "GENERATION":
             conversation.state = "COMPLETED"
         elif status in {"FAILED", "PARTIAL_FAILED"}:
             conversation.state = "FAILED"
@@ -578,7 +588,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
             return
         run.status = "RUNNING"
         presentation.status = "PLANNING"
-        request, options = presentation.user_request, loads(presentation.options_json)
+        request, options = run.director_input or presentation.user_request, loads(presentation.options_json)
         workflow_code = presentation.workflow_code
     sync_conversation_run(run_id, "RUNNING")
     await emit_event(presentation_id, "director.stream.reset", {"run_id": run_id}, run_id)
@@ -595,16 +605,19 @@ async def run_director(presentation_id: str, run_id: str) -> None:
         normalized["slides"] = [s | {"slide_id": str(uuid.uuid4())} for s in normalized["slides"]]
         digest = canonical_hash(normalized)
         with session_scope() as db:
-            outline = Outline(presentation_id=presentation_id, revision=1, content_hash=digest, document_json=dumps(normalized))
+            run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
+            if run.status != "RUNNING":
+                return
+            last_revision = db.scalar(select(Outline.revision).where(Outline.presentation_id == presentation_id).order_by(Outline.revision.desc()).limit(1)) or 0
+            outline = Outline(presentation_id=presentation_id, revision=last_revision + 1, content_hash=digest, document_json=dumps(normalized))
             db.add(outline)
             db.flush()
-            run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
             run.status, presentation.status = "SUCCEEDED", "WAITING_CONFIRMATION"
             if presentation and presentation.conversation_id:
-                turn = db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == presentation_id).order_by(ConversationTurn.turn_no.desc()))
+                turn = db.get(ConversationTurn, run.turn_id) if run.turn_id else db.scalar(select(ConversationTurn).where(ConversationTurn.presentation_id == presentation_id).order_by(ConversationTurn.turn_no.desc()))
                 conversation = db.get(Conversation, presentation.conversation_id)
                 if turn and conversation:
-                    activity = db.scalar(select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id, ConversationMessage.kind == "activity").order_by(ConversationMessage.seq.desc()))
+                    activity = db.scalar(select(ConversationMessage).where(ConversationMessage.turn_id == turn.id, ConversationMessage.kind == "activity").order_by(ConversationMessage.seq.desc()))
                     if activity:
                         activity.status = "READY"
                         activity.payload_json = dumps({"stage_code": "outline_ready", "label": "大纲已生成，等待确认", "run_id": run_id})
@@ -616,7 +629,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
                         role="assistant",
                         kind="outline_card",
                         status="READY",
-                        payload_json=dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": digest, "status": "READY"}),
+                        payload_json=dumps({"run_id": run_id, "outline_id": outline.id, "revision": outline.revision, "content_hash": digest, "status": "READY"}),
                     ))
                     conversation.last_message_seq = seq
         await emit_event(presentation_id, "outline.ready", {"run_id": run_id, "outline": normalized, "content_hash": digest}, run_id)

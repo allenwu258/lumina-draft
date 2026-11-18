@@ -170,6 +170,7 @@ class GenerationSettingsRecord(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    memory_json: Mapped[str] = mapped_column(Text, default="{}")
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     entry_mode: Mapped[str] = mapped_column(String(20), default="ppt", index=True)
     interaction_mode: Mapped[str] = mapped_column(String(20), default="single_turn")
@@ -182,6 +183,8 @@ class Conversation(Base):
 
 class ConversationTurn(Base):
     __tablename__ = "conversation_turns"
+    request_id: Mapped[str | None] = mapped_column(String(80))
+    context_json: Mapped[str] = mapped_column(Text, default="{}")
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
     turn_no: Mapped[int] = mapped_column(Integer, default=1)
@@ -193,6 +196,13 @@ class ConversationTurn(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("conversation_id", "turn_no", name="uq_conversation_turn_no"),)
+
+
+class AgentStep(Base):
+    __tablename__ = "agent_steps"
+    turn_id: Mapped[str] = mapped_column(ForeignKey("conversation_turns.id"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    result_json: Mapped[str] = mapped_column(Text)
 
 
 class ConversationMessage(Base):
@@ -228,6 +238,8 @@ class Presentation(Base):
 
 class Run(Base):
     __tablename__ = "runs"
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    director_input: Mapped[str | None] = mapped_column(Text, nullable=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
     kind: Mapped[str] = mapped_column(String(30))
@@ -382,6 +394,7 @@ class IdempotencyRecord(Base):
 
 class LlmCall(Base):
     __tablename__ = "llm_calls"
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"))
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     presentation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     purpose: Mapped[str] = mapped_column(String(40))
@@ -642,13 +655,16 @@ def _upgrade_existing_schema() -> bool:
             "finished_at": "DATETIME NULL",
             "queue_duration_ms": "INTEGER NULL",
         },
-        "runs": {"error_code": "VARCHAR(80) NULL"},
+        "runs": {"error_code": "VARCHAR(80) NULL", "turn_id": "VARCHAR(36)", "director_input": "TEXT"},
+        "conversations": {"memory_json": "TEXT NOT NULL DEFAULT '{}'"},
+        "conversation_turns": {"request_id": "VARCHAR(80)", "context_json": "TEXT NOT NULL DEFAULT '{}'"},
         "presentations": {
             "conversation_id": "VARCHAR(36) NULL",
             "entry_mode": "VARCHAR(20) NOT NULL DEFAULT 'ppt'",
             "workflow_code": "VARCHAR(40) NOT NULL DEFAULT 'ppt_create'",
         },
         "llm_calls": {
+            "turn_id": "VARCHAR(36)",
             "error_code": "VARCHAR(80) NULL",
             "provider_id": "VARCHAR(36) NULL",
             "model_id": "VARCHAR(36) NULL",
@@ -674,6 +690,7 @@ def _upgrade_existing_schema() -> bool:
         connection.execute(text("UPDATE api_providers SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
         connection.execute(text("UPDATE api_providers SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
         connection.execute(text("UPDATE jobs SET queued_at = created_at WHERE queued_at IS NULL"))
+        connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_request ON conversation_turns (conversation_id, request_id)")
         connection.execute(
             text(
                 """UPDATE jobs

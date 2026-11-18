@@ -10,6 +10,7 @@ import {
 import { Notice } from './SettingsNotice';
 
 const routeDescriptions: Record<BusinessRoute['code'], string> = {
+  agent_leader: 'Leader · 理解对话、查阅作品并委派整份大纲任务',
   default: '未单独配置的业务使用此模型与思考预算',
   ppt_outline: 'Director · 生成 PPT 结构化作品说明书',
   ppt_html: 'Page Composer · 逐页生成 PPT HTML 内容',
