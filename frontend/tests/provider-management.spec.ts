@@ -79,6 +79,8 @@ test('Provider configuration, model discovery, routing and presentation generati
   await page.screenshot({ path: testInfo.outputPath('routing.png'), fullPage: true });
 
   await page.getByRole('button', { name: '返回工作台', exact: true }).click();
+  await page.locator('.entry-mode-trigger').click();
+  await page.getByRole('menuitem', { name: /PPT 生成/ }).click();
   await page.locator('.composer textarea').fill('制作一个用于验收 Provider 管理闭环的演示文稿。');
   await page.getByRole('button', { name: '生成说明书', exact: true }).click();
   const outlineBullets = page.locator('.outline-bullets').first();
@@ -241,19 +243,20 @@ test('Provider configuration, model discovery, routing and presentation generati
 test('Entry mode routing keeps unavailable workflows visible but blocked', async ({ page }) => {
   await page.goto('/');
   const mode = page.locator('.entry-mode-trigger');
+  await expect(mode).toHaveText('Agent 模式');
   await mode.click();
   const menu = page.getByRole('menu', { name: '选择创作模式' });
-  await expect(menu.getByRole('menuitem', { name: /Agent 模式/ })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: /图片生成/ })).toBeDisabled();
   await expect(menu.getByRole('menuitem', { name: /设计生成/ })).toHaveAttribute(
     'aria-disabled',
     'false',
   );
-  await menu.getByRole('menuitem', { name: /Agent 模式/ }).click();
+  await menu.getByRole('menuitem', { name: /PPT 生成/ }).click();
+  await expect(mode).toHaveText('PPT 生成');
+  await page.getByRole('button', { name: '新建作品', exact: true }).click();
+  await expect(mode).toHaveText('Agent 模式');
   await expect(page.getByPlaceholder(/步骤化/)).toBeVisible();
   await page.locator('.composer textarea').fill('用 Agent 方式梳理一个产品发布会');
-  await expect(page.getByRole('button', { name: '开始创作', exact: true })).toBeEnabled();
-  await mode.click();
-  await expect(menu.getByRole('menuitem', { name: /图片生成/ })).toBeDisabled();
   await expect(page.getByRole('button', { name: '开始创作', exact: true })).toBeEnabled();
 });
 
@@ -362,6 +365,8 @@ for (const concurrency of [1, 20]) {
     try {
       await page.goto('/');
       await page.locator('.new-button').click();
+      await page.locator('.entry-mode-trigger').click();
+      await page.getByRole('menuitem', { name: /PPT 生成/ }).click();
       await page.locator('.composer textarea').fill('concurrency-check');
       await page.getByRole('button', { name: '生成说明书', exact: true }).click();
       await page.getByRole('button', { name: '确认并生成 20 页', exact: true }).click();

@@ -5,11 +5,12 @@ import hashlib
 import json
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import settings
 from .db import ApiCredential, ApiEndpoint, ApiProvider, Conversation, ConversationMessage, ConversationTurn, Event, Job, LlmCall, LogicalModel, ModelBinding, Outline, PageTask, Presentation, ProviderTest, Run, dumps, loads, session_scope, utcnow
@@ -95,7 +96,9 @@ def build_page_graph(workflow: WorkflowSpec, node: str):
             presentation = db.get(Presentation, task.presentation_id) if task else None
             if not task or not presentation:
                 return {"error": "页面任务不存在"}
-            outline = db.scalar(select(Outline).where(Outline.presentation_id == task.presentation_id, Outline.confirmed.is_(True)).order_by(Outline.revision.desc()))
+            root = db.get(Run, task.batch_id) if task.batch_id else None
+            outline = db.get(Outline, root.outline_id) if root else db.scalar(select(Outline).where(
+                Outline.presentation_id == task.presentation_id, Outline.confirmed.is_(True)).order_by(Outline.revision.desc()))
             document = loads(outline.document_json)
             slide = loads(task.brief_json)
             slides = document["slides"]
@@ -141,7 +144,10 @@ class ProviderGateway:
     ) -> str:
         with session_scope() as db:
             presentation = db.get(Presentation, presentation_id) if presentation_id else None
-            snapshot = loads(presentation.config_snapshot_json) if presentation else {}
+            run = db.get(Run, run_id) if run_id else None
+            snapshot = loads(run.config_snapshot_json) if run and run.config_snapshot_json else (
+                loads(presentation.config_snapshot_json) if presentation else {})
+            turn_id = turn_id or (run.turn_id if run else None)
             config = resolved_config or (snapshot.get("resolved_routes") or {}).get(business_code)
             if not config and presentation and presentation.workflow_code == DESIGN.code:
                 raise ProviderError("CONFIG_NOT_READY", "设计作品缺少已冻结的模型配置")
@@ -462,15 +468,11 @@ async def finalize_cancelled_run(run_id: str) -> bool:
                 "PAGE_CANCELLED",
                 "页面生成已取消",
             )
+        sync_conversation_run(run_id, "CANCELLED", session=db)
+        append_event_tx(db, presentation_id, "run.cancelled", {"run_id": run_id, "status": "CANCELLED"}, run_id)
     from .scene_service import cancel_conversions
     await cancel_conversions(run_id)
-    await emit_event(
-        presentation_id,
-        "run.cancelled",
-        {"run_id": run_id, "status": "CANCELLED"},
-        run_id,
-    )
-    sync_conversation_run(run_id, "CANCELLED")
+    await EVENT_BUS.notify(presentation_id)
     return True
 
 
@@ -478,14 +480,14 @@ async def emit_page_delta(presentation_id: str, task_id: str, delta: str, run_id
     await emit_event(presentation_id, "page.html.delta", {"page_task_id": task_id, "delta": delta}, run_id)
 
 
-def sync_conversation_run(run_id: str, status: str, *, error: str | None = None) -> None:
+def sync_conversation_run(run_id: str, status: str, *, error: str | None = None, session=None) -> None:
     """Project a run transition onto the persisted conversation messages.
 
     Conversation messages are the durable UI projection. Runtime events remain the live
     transport, while this function makes refreshes and reopened works converge to the same
     state even when a worker exits between two SSE events.
     """
-    with session_scope() as db:
+    with (session_scope() if session is None else nullcontext(session)) as db:
         run = db.get(Run, run_id)
         if not run:
             return
@@ -512,7 +514,9 @@ def sync_conversation_run(run_id: str, status: str, *, error: str | None = None)
         for message in db.scalars(
             select(ConversationMessage).where(
                 ConversationMessage.conversation_id == conversation.id,
-                ConversationMessage.turn_id == (turn.id if turn else None),
+                (ConversationMessage.turn_id == (turn.id if turn else None))
+                | ((ConversationMessage.kind == "generation_card") &
+                   (func.json_extract(ConversationMessage.payload_json, "$.run_id") == run_id)),
             )
         ).all():
             payload = loads(message.payload_json)
@@ -528,7 +532,7 @@ def sync_conversation_run(run_id: str, status: str, *, error: str | None = None)
             turn.state = (
                 "GENERATING" if run.kind == "GENERATION" and status in {"QUEUED", "RUNNING"}
                 else "PLANNING" if run.kind == "DIRECTOR" and status in {"QUEUED", "RUNNING"}
-                else "WAITING_CONFIRMATION" if run.kind == "DIRECTOR" and status == "SUCCEEDED"
+                else "WAITING_CONFIRMATION" if run.kind == "DIRECTOR" and status == "SUCCEEDED" and not run.config_snapshot_json
                 else "COMPLETED" if status in {"SUCCEEDED", "READY"}
                 else "FAILED" if status in {"FAILED", "PARTIAL_FAILED"}
                 else "CANCELLED" if status == "CANCELLED"
@@ -537,7 +541,7 @@ def sync_conversation_run(run_id: str, status: str, *, error: str | None = None)
             if status in {"QUEUED", "RUNNING"}:
                 turn.completed_at = None
             elif status in {"FAILED", "PARTIAL_FAILED", "CANCELLED"} or (
-                run.kind == "GENERATION" and status in {"SUCCEEDED", "READY"}
+                (run.kind == "GENERATION" or run.config_snapshot_json) and status in {"SUCCEEDED", "READY"}
             ):
                 turn.completed_at = utcnow()
         if conversation.interaction_mode == "multi_turn":
@@ -601,7 +605,7 @@ async def run_director(presentation_id: str, run_id: str) -> None:
             expected_count = options.get("page_count")
             if expected_count is not None and len(doc.slides) != expected_count:
                 raise ProviderError("DESIGN_PAGE_COUNT_MISMATCH", f"大纲应包含 {expected_count} 页，实际生成 {len(doc.slides)} 页")
-            normalized["slides"].sort(key=lambda slide: slide["page_number"])
+        normalized["slides"].sort(key=lambda slide: slide["page_number"])
         normalized["slides"] = [s | {"slide_id": str(uuid.uuid4())} for s in normalized["slides"]]
         digest = canonical_hash(normalized)
         with session_scope() as db:
@@ -632,9 +636,10 @@ async def run_director(presentation_id: str, run_id: str) -> None:
                         payload_json=dumps({"run_id": run_id, "outline_id": outline.id, "revision": outline.revision, "content_hash": digest, "status": "READY"}),
                     ))
                     conversation.last_message_seq = seq
-        await emit_event(presentation_id, "outline.ready", {"run_id": run_id, "outline": normalized, "content_hash": digest}, run_id)
-        await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED", "kind": "DIRECTOR"}, run_id)
-        sync_conversation_run(run_id, "SUCCEEDED")
+            sync_conversation_run(run_id, "SUCCEEDED", session=db)
+            append_event_tx(db, presentation_id, "outline.ready", {"run_id": run_id, "outline": normalized, "content_hash": digest}, run_id)
+            append_event_tx(db, presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED", "kind": "DIRECTOR"}, run_id)
+        await EVENT_BUS.notify(presentation_id)
     except Exception as exc:
         message = str(exc)[:500]
         error_code = exc.code if isinstance(exc, ProviderError) else "DIRECTOR_FAILED"
@@ -642,8 +647,9 @@ async def run_director(presentation_id: str, run_id: str) -> None:
             run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
             if run: run.status, run.error_code, run.error = "FAILED", error_code, message
             if presentation: presentation.status = "FAILED"
-        sync_conversation_run(run_id, "FAILED", error=message)
-        await emit_event(presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": error_code}, run_id)
+            sync_conversation_run(run_id, "FAILED", error=message, session=db)
+            append_event_tx(db, presentation_id, "run.failed", {"run_id": run_id, "error": message, "error_code": error_code}, run_id)
+        await EVENT_BUS.notify(presentation_id)
 
 
 async def compose_page(presentation_id: str, run_id: str, task_id: str) -> None:
@@ -721,12 +727,17 @@ async def run_generation(presentation_id: str, run_id: str) -> None:
         for task in tasks:
             group.create_task(compose_page(presentation_id, run_id, task.id))
     with session_scope() as db:
-        statuses = [t.status for t in db.scalars(select(PageTask).where(PageTask.run_id == run_id)).all()]
         run, presentation = db.get(Run, run_id), db.get(Presentation, presentation_id)
-        success = all(s == "SUCCEEDED" for s in statuses)
+        if run.status != "RUNNING":
+            return
+        scope = PageTask.batch_id == run.batch_id if run.batch_id else PageTask.run_id == run_id
+        statuses = db.scalars(select(PageTask.status).where(scope)).all()
+        success = bool(statuses) and all(status == "SUCCEEDED" for status in statuses)
         run.status, run.error_code, presentation.status = ("SUCCEEDED" if success else "PARTIAL_FAILED"), (None if success else "PAGE_GENERATION_FAILED"), ("READY" if success else "PARTIAL_FAILED")
-    sync_conversation_run(run_id, "SUCCEEDED" if success else "PARTIAL_FAILED")
-    await emit_event(presentation_id, "run.completed", {"run_id": run_id, "status": "SUCCEEDED" if success else "PARTIAL_FAILED", "kind": "GENERATION"}, run_id)
+        sync_conversation_run(run_id, run.status, session=db)
+        append_event_tx(db, presentation_id, "run.completed", {"run_id": run_id, "batch_id": run.batch_id,
+                                                               "status": run.status, "kind": "GENERATION"}, run_id)
+    await EVENT_BUS.notify(presentation_id)
 
 
 async def scheduler(stop: asyncio.Event) -> None:

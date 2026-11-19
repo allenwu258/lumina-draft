@@ -27,7 +27,7 @@ from .scene_runtime import HEALTH as SCENE_HEALTH, scene_scheduler
 from .scene_service import summary as scene_summary, cancel_conversions, source_hash as page_source_hash
 from .export_api import router as export_router
 from . import export_service
-from .director_commands import enqueue_director, freeze_route
+from .director_commands import enqueue_director
 from .agent import leader, turns as agent_turns
 from .db import PptxExport
 
@@ -121,7 +121,7 @@ def outline_dict(o: Outline | None) -> dict | None:
 
 
 def run_dict(r: Run | None) -> dict | None:
-    return None if r is None else {"id": r.id, "kind": r.kind, "status": r.status, "error": r.error, "error_code": r.error_code, "created_at": r.created_at.isoformat()}
+    return None if r is None else {"id": r.id, "kind": r.kind, "batch_id": r.batch_id, "status": r.status, "error": r.error, "error_code": r.error_code, "created_at": r.created_at.isoformat()}
 
 
 def job_dict(job: Job | None) -> dict | None:
@@ -153,6 +153,16 @@ def conversation_projection(db, presentation: Presentation, outline: Outline | N
             .where(ConversationMessage.conversation_id == conversation.id)
             .order_by(ConversationMessage.seq)
         ).all()]
+    by_run = {run.id: run for run in runs}
+    for message in messages:
+        payload = message["payload"]
+        attempt = by_run.get(payload.get("run_id")) if message["kind"] == "generation_card" else None
+        if attempt and attempt.batch_id:
+            payload["batch_id"] = attempt.batch_id
+            root = by_run.get(attempt.batch_id)
+            source = db.get(Outline, root.outline_id) if root else None
+            if source:
+                payload.setdefault("revision", source.revision)
     confirmed = bool(outline and outline.confirmed)
     active_turn = agent_turns.active_leader(db, conversation.id) if conversation and presentation.entry_mode == "agent" else None
     has_generation = any(run.kind == "GENERATION" for run in runs)
@@ -427,13 +437,28 @@ async def create_presentation(body: CreatePresentationRequest, idempotency_key: 
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}")
-def get_presentation(presentation_id: str):
+def get_presentation(presentation_id: str, batch_id: str | None = None, outline_id: str | None = None, compact: bool = False):
     with session_scope() as db:
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
         outline = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
         runs = db.scalars(select(Run).where(Run.presentation_id == p.id).order_by(Run.created_at.desc())).all()
-        pages = db.scalars(select(PageTask).where(PageTask.presentation_id == p.id).order_by(PageTask.page_number)).all()
+        if batch_id:
+            root = db.get(Run, batch_id)
+            if not root or root.presentation_id != p.id or root.batch_id != root.id or not root.outline_id:
+                fail("NOT_FOUND", "PPT 批次不存在", 404)
+            outline = db.get(Outline, root.outline_id)
+        elif outline_id:
+            outline = db.get(Outline, outline_id)
+            if not outline or outline.presentation_id != p.id:
+                fail("NOT_FOUND", "大纲不存在", 404)
+        elif outline:
+            root = next((run for run in runs if run.outline_id == outline.id), None)
+            batch_id = root.id if root else None
+        page_scope = PageTask.batch_id == batch_id if batch_id else PageTask.batch_id.is_(None)
+        pages = db.scalars(select(PageTask).where(PageTask.presentation_id == p.id, page_scope).order_by(PageTask.page_number)).all()
+        if compact and batch_id:
+            return batch_details(db, p, batch_id, runs, pages)
         active_run = next((r for r in runs if r.status in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}), None)
         active_job = db.scalar(select(Job).where(Job.run_id == active_run.id)) if active_run else None
         latest_job = db.scalar(select(Job).where(Job.run_id == runs[0].id)) if runs else None
@@ -465,9 +490,24 @@ def get_presentation(presentation_id: str):
                 if channel in director_stream:
                     director_stream[channel] += payload.get("delta", "")
         conversation = conversation_projection(db, p, outline, runs)
-        export_source = export_service.source_summary(db, p.id)
-        latest_export = db.scalar(select(PptxExport).where(PptxExport.presentation_id == p.id, PptxExport.request_hash == export_service.request_identity(p.id, export_source["source_hash"])).order_by(PptxExport.created_at.desc()).limit(1)) if export_source["can_export"] else None
-        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "pages": [page_dict(x, db) for x in pages], "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq, "export_source": export_source, "latest_export": export_service.export_dict(latest_export) if latest_export else None}
+        return {"presentation": presentation_dict(p), "conversation": conversation, "latest_outline": outline_dict(outline), "active_run": run_dict(active_run), "active_job": job_dict(active_job), "latest_run": run_dict(runs[0]) if runs else None, "latest_job": job_dict(latest_job), "active_streams": streams, "director_stream": director_stream if stream_run else None, "last_event_seq": last_seq, **batch_details(db, p, batch_id, runs, pages)}
+
+
+def batch_details(db, presentation, batch_id, runs, pages):
+    source = export_service.source_summary(db, presentation.id, batch_id)
+    latest_export = None
+    if source["can_export"]:
+        identity = export_service.request_identity(presentation.id, source["source_hash"])
+        latest_export = db.scalar(select(PptxExport).where(PptxExport.presentation_id == presentation.id,
+                                                           PptxExport.request_hash == identity))
+    run = next((run for run in runs if batch_id and run.batch_id == batch_id), None)
+    return {"batch_id": batch_id, "batch_run": run_dict(run), "pages": [page_dict(page, db) for page in pages],
+            "export_source": source, "latest_export": export_service.export_dict(latest_export) if latest_export else None}
+
+
+@app.get(f"{API}/presentations/{{presentation_id}}/batches/{{batch_id}}")
+def get_batch(presentation_id: str, batch_id: str, compact: bool = False):
+    return get_presentation(presentation_id, batch_id=batch_id, compact=compact)
 
 
 @app.get(f"{API}/presentations/{{presentation_id}}/outlines/{{outline_id}}")
@@ -510,37 +550,51 @@ async def update_outline(presentation_id: str, body: UpdateOutlineRequest):
         db.execute(text("BEGIN IMMEDIATE"))
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
-        old = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
-        if p.status != "WAITING_CONFIRMATION": fail("INVALID_STATE", "当前不能编辑说明书")
+        latest = db.scalar(select(Outline).where(Outline.presentation_id == p.id).order_by(Outline.revision.desc()))
+        chat = db.get(Conversation, p.conversation_id) if p.conversation_id else None
+        agent_mode = p.entry_mode == "agent" and chat is not None
+        old = latest
+        if not agent_mode and p.status != "WAITING_CONFIRMATION": fail("INVALID_STATE", "当前不能编辑说明书")
         if not old or old.id != body.outline_id or old.content_hash != body.content_hash: fail("OUTLINE_VERSION_CONFLICT", "说明书已更新，请刷新")
+        if old.confirmed: fail("INVALID_STATE", "此大纲已确认，请在对话中起草新版本")
         before = loads(old.document_json)
         if [(x["slide_id"], x["page_number"]) for x in before["slides"]] != [(x["slide_id"], x["page_number"]) for x in document["slides"]]:
             fail("INVALID_SLIDES", "不能增删页面或修改页面顺序", 422)
-        outline = Outline(presentation_id=p.id, revision=old.revision+1, content_hash=canonical_hash(document), document_json=dumps(document))
+        outline = Outline(presentation_id=p.id, revision=latest.revision+1, content_hash=canonical_hash(document), document_json=dumps(document))
         db.add(outline)
         db.flush()
-        if p.conversation_id:
+        new_card = None
+        if chat:
             card = db.scalar(select(ConversationMessage).where(
                 ConversationMessage.conversation_id == p.conversation_id,
                 ConversationMessage.kind == "outline_card",
             ).order_by(ConversationMessage.seq.desc()))
             if card:
                 payload = dumps({"outline_id": outline.id, "revision": outline.revision, "content_hash": outline.content_hash, "status": "READY"})
-                conversation = db.get(Conversation, p.conversation_id)
-                if conversation.interaction_mode == "multi_turn":
-                    conversation.last_message_seq += 1
-                    db.add(ConversationMessage(conversation_id=conversation.id, turn_id=card.turn_id,
-                                               seq=conversation.last_message_seq, role="assistant", kind="outline_card",
-                                               status="READY", payload_json=payload))
+                if agent_mode:
+                    chat.last_message_seq += 1
+                    new_card = ConversationMessage(conversation_id=chat.id, turn_id=card.turn_id,
+                                                   seq=chat.last_message_seq, role="assistant", kind="outline_card",
+                                                   status="READY", payload_json=payload)
+                    db.add(new_card)
+                    db.flush()
                 else:
                     card.payload_json = payload
         result = outline_dict(outline)
+        if new_card:
+            result["message_id"] = new_card.id
     await emit_event(presentation_id, "outline.updated", {"outline_id": result["id"], "content_hash": result["content_hash"]})
     return result
 
 
 @app.post(f"{API}/presentations/{{presentation_id}}/confirm", status_code=202)
 async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
+    with session_scope() as db:
+        work = db.get(Presentation, presentation_id)
+        chat = db.get(Conversation, work.conversation_id) if work and work.conversation_id else None
+        agent_mode = bool(work and work.entry_mode == "agent" and chat and chat.interaction_mode == "multi_turn")
+    if agent_mode:
+        return await agent_turns.confirm_outline(presentation_id, body)
     with session_scope() as db:
         db.execute(text("BEGIN IMMEDIATE"))
         p = db.get(Presentation, presentation_id)
@@ -551,12 +605,6 @@ async def confirm_presentation(presentation_id: str, body: ConfirmRequest):
             return {"presentation_id": p.id, "run_id": run.id, "status": p.status}
         if p.status != "WAITING_CONFIRMATION": fail("INVALID_STATE", "当前不能确认说明书")
         if not outline or outline.id != body.outline_id or outline.content_hash != body.content_hash: fail("OUTLINE_VERSION_CONFLICT", "说明书已更新，请刷新")
-        chat = db.get(Conversation, p.conversation_id) if p.conversation_id else None
-        if chat and chat.interaction_mode == "multi_turn" and not scheduled_model_id(loads(p.config_snapshot_json), "GENERATION", p.workflow_code):
-            try:
-                freeze_route(db, p, WORKFLOWS[p.workflow_code].page_route)
-            except ConfigurationError as exc:
-                fail(exc.code, str(exc), exc.status_code)
         document = loads(outline.document_json)
         outline.confirmed, p.status = True, "GENERATING"
         run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")
@@ -620,8 +668,11 @@ async def retry_presentation(presentation_id: str):
         p = db.get(Presentation, presentation_id)
         if not p: fail("NOT_FOUND", "作品不存在", 404)
         previous = db.scalar(select(Run).where(Run.presentation_id == p.id).order_by(Run.created_at.desc()))
+        if not previous or previous.batch_id:
+            fail("INVALID_STATE", "请从对应的 PPT 卡重试")
         if p.status in {"FAILED", "CANCELLED"} and previous.kind == "DIRECTOR":
-            run = enqueue_director(db, p, turn_id=previous.turn_id, request=previous.director_input)
+            run = enqueue_director(db, p, turn_id=previous.turn_id, request=previous.director_input,
+                                   config_snapshot=previous.config_snapshot_json)
             retry_kind = "activity"
         elif p.status in {"PARTIAL_FAILED", "CANCELLED"} and previous.kind == "GENERATION":
             run = Run(presentation_id=p.id, kind="GENERATION", status="QUEUED")

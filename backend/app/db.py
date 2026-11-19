@@ -238,6 +238,9 @@ class Presentation(Base):
 
 class Run(Base):
     __tablename__ = "runs"
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    outline_id: Mapped[str | None] = mapped_column(ForeignKey("outlines.id"), nullable=True)
+    config_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
     director_input: Mapped[str | None] = mapped_column(Text, nullable=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -263,6 +266,7 @@ class Outline(Base):
 
 class PageTask(Base):
     __tablename__ = "page_tasks"
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
@@ -454,6 +458,8 @@ def init_db() -> None:
     migrated_reasoning = _upgrade_existing_schema()
     with SessionLocal() as db:
         _backfill_conversations(db)
+        for work in db.scalars(select(Presentation).where(Presentation.entry_mode == "agent")):
+            backfill_agent_batch(db, work)
         if db.get(GenerationSettingsRecord, "default") is None:
             db.add(GenerationSettingsRecord(id="default", reasoning_effort="high"))
             db.commit()
@@ -514,6 +520,27 @@ def init_db() -> None:
             db.add(SchemaMigration(version=PROVIDER_MIGRATION))
         db.commit()
     _migrate_model_concurrency()
+
+
+def backfill_agent_batch(db, work) -> None:
+    runs = db.scalars(select(Run).where(Run.presentation_id == work.id, Run.kind == "GENERATION")
+                      .order_by(Run.created_at, Run.id)).all()
+    if not runs or any(run.batch_id for run in runs):
+        return
+    outlines = db.scalars(select(Outline).where(Outline.presentation_id == work.id, Outline.confirmed.is_(True))).all()
+    if len(outlines) != 1:
+        return
+    outline, root = outlines[0], runs[0]
+    pages = db.scalars(select(PageTask).where(PageTask.presentation_id == work.id)).all()
+    if sorted((page.page_number, page.slide_id) for page in pages) != sorted(
+        (slide["page_number"], slide["slide_id"]) for slide in loads(outline.document_json)["slides"]
+    ):
+        return
+    root.outline_id = outline.id
+    for run in runs:
+        run.batch_id = root.id
+    for page in pages:
+        page.batch_id = root.id
 
 
 def _backfill_conversations(db) -> None:
@@ -639,7 +666,7 @@ def _upgrade_existing_schema() -> bool:
             "archived_at": "DATETIME NULL",
         },
         "business_routes": {"reasoning_tier": "VARCHAR(40) NOT NULL DEFAULT 'high'"},
-        "page_tasks": {"error_code": "VARCHAR(80) NULL", "current_scene_job_id": "VARCHAR(36) NULL", "current_scene_id": "VARCHAR(36) NULL"},
+        "page_tasks": {"error_code": "VARCHAR(80) NULL", "current_scene_job_id": "VARCHAR(36) NULL", "current_scene_id": "VARCHAR(36) NULL", "batch_id": "VARCHAR(36)"},
         "page_scenes": {"warning_count": "INTEGER NOT NULL DEFAULT 0"},
         "scene_conversion_jobs": {
             "canvas_width": "INTEGER NOT NULL DEFAULT 800",
@@ -655,7 +682,8 @@ def _upgrade_existing_schema() -> bool:
             "finished_at": "DATETIME NULL",
             "queue_duration_ms": "INTEGER NULL",
         },
-        "runs": {"error_code": "VARCHAR(80) NULL", "turn_id": "VARCHAR(36)", "director_input": "TEXT"},
+        "runs": {"error_code": "VARCHAR(80) NULL", "turn_id": "VARCHAR(36)", "director_input": "TEXT",
+                 "batch_id": "VARCHAR(36)", "outline_id": "VARCHAR(36)", "config_snapshot_json": "TEXT"},
         "conversations": {"memory_json": "TEXT NOT NULL DEFAULT '{}'"},
         "conversation_turns": {"request_id": "VARCHAR(80)", "context_json": "TEXT NOT NULL DEFAULT '{}'"},
         "presentations": {
@@ -691,6 +719,10 @@ def _upgrade_existing_schema() -> bool:
         connection.execute(text("UPDATE api_providers SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
         connection.execute(text("UPDATE jobs SET queued_at = created_at WHERE queued_at IS NULL"))
         connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_request ON conversation_turns (conversation_id, request_id)")
+        connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_run_outline ON runs (outline_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_run_batch ON runs (batch_id, created_at)")
+        connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_page_batch_number ON page_tasks (batch_id, page_number)")
+        connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_page_batch_slide ON page_tasks (batch_id, slide_id)")
         connection.execute(
             text(
                 """UPDATE jobs

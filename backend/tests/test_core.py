@@ -321,6 +321,61 @@ def test_entry_modes_and_persisted_special_messages(client):
     assert conversation["turns"][0]["completed_at"] is not None
 
 
+def test_agent_card_action_validates_latest_outline_and_replays(client, monkeypatch):
+    from backend.app.agent import leader
+
+    async def unexpected_decision(*args, **kwargs):
+        pytest.fail("An explicit card action should not make a routing model call")
+
+    monkeypatch.setattr(leader.ProviderGateway, "decide", unexpected_decision)
+    created = client.post("/api/v1/presentations", json={"user_request": "Legacy Agent draft", "entry_mode": "agent"}).json()
+    work_id = created["presentation_id"]
+    path = f"/api/v1/presentations/{work_id}"
+    initial = wait_status(client, work_id, {"WAITING_CONFIRMATION"})
+    initial_outline = initial["latest_outline"]
+    initial_card = initial["conversation"]["messages"][-1]
+    edited = initial_outline["document"]
+    edited["brief"]["title"] = "Saved Agent version"
+    saved = client.put(path + "/outline", json={
+        "outline_id": initial_outline["id"], "content_hash": initial_outline["content_hash"], "document": edited,
+    })
+    assert saved.status_code == 200, saved.text
+    current = saved.json()
+
+    def action(request_id, card_id, digest):
+        return {"client_request_id": request_id, "text": "确认大纲并生成 PPT", "action": {
+            "type": "compose_deck", "artifact_message_id": card_id, "expected_content_hash": digest,
+        }}
+
+    def assert_rejected(body, code):
+        response = client.post(path + "/turns", json=body)
+        assert response.status_code == 202, response.text
+        for _ in range(100):
+            snapshot = client.get(path).json()
+            if snapshot["conversation"]["active_leader_turn_id"] is None:
+                break
+            time.sleep(.05)
+        assert snapshot["conversation"]["messages"][-1]["payload"]["code"] == code
+        assert not snapshot["latest_outline"]["confirmed"]
+        assert snapshot["batch_id"] is None
+
+    assert_rejected(action("stale", initial_card["id"], initial_outline["content_hash"]), "OUTLINE_VERSION_CONFLICT")
+    assert_rejected(action("hash", current["message_id"], "0" * 64), "OUTLINE_VERSION_CONFLICT")
+    body = action("compose", current["message_id"], current["content_hash"])
+    response = client.post(path + "/turns", json=body)
+    assert response.status_code == 202, response.text
+    assert client.post(path + "/turns", json=body).json() == response.json()
+    assert client.post(path + "/turns", json=dict(body, text="other")).status_code == 409
+    snapshot = wait_status(client, work_id, {"READY"})
+    assert snapshot["latest_outline"]["confirmed"]
+    cards = snapshot["conversation"]["messages"]
+    assert [card["id"] for card in cards if card["kind"] == "outline_card"] == [initial_card["id"], current["message_id"]]
+    assert len([card for card in cards if card["kind"] == "generation_card"]) == 1
+    batch = client.get(path + f"/batches/{snapshot['batch_id']}?compact=true").json()
+    assert "conversation" not in batch
+    assert batch["pages"] == snapshot["pages"]
+
+
 @pytest.mark.asyncio
 async def test_sse_replays_from_last_event_id(client):
     response = client.post("/api/v1/presentations", json={"user_request": "Create a one-page test deck"})

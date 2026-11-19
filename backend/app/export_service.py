@@ -21,6 +21,7 @@ from .db import (
     PageTask,
     PptxExport,
     Presentation,
+    Run,
     SceneConversionJob,
     loads,
     utcnow,
@@ -50,13 +51,16 @@ class ExportError(ValueError):
         super().__init__(message)
 
 
-def source_manifest(db, presentation_id: str) -> dict:
+def source_manifest(db, presentation_id: str, batch_id: str | None = None) -> dict:
     presentation = db.get(Presentation, presentation_id)
     if not presentation:
         raise ExportError("NOT_FOUND", "作品不存在")
     if presentation.workflow_code != PPT.code:
         raise ExportError("EXPORT_NOT_SUPPORTED", "设计作品暂不支持 PPTX 导出")
-    outline = db.scalar(
+    root = db.get(Run, batch_id) if batch_id else None
+    if batch_id and (not root or root.presentation_id != presentation_id or root.batch_id != root.id or not root.outline_id):
+        raise ExportError("NOT_FOUND", "PPT 批次不存在")
+    outline = db.get(Outline, root.outline_id) if root else db.scalar(
         select(Outline)
         .where(Outline.presentation_id == presentation_id)
         .order_by(Outline.revision.desc())
@@ -64,11 +68,14 @@ def source_manifest(db, presentation_id: str) -> dict:
     )
     if not outline or not outline.confirmed:
         raise ExportError("OUTLINE_NOT_CONFIRMED", "请先确认大纲并完成全部页面")
+    if not root:
+        root = db.scalar(select(Run).where(Run.outline_id == outline.id))
+    scope = PageTask.batch_id == root.id if root else PageTask.batch_id.is_(None)
     document = loads(outline.document_json)
     slides = document.get("slides", [])
     pages = db.scalars(
         select(PageTask)
-        .where(PageTask.presentation_id == presentation_id)
+        .where(PageTask.presentation_id == presentation_id, scope)
         .order_by(PageTask.page_number, PageTask.id)
     ).all()
     if not 1 <= len(slides) <= 20 or len(pages) != len(slides):
@@ -95,6 +102,7 @@ def source_manifest(db, presentation_id: str) -> dict:
             }
         )
     return {
+        **({"batch_id": root.id} if root else {}),
         "outline_id": outline.id,
         "outline_hash": outline.content_hash,
         "title": document["brief"]["title"],
@@ -102,11 +110,15 @@ def source_manifest(db, presentation_id: str) -> dict:
     }
 
 
-def source_summary(db, presentation_id: str) -> dict:
+def manifest_source_hash(manifest):
+    return digest(canonical({key: value for key, value in manifest.items() if key != "batch_id"}))
+
+
+def source_summary(db, presentation_id: str, batch_id: str | None = None) -> dict:
     try:
-        manifest = source_manifest(db, presentation_id)
+        manifest = source_manifest(db, presentation_id, batch_id)
         return {
-            "source_hash": digest(canonical(manifest)),
+            "source_hash": manifest_source_hash(manifest),
             "can_export": True,
             "reason": None,
         }
@@ -170,9 +182,9 @@ def exportable_ref(result):
     )
 
 
-def create_tx(db, presentation_id, expected_hash, retry=False):
-    manifest = source_manifest(db, presentation_id)
-    source = digest(canonical(manifest))
+def create_tx(db, presentation_id, expected_hash, retry=False, batch_id=None):
+    manifest = source_manifest(db, presentation_id, batch_id)
+    source = manifest_source_hash(manifest)
     if source != expected_hash:
         raise ExportError("SOURCE_CHANGED", "作品已更新，请刷新后重新导出")
     manifest["target"] = SCENE_TARGET

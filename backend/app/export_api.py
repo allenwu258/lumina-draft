@@ -17,6 +17,7 @@ class ExportRequest(BaseModel):
     format: Literal["pptx"] = "pptx"
     expected_source_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     retry: bool = False
+    batch_id: str | None = None
 
 
 @router.post("/presentations/{presentation_id}/exports", status_code=202)
@@ -25,7 +26,7 @@ async def create_export(presentation_id: str, body: ExportRequest, response: Res
         with session_scope() as db:
             try:
                 record = service.create_tx(
-                    db, presentation_id, body.expected_source_hash, body.retry
+                    db, presentation_id, body.expected_source_hash, body.retry, body.batch_id
                 )
                 result = service.export_dict(record)
             except service.ExportError as exc:

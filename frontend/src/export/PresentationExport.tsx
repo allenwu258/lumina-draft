@@ -19,9 +19,9 @@ export type ExportSummary = {
   warnings: string[];
   download_url: string | null;
 };
-type Props = { presentationId: string; source?: ExportSource; latest?: ExportSummary | null };
+type Props = { presentationId: string; batchId?: string | null; source?: ExportSource; latest?: ExportSummary | null };
 
-export function PresentationExport({ presentationId, source, latest }: Props) {
+export function PresentationExport({ presentationId, batchId, source, latest }: Props) {
   const [record, setRecord] = useState(latest || null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
@@ -63,6 +63,7 @@ export function PresentationExport({ presentationId, source, latest }: Props) {
           method: 'POST',
           body: JSON.stringify({
             format: 'pptx',
+            ...(batchId ? { batch_id: batchId } : {}),
             expected_source_hash: source.source_hash,
             retry: record?.status === 'FAILED',
           }),

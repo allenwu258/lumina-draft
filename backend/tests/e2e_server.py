@@ -29,6 +29,7 @@ provider_api.delete_secret = lambda ref: _secrets.pop(ref, None) is not None
 _html_release = asyncio.Event()
 _html_release.set()
 _active_html = 0
+_customer_page_attempts = 0
 _web_origin = "http://127.0.0.1:" + os.getenv("E2E_WEB_PORT", "15173")
 
 
@@ -49,14 +50,18 @@ async def isolated_browser_origin(request, call_next):
 
 
 async def fake_stream(**kwargs):
-    global _active_html
+    global _active_html, _customer_page_attempts
     schema = kwargs.get("json_schema") or {}
     if "ok" in schema.get("properties", {}):
         text = '{"ok":true}'
     elif "action" in schema.get("properties", {}):
         context = json.loads(kwargs["prompt"])
-        if context["user"] in {"请起草整份大纲", "将渠道分析放最后"}:
+        if context["user"] in {"请起草整份大纲", "将渠道分析放最后", "把大纲 V2 改写为客户汇报大纲"}:
             decision = {"action": "draft_outline", "text": context["user"]}
+        elif context["user"] in {"按这版生成 PPT", "按大纲 V3 生成 PPT", "按大纲 V2 生成 PPT"}:
+            decision = {"action": "compose_deck", "intent_quote": context["user"]}
+        elif context["user"] == "如果按这版生成会怎样？":
+            decision = {"action": "reply", "text": "确认后我会按这版大纲逐页制作。"}
         elif not context["recent"]:
             decision = {"action": "clarify", "text": "这次汇报希望董事会决定什么？",
                         "memory": [{"key": "audience", "quote": "董事会"}]}
@@ -126,6 +131,9 @@ async def fake_stream(**kwargs):
             base = task["基准大纲"]
             assert base["slides"][0]["title"] == "渠道分析"
             doc["slides"] = list(reversed(base["slides"]))
+        elif task["本轮用户要求"] == "把大纲 V2 改写为客户汇报大纲":
+            assert task["基准大纲"]["brief"]["purpose"] == "供董事会决策的工作汇报"
+            doc["slides"] = [dict(doc["slides"][0], title=title) for title in ("客户现状", "交付安排", "下一步")]
         else:
             doc["slides"] = [dict(doc["slides"][0], title=title) for title in ("渠道分析", "行动计划")]
         for number, slide in enumerate(doc["slides"], 1):
@@ -140,6 +148,14 @@ async def fake_stream(**kwargs):
         title = json.loads(kwargs["prompt"].split("当前页面：\n", 1)[1].splitlines()[0])["title"]
         text = text.replace("800px", width + "px").replace("450px", height + "px")
         text = text.replace("Provider 验收完成", escape(title))
+    elif not schema and "当前页面：\n" in kwargs["prompt"]:
+        title = json.loads(kwargs["prompt"].split("当前页面：\n", 1)[1].splitlines()[0])["title"]
+        if title in {"客户现状", "交付安排", "下一步", "渠道分析", "行动计划"}:
+            text = text.replace("Provider 验收完成", escape(title))
+        if title == "交付安排":
+            _customer_page_attempts += 1
+            if _customer_page_attempts <= 2:
+                text = "invalid HTML for testing page retry"
     if schema and "concurrency-check" in kwargs.get("prompt", ""):
         doc = json.loads(text)
         doc["slides"] = [

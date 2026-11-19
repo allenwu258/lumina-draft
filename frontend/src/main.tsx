@@ -1,32 +1,31 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowDown, ArrowLeft, ArrowRight, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, CircleHelp, FileText, Image, Layers3, LayoutTemplate, LoaderCircle, PanelLeftClose, PanelRightClose, PanelRightOpen, Palette, Plus, RefreshCw, Send, Settings2, ShieldCheck, Sparkles, UserRound, X } from 'lucide-react';
+import { Activity, ArrowLeft, ArrowRight, Bot, Check, ChevronDown, ChevronUp, CircleHelp, FileText, Image, Layers3, LayoutTemplate, LoaderCircle, PanelLeftClose, PanelRightClose, PanelRightOpen, Palette, Plus, RefreshCw, Send, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import './styles.css';
 import './generation-settings.css';
 import './chat-ui.css';
-import { OutlineVersionCard } from './OutlineVersionCard';
-import { AgentComposer } from './AgentComposer';
+import { AgentConversation } from './AgentConversation';
+import { SlideFrame } from './SlideFrame';
+import { api, type Slide, type OutlineDocument as Document, type Page, type OutlineVersion, type ConversationMessage } from './workbench-api';
 import { ProviderSettings, type SettingsTab } from './ProviderSettings';
 import './layout.css';
 import { GenerationProgress, PageStatusIcon, pageStatusLabel } from './PageStatus';
 import type { CanvasSize } from '@lumina/scene-core';
 import { canvasRatio, defaultDesignDraft, designOptions, DesignOptions } from './DesignOptions';
-import { fitCanvas } from './scene/fitCanvas';
 import { SceneViewport } from './scene/SceneViewport';
-import type { SceneSummary } from './scene/scene-api';
 import { PresentationExport, type ExportSource, type ExportSummary } from './export/PresentationExport';
 
-type Slide = { slide_id: string; page_number: number; page_type: string; title: string; key_message: string; content_outline: string[]; design_notes: string; summary: string };
-type Document = { schema_version: string; brief: { title: string; purpose: string; audience: string; language: string; tone: string; assumptions: string[] }; style_spec: { description: string; colors: Record<string,string>; typography: {font_family:string;title_size_px:number;body_size_px:number;caption_size_px:number}; layout_rules:string[] }; slides: Slide[] };
-type Page = { id:string; run_id:string; page_number:number; title:string; status:string; html_hash:string|null; error:string|null; error_code:string|null; scene?:SceneSummary };
 type JobState = { id:string; status:string; queue_reason:string|null; queue_duration_ms:number|null; error_code:string|null; error:string|null };
 type DirectorStream = {reasoning:string;output:string};
 type EntryMode = 'agent' | 'ppt' | 'design' | 'image';
-type ConversationMessage = {id:string;seq:number;role:string;kind:string;status:string;body_text:string|null;payload:Record<string,unknown>;created_at:string};
-type Snapshot = { presentation:{id:string;user_request:string;status:string;entry_mode:EntryMode;workflow_code:string;canvas:CanvasSize;conversation_id:string|null;created_at:string}; conversation?:{id:string|null;entry_mode:EntryMode;interaction_mode:string;active_leader_turn_id?:string|null;state:string;messages:ConversationMessage[];allowed_actions:Record<string,boolean>;allowed_views:{outline:boolean;generation:boolean}}; latest_outline:{id:string;revision:number;content_hash:string;confirmed:boolean;document:Document}|null; pages:Page[]; active_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; active_job:JobState|null; latest_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; latest_job:JobState|null; active_streams:Record<string,string>; director_stream:DirectorStream|null; last_event_seq:number; export_source?:ExportSource; latest_export?:ExportSummary|null };
+type Snapshot = { presentation:{id:string;user_request:string;status:string;entry_mode:EntryMode;workflow_code:string;canvas:CanvasSize;conversation_id:string|null;created_at:string}; conversation?:{id:string|null;entry_mode:EntryMode;interaction_mode:string;active_leader_turn_id?:string|null;state:string;messages:ConversationMessage[];allowed_actions:Record<string,boolean>;allowed_views:{outline:boolean;generation:boolean}}; latest_outline:OutlineVersion|null; pages:Page[]; active_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; active_job:JobState|null; latest_run:{id:string;kind:string;status:string;error:string|null;error_code:string|null}|null; latest_job:JobState|null; active_streams:Record<string,string>; director_stream:DirectorStream|null; last_event_seq:number; export_source?:ExportSource; latest_export?:ExportSummary|null };
 type SessionUsage = {presentation_id:string;call_count:number;input_tokens:number|null;output_tokens:number|null;total_tokens:number|null;input_unreported_calls:number;output_unreported_calls:number;total_unreported_calls:number};
 type Provider = {name:string;base_url:string;model:string;enabled:boolean;revision:number;credential_configured:boolean};
-const api = async <T,>(path:string, init?:RequestInit):Promise<T> => { const response=await fetch(`/api/v1${path}`,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})}}); const data=await response.json(); if(!response.ok) throw new Error(data?.detail?.message||data?.detail||'请求失败'); return data as T; };
+function writeOutline(id:string, outline:NonNullable<Snapshot['latest_outline']>, document:Document) {
+  return api<NonNullable<Snapshot['latest_outline']>>(`/presentations/${id}/outline`, {
+    method:'PUT', body:JSON.stringify({outline_id:outline.id, content_hash:outline.content_hash, document}),
+  });
+}
 
 const ENTRY_MODES: Array<{code:EntryMode; label:string; description:string; enabled:boolean; icon:typeof Bot}> = [
   {code:'agent', label:'Agent 模式', description:'对话式创作，展示完整工作过程', enabled:true, icon:Bot},
@@ -35,6 +34,7 @@ const ENTRY_MODES: Array<{code:EntryMode; label:string; description:string; enab
   {code:'image', label:'图片生成', description:'工作流尚未开放', enabled:false, icon:Image},
 ];
 
+const DEFAULT_ENTRY_MODE: EntryMode = 'agent';
 const PPT_CANVAS: CanvasSize = { width: 800, height: 450 };
 const MODE_LABELS = Object.fromEntries(ENTRY_MODES.map(mode => [mode.code, mode.label]));
 const modeIcon = (mode: EntryMode) => mode === 'agent' ? Bot : mode === 'design' ? Palette : LayoutTemplate;
@@ -98,7 +98,7 @@ function OutlineBulletsInput({ value, onChange, readOnly = false }: { value: str
 function App(){
   const [presentations,setPresentations]=useState<any[]>([]); const [activeId,setActiveId]=useState<string|null>(()=>sessionStorage.getItem('lumina.activePresentation')); const [snapshot,setSnapshot]=useState<Snapshot|null>(null);
   const [prompt,setPrompt]=useState(''); const [loading,setLoading]=useState(false); const [error,setError]=useState('');
-  const [entryMode,setEntryMode]=useState<EntryMode>('ppt');
+  const [entryMode,setEntryMode]=useState<EntryMode>(DEFAULT_ENTRY_MODE);
   const [designDraft,setDesignDraft]=useState(defaultDesignDraft);
   const { canvas: requestedCanvas, page_count, canvasValid, pagesValid } = designOptions(designDraft);
   const creatingDesign = entryMode === 'design';
@@ -111,14 +111,37 @@ function App(){
   useEffect(()=>{const onPop=()=>setSettingsPage(settingsTabFromPath());window.addEventListener('popstate',onPop);return()=>window.removeEventListener('popstate',onPop);},[]);
   const [doc,setDoc]=useState<Document|null>(null); const [selectedPage,setSelectedPage]=useState(0); const [view,setView]=useState<'scene'|'preview'|'source'>('scene'); const [workspaceView,setWorkspaceView]=useState<'outline'|'generation'>('outline'); const [previewOpen,setPreviewOpen]=useState(true); const [streamHtml,setStreamHtml]=useState<Record<string,string>>({}); const [directorStream,setDirectorStream]=useState<DirectorStream>({reasoning:'',output:''}); const [sourceHtml,setSourceHtml]=useState('');
   const selectedWork = useRef(activeId);
+  const [runUpdates, setRunUpdates] = useState<Record<string, number>>({});
   const snapshotRequest = useRef(0);
   const loadedOutlineHash = useRef<string | null>(null);
   const initialRequest = useRef({body:"",key:""});
   const loadedPresentationRef=useRef<string|null>(null);
   const [pageRailWidth,setPageRailWidth]=useState(220); const railResizeRef=useRef<{startX:number;startWidth:number}|null>(null);
-  const sourceRef=useRef<EventSource|null>(null); const workbenchRef=useRef<HTMLElement|null>(null); const followAgentTail=useRef(true); const feedRef=useRef<HTMLDivElement>(null); const [sidebarOpen,setSidebarOpen]=useState(true); const [usage,setUsage]=useState<SessionUsage|null>(null); const usageRequest=useRef(0);
+  const sourceRef=useRef<EventSource|null>(null); const [sidebarOpen,setSidebarOpen]=useState(true); const [usage,setUsage]=useState<SessionUsage|null>(null); const usageRequest=useRef(0);
   const refreshList=useCallback(async()=>{try{const result=await api<{items:any[]}>('/presentations');setPresentations(result.items)}catch{}},[]);
-  const loadSnapshot=useCallback(async(id:string)=>{if (selectedWork.current !== id) return; const request = ++snapshotRequest.current; try{const s=await api<Snapshot>(`/presentations/${id}`);if(selectedWork.current!==id || request!==snapshotRequest.current)return;const firstLoad=loadedPresentationRef.current!==id;setSnapshot(s);setEntryMode(s.presentation.entry_mode||'ppt');const outlineHash=s.latest_outline?.content_hash??null;if(firstLoad||loadedOutlineHash.current!==outlineHash){setDoc(s.latest_outline?.document||null);loadedOutlineHash.current=outlineHash;}setStreamHtml(s.active_streams||{});setDirectorStream(s.director_stream||{reasoning:'',output:''});setSelectedPage(n=>Math.min(n,Math.max(0,s.pages.length-1)));if(firstLoad)setWorkspaceView(s.latest_outline?.confirmed&&s.pages.length?'generation':'outline');loadedPresentationRef.current=id;}catch(e){setError(String(e))}},[]);
+  const loadSnapshot=useCallback(async(id:string)=>{
+    if (selectedWork.current !== id) return;
+    const request = ++snapshotRequest.current;
+    try {
+      const result = await api<Snapshot>(`/presentations/${id}`);
+      if (selectedWork.current !== id || request !== snapshotRequest.current) return;
+      const firstLoad = loadedPresentationRef.current !== id;
+      setSnapshot(result);
+      setEntryMode(result.presentation.entry_mode || 'ppt');
+      const outlineKey = result.latest_outline ? `${result.latest_outline.id}/${result.latest_outline.content_hash}` : null;
+      if (firstLoad || loadedOutlineHash.current !== outlineKey) {
+        setDoc(result.latest_outline?.document || null);
+        loadedOutlineHash.current = outlineKey;
+      }
+      setStreamHtml(result.active_streams || {});
+      setDirectorStream(result.director_stream || {reasoning:'',output:''});
+      setSelectedPage(index => Math.min(index, Math.max(0, result.pages.length - 1)));
+      if (firstLoad) setWorkspaceView(result.latest_outline?.confirmed && result.pages.length ? 'generation' : 'outline');
+      loadedPresentationRef.current = id;
+    } catch (cause) {
+      if (selectedWork.current === id && request === snapshotRequest.current) setError(String(cause));
+    }
+  },[]);
   const loadUsage=useCallback(async(id:string)=>{const request=++usageRequest.current;try{const result=await api<SessionUsage>(`/presentations/${id}/usage`);if(request===usageRequest.current)setUsage(result)}catch{if(request===usageRequest.current)setUsage(null)}},[]);
   useEffect(()=>{refreshList();refreshProvider();},[refreshList,refreshProvider]);
   useEffect(()=>{if(activeId)sessionStorage.setItem('lumina.activePresentation',activeId);else sessionStorage.removeItem('lumina.activePresentation');},[activeId]);
@@ -127,7 +150,11 @@ function App(){
   useEffect(()=>{ if(!activeId||snapshot?.presentation.id!==activeId)return; sourceRef.current?.close(); const source=new EventSource(`/api/v1/presentations/${activeId}/events?after=${snapshot.last_event_seq||0}`); sourceRef.current=source;
     let refreshTimer:ReturnType<typeof setTimeout>|undefined;
     const scheduleRefresh=()=>{if(refreshTimer)return;refreshTimer=setTimeout(()=>{refreshTimer=undefined;void loadSnapshot(activeId);void refreshList();},150)};
-    const handle=(event:MessageEvent)=>{if(selectedWork.current!==activeId)return;try{const data=JSON.parse(event.data);const type=data.type; if(type==='director.stream.reset')setDirectorStream({reasoning:'',output:''});
+    const handle=(event:MessageEvent)=>{if(selectedWork.current!==activeId)return;try{const data=JSON.parse(event.data);const type=data.type;
+      if (snapshot.presentation.entry_mode === 'agent' && data.run_id && (type.startsWith('page.') && type !== 'page.html.delta' || type.startsWith('run.'))) {
+        const runId: string = data.run_id;
+        setRunUpdates(previous => ({...previous, [runId]: (previous[runId] || 0) + 1}));
+      } if(type==='director.stream.reset')setDirectorStream({reasoning:'',output:''});
       if(type==='director.stream.delta'){const channel=data.payload?.channel as string;const delta=data.payload?.delta as unknown;if(typeof delta==='string'&&(channel==='reasoning'||channel==='output'))setDirectorStream(prev=>channel==='reasoning'?({...prev,reasoning:prev.reasoning+delta}):({...prev,output:prev.output+delta}));}
       if(type==='page.html.delta'){const id=data.payload.page_task_id;setStreamHtml(prev=>({...prev,[id]:(prev[id]||'')+(data.payload.delta||'')}));}
       if(type==='page.retrying'||type==='page.started'){setStreamHtml(prev=>({...prev,[data.payload.page_task_id]:''}));}
@@ -135,69 +162,83 @@ function App(){
       if(pageStates[type])setSnapshot(prev=>prev?.presentation.id===activeId?({...prev,pages:prev.pages.map(page=>page.id===data.payload.page_task_id&&(!data.run_id||page.run_id===data.run_id)?({...page,status:pageStates[type],html_hash:data.payload.html_hash??page.html_hash,error:data.payload.error??null,error_code:type==='page.failed'?(data.payload.error_code??null):type==='page.started'||type==='page.retrying'?null:page.error_code}):page)}):prev);
       if(type.startsWith('turn.')||type.startsWith('page.scene.')||type.startsWith('export.'))scheduleRefresh();
       if(type==='llm.usage.updated')loadUsage(activeId);
-      if(type==='outline.ready'){setDoc(data.payload.outline);scheduleRefresh();}
-      if(['run.completed','run.failed','run.cancelled','generation.queued','generation.started','outline.updated','job.waiting_scheduler','job.started','job.queue_timeout','call.queue_timeout'].includes(type))scheduleRefresh();
+      if(type==='outline.ready')scheduleRefresh();
+      if(type==='run.queued')scheduleRefresh();
+      if(['run.completed','run.failed','run.cancelled','run.cancel_requested','generation.queued','generation.started','outline.updated','job.waiting_scheduler','job.started','job.queue_timeout','call.queue_timeout'].includes(type))scheduleRefresh();
     }catch{} };
-    ['turn.queued','turn.inspected','turn.finished','export.preparing','export.queued','export.started','export.completed','export.failed','page.scene.queued','page.scene.started','page.scene.completed','page.scene.failed','page.scene.cancelled','presentation.created','director.started','director.stream.reset','director.stream.delta','outline.ready','outline.updated','generation.queued','generation.started','page.queued','page.started','page.validating','page.html.delta','page.retrying','page.completed','page.failed','run.completed','run.failed','run.cancelled','run.queued','job.waiting_scheduler','job.started','job.queue_timeout','llm.queued','llm.started','call.queue_timeout','llm.usage.updated'].forEach(type=>source.addEventListener(type,handle as EventListener));
+    ['turn.queued','turn.inspected','turn.finished','export.preparing','export.queued','export.started','export.completed','export.failed','page.scene.queued','page.scene.started','page.scene.completed','page.scene.failed','page.scene.cancelled','presentation.created','director.started','director.stream.reset','director.stream.delta','outline.ready','outline.updated','generation.queued','generation.started','page.queued','page.started','page.validating','page.html.delta','page.retrying','page.completed','page.failed','run.completed','run.failed','run.cancelled','run.cancel_requested','run.queued','job.waiting_scheduler','job.started','job.queue_timeout','llm.queued','llm.started','call.queue_timeout','llm.usage.updated'].forEach(type=>source.addEventListener(type,handle as EventListener));
     source.onerror=()=>{}; return()=>{source.close();if(refreshTimer)clearTimeout(refreshTimer);};
   },[activeId,snapshot?.last_event_seq,loadSnapshot,loadUsage,refreshList]);
   const create=async()=>{if(!canCreate)return;setLoading(true);setError('');try{const body=JSON.stringify({user_request:prompt,entry_mode:entryMode,...(entryMode==='agent'?{interaction_mode:'multi_turn'}:{}),options:creatingDesign?{language:'zh-CN',canvas:requestedCanvas,page_count}:{language:'zh-CN'}});
     if(initialRequest.current.body!==body)initialRequest.current={body,key:crypto.randomUUID()};
     const res=await api<{presentation_id:string;entry_mode:EntryMode}>('/presentations',{method:'POST',headers:{'Idempotency-Key':initialRequest.current.key},body});initialRequest.current.body='';setPrompt('');choose(res.presentation_id);await refreshList();}catch(e){setError(String(e));}finally{setLoading(false)}};
-  const confirm=async()=>{if(!snapshot?.latest_outline||!doc)return;try{let outline=snapshot.latest_outline;if(JSON.stringify(doc)!==JSON.stringify(outline.document)){outline=await api<any>(`/presentations/${snapshot.presentation.id}/outline`,{method:'PUT',body:JSON.stringify({outline_id:outline.id,content_hash:outline.content_hash,document:doc})});}await api(`/presentations/${snapshot.presentation.id}/confirm`,{method:'POST',body:JSON.stringify({outline_id:outline.id,content_hash:outline.content_hash})});setWorkspaceView('generation');await loadSnapshot(snapshot.presentation.id)}catch(e){setError(String(e))}};
-  const saveOutline=async()=>{if(!snapshot?.latest_outline||!doc)return;try{const updated=await api<any>(`/presentations/${snapshot.presentation.id}/outline`,{method:'PUT',body:JSON.stringify({outline_id:snapshot.latest_outline.id,content_hash:snapshot.latest_outline.content_hash,document:doc})});setSnapshot(s=>s?({...s,latest_outline:updated}):s)}catch(e){setError(String(e))}};
+  const confirm=async()=>{
+    if(!snapshot?.latest_outline || !doc) return;
+    const id = snapshot.presentation.id;
+    try {
+      let outline = snapshot.latest_outline;
+      if (JSON.stringify(doc) !== JSON.stringify(outline.document)) outline = await writeOutline(id, outline, doc);
+      await api(`/presentations/${id}/confirm`, {
+         method:'POST', body: JSON.stringify({outline_id:outline.id, content_hash:outline.content_hash}),
+      });
+      if (selectedWork.current !== id) return;
+      setWorkspaceView('generation');
+      await loadSnapshot(id);
+    } catch(cause) { setError(String(cause)); }
+  };
+  const saveOutline=async()=>{
+    if(!snapshot?.latest_outline || !doc) return;
+    const id = snapshot.presentation.id;
+    try {
+      await writeOutline(id, snapshot.latest_outline, doc);
+      if (selectedWork.current === id) await loadSnapshot(id);
+    } catch(cause) { setError(String(cause)); }
+  };
   const updateSlide=(index:number,patch:Partial<Slide>)=>setDoc(d=>d?({...d,slides:d.slides.map((s,i)=>i===index?({...s,...patch}):s)}):d);
   const startRailResize=(event:React.PointerEvent<HTMLDivElement>)=>{if(window.innerWidth<=900)return;event.currentTarget.setPointerCapture(event.pointerId);railResizeRef.current={startX:event.clientX,startWidth:pageRailWidth};};
   const moveRailResize=(event:React.PointerEvent<HTMLDivElement>)=>{const start=railResizeRef.current;if(!start)return;const max=Math.max(220,(event.currentTarget.parentElement?.clientWidth||800)-440);setPageRailWidth(Math.max(160,Math.min(max,start.startWidth+event.clientX-start.startX)));};
   const endRailResize=()=>{railResizeRef.current=null;};
-  const choose=(id:string)=>{navigateSettings(null);if(selectedWork.current===id && snapshot)return;selectedWork.current=id;setSnapshot(null);setDoc(null);setStreamHtml({});setDirectorStream({reasoning:'',output:''});setWorkspaceView('outline');loadedPresentationRef.current=null;followAgentTail.current=true;setActiveId(id);setError('');};
-  const waitingScheduler=snapshot?.active_job?.status==='QUEUED'; const status=waitingScheduler?'WAITING_SCHEDULER':snapshot?.presentation.status||''; const isPlanning=status==='PLANNING'||(waitingScheduler&&snapshot?.active_run?.kind==='DIRECTOR'); const waiting=status==='WAITING_CONFIRMATION'; const generating=status==='GENERATING'||(waitingScheduler&&snapshot?.active_run?.kind==='GENERATION'); const isAgent=snapshot?.presentation.entry_mode==='agent'; const generationAvailable=Boolean(snapshot?.latest_outline?.confirmed&&snapshot?.pages.length); const outlineEditing=waiting;
+  const choose=(id:string)=>{navigateSettings(null);if(selectedWork.current===id && snapshot)return;selectedWork.current=id;setRunUpdates({});setSnapshot(null);setDoc(null);setStreamHtml({});setDirectorStream({reasoning:'',output:''});setWorkspaceView('outline');loadedPresentationRef.current=null;setActiveId(id);setError('');};
+  const isAgent = snapshot?.presentation.entry_mode === 'agent';
+  const waitingScheduler = snapshot?.active_job?.status === 'QUEUED';
+  const status = waitingScheduler ? 'WAITING_SCHEDULER' : snapshot?.presentation.status || '';
+  const isPlanning = status === 'PLANNING' || (waitingScheduler && snapshot?.active_run?.kind === 'DIRECTOR');
+  const waiting = status === 'WAITING_CONFIRMATION';
+  const generating = status === 'GENERATING' || (waitingScheduler && snapshot?.active_run?.kind === 'GENERATION');
+  const generationAvailable = Boolean(snapshot?.latest_outline?.confirmed && snapshot?.pages.length);
+  const outlineEditing = waiting;
   const isDesign = snapshot?.presentation.workflow_code === 'design_create';
   const canvas = snapshot?.presentation.canvas || PPT_CANVAS;
   const canvasLabel = `${canvas.width} × ${canvas.height}`;
   const currentSlide=doc?.slides[selectedPage]; const currentTask=snapshot?.pages.find(p=>p.page_number===selectedPage+1); const previewHtml=currentTask?.status==='SUCCEEDED'?`/api/v1/page-tasks/${currentTask.id}/html`:streamHtml[currentTask?.id||''];
   const displayHtml=typeof previewHtml==='string'&&previewHtml.startsWith('/')?previewHtml:null;
   useEffect(()=>{const controller=new AbortController();setSourceHtml('');if(view==='source'&&displayHtml)fetch(displayHtml,{signal:controller.signal}).then(r=>r.text()).then(text=>{if(!controller.signal.aborted)setSourceHtml(text)}).catch(()=>{if(!controller.signal.aborted)setSourceHtml('无法读取 HTML')});return()=>controller.abort()},[view,displayHtml]);
-  const latestMessageId = snapshot?.conversation?.messages.slice(-1)[0]?.id;
-  useLayoutEffect(() => {
-    if (!isAgent || !followAgentTail.current || !feedRef.current || !workbenchRef.current) return;
-    const scroller = workbenchRef.current;
-    const tail = feedRef.current.getBoundingClientRect().bottom;
-    const bounds = scroller.getBoundingClientRect();
-    if (tail > bounds.bottom || tail < bounds.top) scroller.scrollTop += tail - bounds.bottom + 10;
-  }, [isAgent, latestMessageId]);
   return <div className="app-shell">
     <aside className={`sidebar ${sidebarOpen?'':'collapsed'}`}>
       <div className="brand-row"><div className="brand-mark"><Layers3 size={17}/></div>{sidebarOpen&&<><span className="brand-name">lumina<span>draft</span></span><button className="icon-button sidebar-toggle" title="收起侧栏" onClick={()=>setSidebarOpen(false)}><PanelLeftClose size={16}/></button></>}</div>
-      {sidebarOpen&&<><button className="new-button" onClick={()=>{navigateSettings(null);selectedWork.current=null;setActiveId(null);setSnapshot(null);setDoc(null);setEntryMode('ppt');setWorkspaceView('outline');loadedPresentationRef.current=null;followAgentTail.current=true;setError('')}}><Plus size={16}/> 新建作品</button>
+      {sidebarOpen&&<><button className="new-button" onClick={()=>{navigateSettings(null);selectedWork.current=null;setActiveId(null);setSnapshot(null);setDoc(null);setEntryMode(DEFAULT_ENTRY_MODE);setWorkspaceView('outline');loadedPresentationRef.current=null;setRunUpdates({});setError('')}}><Plus size={16}/> 新建作品</button>
         <div className="side-label">工作区</div><button className={"side-item "+(!settingsPage?"active":"")} onClick={()=>navigateSettings(null)}><Sparkles size={15}/>创作工作台</button><button className={"side-item "+(settingsPage?"active":"")} onClick={()=>navigateSettings('providers')}><Settings2 size={15}/>模型与 API</button>
         <div className="side-label history-label">最近创作 <span>{presentations.length}</span></div><div className="history-list">{presentations.map(p=><button key={p.id} className={`history-item ${activeId===p.id?'selected':''}`} onClick={()=>choose(p.id)}><span className="history-mode-icon"><ModeIcon mode={p.entry_mode} size={14}/></span><span>{p.user_request.slice(0,26)||'未命名演示文稿'}</span><i className={`status-dot ${p.status.toLowerCase()}`}/></button>)}</div>
         <div className="sidebar-footer"><div className="avatar">L</div><div><strong>本地工作区</strong><small>单用户 · SQLite</small></div><CircleHelp size={16}/></div>
       </>}{!sidebarOpen&&<button className="icon-button expand-button" title="展开侧栏" onClick={()=>setSidebarOpen(true)}><ArrowRight size={17}/></button>}
     </aside>
     <main className="main-area">
-      <header className="topbar"><div className="breadcrumbs"><span>工作区</span><span className="crumb-slash">/</span><strong>{snapshot?.latest_outline?.document.brief.title||'创作工作台'}</strong>{snapshot&&<><span className={`entry-mode-pill ${snapshot.presentation.entry_mode}`}><span><ModeIcon mode={snapshot.presentation.entry_mode} size={12}/></span>{MODE_LABELS[snapshot.presentation.entry_mode]}</span><span className={`state-pill ${status.toLowerCase()}`}><i/>{statusLabel(status)}</span></>}</div><div className="top-actions"><button className="provider-chip" onClick={()=>navigateSettings('providers')}><span className="provider-indicator"/>{provider?.model||'配置模型'}<ChevronDown size={14}/></button><button className="icon-button" title="模型设置" onClick={()=>navigateSettings('providers')}><Settings2 size={17}/></button></div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>工作区</span><span className="crumb-slash">/</span><strong>{isAgent ? '创作会话' : snapshot?.latest_outline?.document.brief.title || '创作工作台'}</strong>{snapshot&&<><span className={`entry-mode-pill ${snapshot.presentation.entry_mode}`}><span><ModeIcon mode={snapshot.presentation.entry_mode} size={12}/></span>{MODE_LABELS[snapshot.presentation.entry_mode]}</span>{!isAgent&&<span className={`state-pill ${status.toLowerCase()}`}><i/>{statusLabel(status)}</span>}</>}</div><div className="top-actions"><button className="provider-chip" onClick={()=>navigateSettings('providers')}><span className="provider-indicator"/>{provider?.model||'配置模型'}<ChevronDown size={14}/></button><button className="icon-button" title="模型设置" onClick={()=>navigateSettings('providers')}><Settings2 size={17}/></button></div></header>
       {settingsPage ? <ProviderSettings tab={settingsPage} onNavigate={navigateSettings} onClose={()=>navigateSettings(null)} onChanged={refreshProvider}/> : !snapshot?<section className="welcome"><div className="welcome-kicker"><span/> {creatingDesign?'DESIGN STUDIO':'PRESENTATION STUDIO'}</div><h1>把想法，变成<br/><em>{creatingDesign?'有目的的设计。':'清晰有力的演示。'}</em></h1><p>{creatingDesign?'描述用途、内容和风格，选择画布规格。确认大纲后，即可逐页预览成品。':'选择创作模式，描述主题、受众和目标。先共同确认内容结构，再逐页生成可预览的演示页面。'}</p>
         <div className="composer"><textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')create()}} placeholder={entryMode==='agent'?'告诉我你想完成什么，我会用步骤化的创作过程协助你…':creatingDesign?'例如：为周末社区市集做一张海报，突出日期、地点和报名入口，使用温暖的橙色…':'例如：为创业团队制作一份关于 AI 产品市场进入策略的路演，突出客户问题、市场机会和 90 天计划…'}/>{creatingDesign&&<DesignOptions draft={designDraft} onChange={setDesignDraft}/>}<div className="composer-bottom"><div className="composer-options"><EntryModeMenu value={entryMode} onChange={setEntryMode}/><span className="composer-divider"/><span><span className="color-dot"/>中文</span></div><button className="send-button" disabled={!canCreate} onClick={create}>{loading?<LoaderCircle className="spin" size={16}/>:<Send size={15}/>}<span>{entryMode==='agent'?'开始创作':creatingDesign?'生成设计大纲':'生成说明书'}</span></button></div>
           {error&&<div className="inline-error"><X size={14}/>{error}{error.includes('配置')&&<button onClick={()=>navigateSettings('providers')}>去配置</button>}</div>}
         </div><div className="trust-line"><ShieldCheck size={14}/> {entryMode==='agent'?'可以一起讨论需求、起草或修订大纲。确认大纲后即可生成页面。':'由你确认每页结构后，才开始生成页面'}</div>
         <div className="example-row"><span>试试这些主题</span>{(creatingDesign?['市集活动海报','新品社交卡片','展览导览图']:['产品发布路演','季度业务复盘','新员工培训']).map(x=><button key={x} onClick={()=>setPrompt(`制作一份关于${x}的${creatingDesign?'视觉设计，突出主题和关键信息，留出清晰的阅读空间。':'演示文稿，结构清晰、观点具体、视觉简洁专业。'}`)}>{x}<ArrowRight size={12}/></button>)}</div>
-        </section>:<><section ref={workbenchRef} onScroll={() => {
-          const scroller = workbenchRef.current;
-          const feed = feedRef.current;
-          if (!scroller || !feed) return;
-          const tail = feed.getBoundingClientRect().bottom;
-          const bounds = scroller.getBoundingClientRect();
-          followAgentTail.current = tail >= bounds.top && tail <= bounds.bottom + 48;
-        }} className={`workbench ${isAgent?'agent-workbench':isDesign?'design-workbench':''}`}>
-         {isAgent&&<div className="agent-mode-banner"><Bot size={16}/><div><strong>Agent 模式</strong><span>讨论创作需求、起草和修订整份大纲</span></div></div>}
-         <div className="work-heading"><div><div className="eyebrow">{waiting?(isDesign?'设计大纲':'内容说明书'):generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':isAgent?'创作会话':'任务进度'}</div><h1>{doc?.brief.title||(status==='DRAFT'?snapshot.presentation.user_request.slice(0,36):'正在理解你的需求')}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p>{isDesign&&<span className="design-spec">{canvasLabel} px · {canvasRatio(canvas)}</span>}</div><div className="work-heading-actions">{!isDesign&&snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
+        </section> : isAgent && snapshot.conversation ? <AgentConversation key={snapshot.presentation.id}
+          presentationId={snapshot.presentation.id} title={snapshot.presentation.user_request} canvas={canvas}
+          currentOutline={snapshot.latest_outline} legacy={snapshot} messages={snapshot.conversation.messages}
+          activeTurn={snapshot.conversation.active_leader_turn_id} allowed={snapshot.conversation.allowed_actions.send_message}
+          refresh={()=>loadSnapshot(snapshot.presentation.id)} runUpdates={runUpdates} error={error}/>
+        : <section className={`workbench ${isDesign ? 'design-workbench' : ''}`}>
+         <div className="work-heading"><div><div className="eyebrow">{waiting?(isDesign?'设计大纲':'内容说明书'):generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':'任务进度'}</div><h1>{doc?.brief.title||(status==='DRAFT'?snapshot.presentation.user_request.slice(0,36):'正在理解你的需求')}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p>{isDesign&&<span className="design-spec">{canvasLabel} px · {canvasRatio(canvas)}</span>}</div><div className="work-heading-actions">{!isDesign&&snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
          {doc&&<div className="ppt-view-switcher" role="tablist" aria-label="工作区视图"><button role="tab" aria-selected={workspaceView==='outline'} className={workspaceView==='outline'?'active':''} onClick={()=>setWorkspaceView('outline')}><LayoutTemplate size={14}/>{isDesign?'设计大纲':'大纲'}{snapshot.latest_outline?.confirmed&&<small>只读</small>}</button><button role="tab" aria-selected={workspaceView==='generation'} disabled={!generationAvailable} className={workspaceView==='generation'?'active':''} onClick={()=>generationAvailable&&setWorkspaceView('generation')}><Layers3 size={14}/>{isDesign?'设计预览':'页面生成'}{generationAvailable&&<small>{snapshot.pages.filter(page=>page.status==='SUCCEEDED').length}/{snapshot.pages.length}</small>}</button></div>}
         {usage?.presentation_id===snapshot.presentation.id&&<div className="usage-bar" aria-label="当前作品会话 token 用量"><Activity size={14}/><span>会话用量</span><span title={usage.input_unreported_calls?`${usage.input_unreported_calls} 次调用未返回输入用量`:undefined}>输入 <strong>{formatUsage(usage.input_tokens,usage.input_unreported_calls)}</strong></span><span title={usage.output_unreported_calls?`${usage.output_unreported_calls} 次调用未返回输出用量`:undefined}>输出 <strong>{formatUsage(usage.output_tokens,usage.output_unreported_calls)}</strong></span><span title={usage.total_unreported_calls?`${usage.total_unreported_calls} 次调用未返回总用量`:undefined}>合计 <strong>{formatUsage(usage.total_tokens,usage.total_unreported_calls)}</strong></span><span>{usage.call_count} 次调用</span></div>}
         {error&&<div className="inline-error"><X size={14}/>{error}<button onClick={()=>setError('')}>关闭</button></div>}
-          {isAgent&&<ConversationFeed feedRef={feedRef} onRead={() => { followAgentTail.current = false; }} presentationId={snapshot.presentation.id} currentOutline={snapshot.latest_outline?.id} messages={snapshot.conversation?.messages||[]} onViewOutline={()=>setWorkspaceView('outline')} onViewGeneration={()=>generationAvailable&&setWorkspaceView('generation')}/>}
-         {isAgent&&snapshot.conversation?.interaction_mode==='single_turn'&&<div className="agent-flow-strip"><div className="agent-flow-step active"><span>1</span><div><strong>理解需求</strong><small>Director 正在整理创作目标</small></div></div><div className="agent-flow-line"/><div className={`agent-flow-step ${waiting||generating||status==='READY'?'active':''}`}><span>2</span><div><strong>确认大纲</strong><small>先确认内容结构，再生成页面</small></div></div><div className="agent-flow-line"/><div className={`agent-flow-step ${generating||status==='READY'?'active':''}`}><span>3</span><div><strong>生成页面</strong><small>按页制作可预览 HTML</small></div></div></div>}
-
         {isPlanning&&!doc?<div className="planning-panel"><div className="planning-visual"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><Sparkles size={25}/></div><div className="planning-content"><h2>{isDesign?'正在规划设计大纲':'正在梳理内容结构'}</h2><p>{isDesign?'正在确定每页目标、信息层级和视觉方向。':'Director 正在确定叙事主线、页面大纲与全局视觉规范。'}</p><div className="progress-track"><i/></div><small>说明书完成后，你可以逐页编辑和确认</small><DirectorStreamView stream={directorStream} active={isPlanning}/></div></div>:null}
         {snapshot.director_stream&&(waiting||generating||status==='READY'||status==='PARTIAL_FAILED'||status==='CANCELLED'||(status==='FAILED'&&snapshot.latest_run?.kind==='DIRECTOR'))&&<DirectorStreamView stream={directorStream} active={false} defaultOpen={false}/>}
         {status==='FAILED'&&<div className="inline-error"><X size={14}/>{snapshot.latest_run?.error||'生成失败，请检查模型配置后重试。'}</div>}
@@ -274,17 +315,7 @@ function App(){
              <div className="canvas-footer"><div className="render-status"><i className={currentTask?.status==='SUCCEEDED'?'success':''}/>{pageStatusLabel(currentTask?.status,currentTask?.scene?.status)}</div><span>画布比例 · {canvasRatio(canvas)}</span></div></div></div>}
         {doc&&workspaceView==='generation'&&generationAvailable&&!previewOpen&&<button className="preview-restore-button" onClick={()=>setPreviewOpen(true)}><PanelRightOpen size={15}/>显示预览</button>}
       </section>
-      {isAgent && snapshot.conversation && <footer className="agent-dock">
-        <AgentComposer key={snapshot.presentation.id}
-          activeTurn={snapshot.conversation.active_leader_turn_id} allowed={snapshot.conversation.allowed_actions.send_message}
-          selection={workspaceView==='generation' && currentSlide && currentTask?.html_hash ? {
-            slide_id: currentSlide.slide_id, source_ref: currentTask.html_hash, label: '第 '+currentSlide.page_number+' 页'
-          } : null}
-          submit={(path,body)=>api('/presentations/'+snapshot.presentation.id+'/turns'+path,{method:'POST',body:JSON.stringify(body)})}
-          onSent={() => { if (selectedWork.current === snapshot.presentation.id) followAgentTail.current = true; }}
-          refresh={()=>loadSnapshot(snapshot.presentation.id)} />
-      </footer>}
-      </>}
+      }
     </main>
 
   </div>
@@ -295,38 +326,6 @@ function settingsTabFromPath(): SettingsTab|null {const segment=window.location.
 function statusLabel(s:string){return ({DRAFT:'讨论中',PLANNING:'策划中',WAITING_SCHEDULER:'等待任务调度',WAITING_CONFIRMATION:'待确认',GENERATING:'生成中',READY:'已完成',PARTIAL_FAILED:'部分失败',FAILED:'生成失败',CANCELLED:'已取消'} as Record<string,string>)[s]||s}
 function pageType(s:string){return ({cover:'封面',agenda:'目录',section:'章节',content:'内容页',ending:'结束页',other:'内容页'} as Record<string,string>)[s]||'内容页'}
 function formatUsage(value:number|null,unreported:number){return value===null?'—':`${unreported?'≥':''}${value.toLocaleString()}`}
-
-function ChatMessage({message}: {message: ConversationMessage}) {
-  const user = message.role === 'user';
-  const Icon = user ? UserRound : Bot;
-  const label = user ? '你' : '助手';
-  const note = ({suggest:'下一步建议', error:'回复失败', cancelled:'本轮已停止'} as Record<string,string>)[message.kind];
-  return <article className={'chat-message ' + (user ? 'from-user' : 'from-assistant')} aria-label={label}>
-    <div className="chat-message-avatar"><Icon size={15} aria-hidden="true" /></div>
-    <div className="chat-message-copy"><header><strong>{label}</strong>{note && <span> · {note}</span>}</header>
-      <p>{message.body_text}</p>
-    </div>
-  </article>;
-}
-
-function ConversationFeed({feedRef,onRead,presentationId,currentOutline,messages,onViewOutline,onViewGeneration}:{feedRef:React.RefObject<HTMLDivElement|null>;onRead:()=>void;presentationId:string;currentOutline?:string;messages:ConversationMessage[];onViewOutline:()=>void;onViewGeneration:()=>void}){
-  if(!messages.length)return null;
-  const text=(value:unknown,fallback:string)=>typeof value==='string'&&value.trim()?value:fallback;
-  return <div ref={feedRef} className="conversation-feed" aria-label="对话记录" onClickCapture={onRead}>
-    {messages.map(message=>{
-      const payload=message.payload||{};
-      if (['text','reply','clarify','suggest','error','cancelled'].includes(message.kind)) {
-        return <ChatMessage key={message.id} message={message} />;
-      }
-      if(message.kind==='inspection')return <details className="agent-observation" key={message.id}><summary>查阅作品 · {payload.view==='pages'?'页面':payload.view==='outline'?'大纲':'概览'}</summary><pre>{JSON.stringify(payload.result,null,2)}</pre></details>;
-      if(message.kind==='activity')return <div className={`conversation-activity ${message.status.toLowerCase()}`} key={message.id}><div className="conversation-activity-icon"><Activity size={14}/></div><div><strong>{text(payload.label,'正在处理你的需求')}</strong><small>{message.status==='STREAMING'?'进行中':message.status==='FAILED'?'失败':message.status==='CANCELLED'?'已取消':'已完成'}</small></div>{message.status==='STREAMING'&&<LoaderCircle className="spin" size={14}/>}</div>;
-      if(message.kind==='outline_card' && typeof payload.outline_id==='string')return <OutlineVersionCard key={payload.outline_id} path={'/api/v1/presentations/'+presentationId+'/outlines/'+payload.outline_id} revision={Number(payload.revision)} current={currentOutline===payload.outline_id} openEditor={onViewOutline}/>;
-      if(message.kind==='action')return <div className="conversation-action" key={message.id}><Check size={13}/>{payload.action==='confirm_outline'?'你已确认大纲':payload.action==='retry_run'?'你发起了重新生成':'已执行操作'}</div>;
-      if(message.kind==='generation_card')return <button className={`conversation-special-card generation-special-card ${message.status.toLowerCase()}`} key={message.id} onClick={onViewGeneration}><span className="special-card-icon"><Layers3 size={16}/></span><span className="special-card-copy"><strong>页面生成工作台</strong><small>{typeof payload.page_count==='number'?`${payload.page_count} 页 · `:''}{message.status==='STREAMING'?'正在生成页面':message.status==='READY'?'生成已完成':message.status==='FAILED'?'部分页面生成失败':'已取消'}</small></span><span className="special-card-action">打开工作台 <ArrowRight size={13}/></span></button>;
-      return null;
-    })}
-  </div>;
-}
 
 function DirectorStreamView({stream,active,defaultOpen=true}:{stream:DirectorStream;active:boolean;defaultOpen?:boolean}){
   const [open,setOpen]=useState(defaultOpen);
@@ -348,40 +347,6 @@ function StreamText({text,code=false}:{text:string;code?:boolean}){
   const followTail=useRef(true);
   useEffect(()=>{const element=ref.current;if(element&&followTail.current)element.scrollTop=element.scrollHeight},[text]);
   return <pre ref={ref} className={code?'stream-code':''} onScroll={event=>{const element=event.currentTarget;followTail.current=element.scrollHeight-element.scrollTop-element.clientHeight<28}}>{text}</pre>
-}
-
-function SlideFrame({url, number, sceneId, canvas}: {
-  url:string; number:number; sceneId?:string|null; canvas:CanvasSize;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(0);
-  const [preview, setPreview] = useState({ request: '', url: '' });
-  const { width, height } = canvas;
-  const request = `${url}:${sceneId || ''}`;
-  useLayoutEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    const resize = () => setScale(fitCanvas(element.clientWidth, element.clientHeight, { width, height }));
-    const observer = new ResizeObserver(resize);
-    observer.observe(element);
-    resize();
-    return () => observer.disconnect();
-  }, [width, height]);
-  useEffect(() => {
-    const controller = new AbortController();
-    const id = url.split('/').at(-2);
-    api<{preview_url:string}>(`/page-tasks/${id}/preview-tickets${sceneId?'?scene_id='+encodeURIComponent(sceneId):''}`,
-      {method:'POST', signal:controller.signal})
-      .then(result => { if (!controller.signal.aborted) setPreview({ request, url: result.preview_url }); })
-      .catch(() => { if (!controller.signal.aborted) setPreview({ request, url: '' }); });
-    return () => controller.abort();
-  }, [request, url, sceneId]);
-  return <div ref={ref} className="slide-viewport">
-    {preview.request === request && (preview.url
-      ? <iframe className="slide-frame" title={`第 ${number} 页预览`} src={preview.url} sandbox=""
-          style={{ width, height, transform: `translate(-50%, -50%) scale(${scale})` }}/>
-      : <div className="empty-canvas scene-message" role="status">无法加载 HTML 预览</div>)}
-  </div>;
 }
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);

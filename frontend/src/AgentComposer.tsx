@@ -1,23 +1,22 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { FileText, LoaderCircle, Send, X } from 'lucide-react';
+import type { ArtifactSelection } from './workbench-api';
 
-type Selection = { slide_id: string; source_ref: string; label: string };
 type Props = {
   activeTurn?: string | null;
   allowed: boolean;
-  selection: Selection | null;
+  selection: ArtifactSelection | null;
+  clearSelection: () => void;
   submit: (path: string, body: object) => Promise<unknown>;
   refresh: () => Promise<void>;
   onSent: () => void;
 };
 
-export function AgentComposer({ activeTurn, allowed, selection, submit, refresh, onSent }: Props) {
+export function AgentComposer({ activeTurn, allowed, selection, clearSelection, submit, refresh, onSent }: Props) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [excluded, setExcluded] = useState<string | null>(null);
   const request = useRef({ payload: '', key: '' });
-  const selected = selection && excluded !== selection.source_ref ? selection : null;
   const inputRef = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const input = inputRef.current;
@@ -53,7 +52,9 @@ export function AgentComposer({ activeTurn, allowed, selection, submit, refresh,
   async function send(event: FormEvent) {
     event.preventDefault();
     if (busy || activeTurn || !allowed || !text.trim()) return;
-    const data = { text: text.trim(), slide_id: selected?.slide_id, source_ref: selected?.source_ref };
+    const data = selection
+      ? { text: text.trim(), view_ref: { artifact_message_id: selection.artifact_message_id, slide_id: selection.slide_id, source_ref: selection.source_ref } }
+      : { text: text.trim() };
     const payload = JSON.stringify(data);
     if (request.current.payload !== payload) request.current = { payload, key: crypto.randomUUID() };
     setBusy(true);
@@ -83,7 +84,7 @@ export function AgentComposer({ activeTurn, allowed, selection, submit, refresh,
     }
   }
   return <form className="composer agent-composer" onSubmit={send}>
-    {selected && <button className="agent-selection" type="button" aria-label={selected.label+' · 移除引用'} onClick={() => setExcluded(selected.source_ref)}><FileText size={13}/>{selected.label}<X size={12}/></button>}
+    {selection && <button className="agent-selection" type="button" aria-label={selection.label+' · 移除引用'} onClick={clearSelection}><FileText size={13}/>{selection.label}<X size={12}/></button>}
     <textarea ref={inputRef} rows={2} aria-label="继续对话" value={text} maxLength={20000} placeholder="补充需求，或询问当前作品…" onChange={event => setText(event.target.value)} onKeyDown={event => {
       if (!event.nativeEvent.isComposing && (event.ctrlKey || event.metaKey) && event.key === 'Enter') {
         event.preventDefault();
