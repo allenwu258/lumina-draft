@@ -40,7 +40,7 @@ from .scene_service import (
     validate_scene,
 )
 
-EXPORT_VERSION = "scene-pptx-0.2.3"
+EXPORT_VERSION = "scene-pptx-0.2.4"
 EXPORT_ROOT = Path(os.getenv("PPTX_EXPORT_DIR", ROOT / "data" / "exports")).resolve()
 MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
@@ -527,8 +527,29 @@ def verify_pptx(path: Path, report: dict, staged: dict):
                 name = properties.get("name", "") if properties is not None else ""
                 contents = "".join(t.text or "" for t in shape.findall(".//a:t", NS))
                 if contents:
-                    xml_records.append((name.removeprefix("text:"), contents))
-            if xml_records != [(r["nodeId"], r["text"]) for r in native_records]:
+                    paragraphs = shape.findall("./p:txBody/a:p", NS)
+                    soft_breaks = sum(
+                        len(paragraph.findall(".//a:br", NS))
+                        for paragraph in paragraphs
+                    )
+                    xml_records.append(
+                        (
+                            name.removeprefix("text:"),
+                            contents,
+                            len(paragraphs),
+                            soft_breaks,
+                        )
+                    )
+            expected_boxes = [
+                (
+                    box["nodeId"],
+                    box["text"],
+                    box["paragraphCount"],
+                    box["softBreakCount"],
+                )
+                for box in page_report.get("nativeTextBoxes", [])
+            ]
+            if xml_records != expected_boxes:
                 raise ExportError("PPTX_VALIDATION", "Scene 文字对象顺序错误", i)
             page_rels_path = f"ppt/slides/_rels/slide{i}.xml.rels"
             page_rels = (
@@ -665,6 +686,7 @@ def install_result(record, token, output: Path, staged: dict):
                     "scene_id": p["sceneId"],
                     "native_text_count": len(p["nativeTexts"]),
                     "native_text_character_count": p.get("nativeTextCharacterCount", 0),
+                    "native_text_boxes": p.get("nativeTextBoxes", []),
                     "native_fragments": p.get("nativeFragments", []),
                     "raster_regions": p["rasterRegions"],
                     "fonts": p.get("fonts", []),

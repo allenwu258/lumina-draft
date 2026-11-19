@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright-core";
 import { PNG } from "pngjs";
+import JSZip from "jszip";
 import { convert, hash } from "../dist/capture.js";
 import { writePptx } from "../dist/export/writer.js";
 import { planPptxPage } from "../dist/export/plan.js";
@@ -18,7 +19,7 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
   const browser = await chromium.launch({ headless: true });
   try {
     const html =
-      '<!doctype html><html><body style="margin:0"><main id="ppt-page" style="position:relative;width:800px;height:450px;background:white;font-family:Microsoft YaHei,sans-serif"><h1 style="margin:0;position:absolute;left:40px;top:36px;font-size:32px">中文标题 English</h1><p style="position:absolute;left:40px;top:120px;font-size:20px">第一行正文<br>第二行文字</p><div style="position:absolute;left:40px;top:230px;width:200px;height:80px;background:#dbeafe;border:2px solid #2563eb;border-radius:12px"></div></main></body></html>';
+      '<!doctype html><html><body style="margin:0"><main id="ppt-page" style="position:relative;width:800px;height:450px;background:white;font-family:Microsoft YaHei,sans-serif"><h1 style="margin:0;position:absolute;left:40px;top:36px;font-size:32px">中文标题 English</h1><p style="position:absolute;left:40px;top:120px;width:140px;font-size:20px">第一行正文第二行文字持续换行测试</p><p style="position:absolute;left:40px;top:220px;font-size:16px">独立段落</p><div style="position:absolute;left:40px;top:270px;width:200px;height:80px;background:#dbeafe;border:2px solid #2563eb;border-radius:12px"></div></main></body></html>';
     const scene = await convert(
       { html, htmlHash: hash(html), cssHash: hash("") },
       { browser, outputDir: join(temp, "capture") },
@@ -38,6 +39,50 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
     assert.equal(report.pages[0].rasterRegions, 0);
     assert.equal(report.pages[0].fontMapVersion, "font-map-win32-v2");
     assert.ok(report.pages[0].nativeTextCharacterCount > 0);
+    const paragraph = scene.nodes.find(
+      (node) =>
+        node.kind === "text" &&
+        node.text.sourceText.includes("第一行正文"),
+    );
+    const textBoxes = report.pages[0].nativeTextBoxes.filter(
+      (box) => box.nodeId === paragraph.id,
+    );
+    assert.equal(textBoxes.length, 1);
+    assert.equal(textBoxes[0].paragraphCount, 1);
+    assert.equal(
+      textBoxes[0].softBreakCount,
+      paragraph.text.lines.length - 1,
+    );
+    const pptx = await JSZip.loadAsync(
+      await readFile(join(output, "presentation.pptx")),
+    );
+    const slideXml = await pptx.file("ppt/slides/slide1.xml").async("string");
+    const textShape = [...slideXml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)]
+      .map((match) => match[0])
+      .find((shape) => shape.includes(`name="text:${paragraph.id}"`));
+    assert.ok(textShape);
+    assert.equal((textShape.match(/<a:p(?=[\s>])/g) || []).length, 1);
+    assert.equal(
+      (textShape.match(/<a:br\b/g) || []).length,
+      paragraph.text.lines.length - 1,
+    );
+    assert.equal(
+      [...textShape.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)]
+        .map((match) => match[1])
+        .join(""),
+      paragraph.text.lines
+        .flatMap((line) => line.fragments.map((fragment) => fragment.displayText))
+        .join(""),
+    );
+    const independentParagraph = scene.nodes.find(
+      (node) =>
+        node.kind === "text" && node.text.sourceText === "独立段落",
+    );
+    const independentShape = [...slideXml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)]
+      .map((match) => match[0])
+      .find((shape) => shape.includes(`name="text:${independentParagraph.id}"`));
+    assert.ok(independentShape);
+    assert.notEqual(independentShape, textShape);
     assert.ok(report.pages[0].fontFaces.length > 0);
     assert.match(report.pages[0].fontFaces[0].postscriptName, /.+/);
     assert.match(report.pages[0].fontFaces[0].fontFileSha256, /^[a-f0-9]{64}$/);

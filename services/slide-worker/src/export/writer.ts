@@ -3,7 +3,13 @@ import { writeFile, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import type { Browser, Page } from "playwright-core";
 import { textTarget, type SceneIR, type Rect } from "@lumina/scene-core";
-import { planPptxPage, inch, point, type PagePlan } from "./plan.js";
+import {
+  planPptxPage,
+  inch,
+  point,
+  type Element,
+  type PagePlan,
+} from "./plan.js";
 import { sceneToSvg } from "./svg.js";
 import { hash } from "../capture.js";
 import { serializePresentation, type SlidePacket } from "./serialize.js";
@@ -23,6 +29,77 @@ const geometry = (r: Rect) => ({
   w: inch(Math.max(r.width, 0.05)),
   h: inch(Math.max(r.height, 0.05)),
 });
+type NativeTextElement = Extract<Element, { kind: "text" }>;
+
+function mergeableTextGroup(
+  elements: Element[],
+  start: number,
+  nodeHasOneParagraph: boolean,
+  nodeHasRasterText: boolean,
+): NativeTextElement[] | undefined {
+  const first = elements[start];
+  if (first?.kind !== "text" || !nodeHasOneParagraph || nodeHasRasterText)
+    return;
+
+  const group: NativeTextElement[] = [];
+  for (let i = start; i < elements.length; i++) {
+    const element = elements[i];
+    if (element.kind !== "text" || element.nodeId !== first.nodeId) break;
+    group.push(element);
+  }
+  const lines = new Map<number, NativeTextElement[]>();
+  for (const element of group) {
+    const line = lines.get(element.lineIndex) || [];
+    line.push(element);
+    lines.set(element.lineIndex, line);
+  }
+  const lineIndices = [...lines.keys()];
+  if (lineIndices.length < 2) return;
+
+  const firstFont = group[0];
+  const firstAscent =
+    (firstFont.style.fontSize * firstFont.font.ascent) /
+    firstFont.font.unitsPerEm;
+  if (
+    group.some((element) => {
+      const ascent =
+        (element.style.fontSize * element.font.ascent) /
+        element.font.unitsPerEm;
+      return (
+        element.style.fontSize !== firstFont.style.fontSize ||
+        Math.abs(ascent - firstAscent) > 0.5
+      );
+    })
+  )
+    return;
+
+  const lineGroups = lineIndices.map((index) => lines.get(index)!);
+  const startX = lineGroups[0][0].frame.x;
+  const baselineStep = lineGroups[1][0].baseline - lineGroups[0][0].baseline;
+  if (baselineStep <= 0) return;
+
+  for (let lineIndex = 0; lineIndex < lineGroups.length; lineIndex++) {
+    const line = lineGroups[lineIndex];
+    if (
+      lineIndices[lineIndex] !== lineIndices[0] + lineIndex ||
+      Math.abs(line[0].frame.x - startX) > 0.75 ||
+      Math.abs(
+        line[0].baseline - lineGroups[0][0].baseline - baselineStep * lineIndex,
+      ) > 0.75
+    )
+      return;
+    for (let fragmentIndex = 1; fragmentIndex < line.length; fragmentIndex++) {
+      const previous = line[fragmentIndex - 1];
+      const current = line[fragmentIndex];
+      if (
+        Math.abs(current.frame.x - previous.frame.x - previous.frame.width) >
+        0.75
+      )
+        return;
+    }
+  }
+  return group;
+}
 
 /** Standard PptxGenJS APIs only; no OOXML replacement or HTML access. */
 export async function writePptx(
@@ -72,6 +149,12 @@ async function writePptxWithPage(
   const reports: {
       sceneId: string;
       nativeTexts: string[];
+      nativeTextBoxes: {
+        nodeId: string;
+        text: string;
+        paragraphCount: number;
+        softBreakCount: number;
+      }[];
       nativeFragments: {
         nodeId: string;
         fragmentKey: string;
@@ -158,7 +241,7 @@ async function writePptxWithPage(
         addImage: (options: import("pptxgenjs").default.ImageProps) =>
           packet.objects.push({ kind: "image", options }),
         addText: (
-          text: string,
+          text: string | import("pptxgenjs").default.TextProps[],
           options: import("pptxgenjs").default.TextPropsOptions,
         ) => packet.objects.push({ kind: "text", text, options }),
         addShape: (
@@ -169,11 +252,151 @@ async function writePptxWithPage(
       slides.push(packet);
       const svgRegions: (typeof reports)[number]["svgRegions"] = [];
       const nativeFragments: (typeof reports)[number]["nativeFragments"] = [];
+      const nativeTextBoxes: (typeof reports)[number]["nativeTextBoxes"] = [];
       const nativeTexts: string[] = [],
         fonts = new Set<string>(),
         fontFaces = new Map<string, (typeof reports)[number]["fontFaces"][number]>();
+      const textNodes = new Map(
+        page.scene.nodes
+          .filter((node) => node.kind === "text")
+          .map((node) => [node.id, node]),
+      );
+      const nodesWithRasterText = new Set(
+        regions
+          .filter((region) => region.fragmentKeys?.length)
+          .flatMap((region) => region.nodeIds),
+      );
+      const textStyleOptions = (e: NativeTextElement) => ({
+        fontFace: e.font.family,
+        fontSize: point(e.style.fontSize),
+        bold: e.font.bold,
+        italic: e.style.fontStyle === "italic",
+        ...alpha(color(e.style.color), e.opacity),
+        charSpacing: point(e.style.letterSpacing),
+        underline: e.style.decoration.includes("underline")
+          ? ({ style: "sng" } as const)
+          : undefined,
+        strike: e.style.decoration.includes("line-through")
+          ? ("sngStrike" as const)
+          : undefined,
+        lang: "zh-CN",
+      });
+      const recordNativeText = (e: NativeTextElement) => {
+        nativeTexts.push(e.text);
+        nativeFragments.push({
+          nodeId: e.nodeId,
+          fragmentKey: e.fragmentKey,
+          text: e.text,
+          baseline: e.baseline,
+          requestedFontFamily: e.style.fontFamily,
+          fontFamily: e.font.family,
+          postscriptName: e.font.postscript,
+          fontFileSha256: e.font.fileSha256,
+          fontSize: e.style.fontSize,
+          letterSpacing: e.style.letterSpacing,
+          requestedWeight: e.font.requestedWeight,
+          faceWeight: e.font.faceWeight,
+          bold: e.font.bold,
+          italic: e.font.italic,
+          ascent: e.font.ascent,
+          descent: e.font.descent,
+          unitsPerEm: e.font.unitsPerEm,
+          measuredWidth: e.font.width,
+        });
+        fonts.add(e.font.family);
+        const faceKey = `${e.font.postscript}:${e.font.fileSha256}:${e.font.requestedWeight}:${e.font.italic}`;
+        const face = fontFaces.get(faceKey);
+        if (face) face.uses++;
+        else
+          fontFaces.set(faceKey, {
+            family: e.font.family,
+            postscriptName: e.font.postscript,
+            fontFileSha256: e.font.fileSha256,
+            requestedWeight: e.font.requestedWeight,
+            faceWeight: e.font.faceWeight,
+            italic: e.font.italic,
+            uses: 1,
+          });
+      };
+      const writeNativeText = (elements: NativeTextElement[]) => {
+        const first = elements[0];
+        const lines = [...new Set(elements.map((element) => element.lineIndex))];
+        const merged = lines.length > 1;
+        const boxes = elements.map((element) => {
+          const ascent =
+            (element.style.fontSize * element.font.ascent) /
+            element.font.unitsPerEm;
+          return {
+            x: element.frame.x,
+            y: element.baseline - ascent,
+            width: Math.max(element.frame.width, element.font.width) + 0.5,
+            height: Math.max(
+              element.frame.height,
+              element.style.fontSize * 1.5,
+            ),
+          };
+        });
+        const frame = merged
+          ? {
+              x: boxes[0].x,
+              y: boxes[0].y,
+              width:
+                Math.max(...boxes.map((box) => box.x + box.width)) - boxes[0].x,
+              height:
+                Math.max(...boxes.map((box) => box.y + box.height)) - boxes[0].y,
+            }
+          : boxes[0];
+        const lineStep = merged
+          ? elements.find((element) => element.lineIndex !== first.lineIndex)!
+              .baseline - first.baseline
+          : undefined;
+        const options = {
+          ...geometry(frame),
+          ...textStyleOptions(first),
+          margin: 0,
+          fit: "none" as const,
+          wrap: false,
+          align: "left" as const,
+          valign: "top" as const,
+          paraSpaceAfter: 0,
+          paraSpaceBefore: 0,
+          ...(lineStep === undefined
+            ? { lineSpacingMultiple: 1 }
+            : { lineSpacing: point(lineStep) }),
+          objectName: `text:${first.nodeId}`,
+        };
+        if (merged) {
+          let previousLine = first.lineIndex;
+          slide.addText(
+            elements.map((element) => {
+              const softBreakBefore = element.lineIndex !== previousLine;
+              previousLine = element.lineIndex;
+              return {
+                text: element.text,
+                options: {
+                  ...textStyleOptions(element),
+                  ...(softBreakBefore ? { softBreakBefore: true } : {}),
+                },
+              };
+            }),
+            options,
+          );
+        } else slide.addText(first.text, options);
+        nativeTextBoxes.push({
+          nodeId: first.nodeId,
+          text: elements.map((element) => element.text).join(""),
+          paragraphCount: 1,
+          softBreakCount: merged ? lines.length - 1 : 0,
+        });
+        elements.forEach(recordNativeText);
+      };
       let ri = 0;
-      for (const e of plan.elements) {
+      for (
+        let elementIndex = 0;
+        elementIndex < plan.elements.length;
+        elementIndex++
+      ) {
+        const e = plan.elements[elementIndex];
         if (e.kind === "raster") {
           slide.addImage({
             data: rasters[ri++],
@@ -216,74 +439,16 @@ async function writePptxWithPage(
           continue;
         }
         if (e.kind === "text") {
-          const size = e.style.fontSize,
-            ascent = (size * e.font.ascent) / e.font.unitsPerEm;
-          const frame = {
-            x: e.frame.x,
-            y: e.baseline - ascent,
-            width: Math.max(e.frame.width, e.font.width) + 0.5,
-            height: Math.max(e.frame.height, size * 1.5),
-          };
-          slide.addText(e.text, {
-            ...geometry(frame),
-            fontFace: e.font.family,
-            fontSize: point(size),
-            bold: e.font.bold,
-            italic: e.style.fontStyle === "italic",
-            ...alpha(color(e.style.color), e.opacity),
-            charSpacing: point(e.style.letterSpacing),
-            underline: e.style.decoration.includes("underline")
-              ? { style: "sng" }
-              : undefined,
-            strike: e.style.decoration.includes("line-through")
-              ? "sngStrike"
-              : undefined,
-            margin: 0,
-            fit: "none",
-            wrap: false,
-            align: "left",
-            valign: "top",
-            paraSpaceAfter: 0,
-            paraSpaceBefore: 0,
-            lineSpacingMultiple: 1,
-            lang: "zh-CN",
-            objectName: `text:${e.nodeId}`,
-          });
-          nativeTexts.push(e.text);
-          nativeFragments.push({
-            nodeId: e.nodeId,
-            fragmentKey: e.fragmentKey,
-            text: e.text,
-            baseline: e.baseline,
-            requestedFontFamily: e.style.fontFamily,
-            fontFamily: e.font.family,
-            postscriptName: e.font.postscript,
-            fontFileSha256: e.font.fileSha256,
-            fontSize: e.style.fontSize,
-            letterSpacing: e.style.letterSpacing,
-            requestedWeight: e.font.requestedWeight,
-            faceWeight: e.font.faceWeight,
-            bold: e.font.bold,
-            italic: e.font.italic,
-            ascent: e.font.ascent,
-            descent: e.font.descent,
-            unitsPerEm: e.font.unitsPerEm,
-            measuredWidth: e.font.width,
-          });
-          fonts.add(e.font.family);
-          const faceKey = `${e.font.postscript}:${e.font.fileSha256}:${e.font.requestedWeight}:${e.font.italic}`;
-          const face = fontFaces.get(faceKey);
-          if (face) face.uses++;
-          else
-            fontFaces.set(faceKey, {
-              family: e.font.family,
-              postscriptName: e.font.postscript,
-              fontFileSha256: e.font.fileSha256,
-              requestedWeight: e.font.requestedWeight,
-              faceWeight: e.font.faceWeight,
-              italic: e.font.italic,
-              uses: 1,
-            });
+          const node = textNodes.get(e.nodeId);
+          const group = mergeableTextGroup(
+            plan.elements,
+            elementIndex,
+            node?.text.paragraphs.length === 1,
+            nodesWithRasterText.has(e.nodeId),
+          );
+          const textGroup = group || [e];
+          writeNativeText(textGroup);
+          elementIndex += textGroup.length - 1;
           continue;
         }
         const n = e.node,
@@ -395,6 +560,7 @@ async function writePptxWithPage(
       reports.push({
         sceneId: page.sceneId,
         nativeTexts,
+        nativeTextBoxes,
         nativeFragments,
         coveredNodeIds: plan.coveredNodeIds,
         rasterNodeIds: [

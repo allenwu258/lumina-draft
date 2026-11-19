@@ -6,7 +6,7 @@ export type SlidePacket = {
     | { kind: "image"; options: import("pptxgenjs").default.ImageProps }
     | {
         kind: "text";
-        text: string;
+        text: string | import("pptxgenjs").default.TextProps[];
         options: import("pptxgenjs").default.TextPropsOptions;
       }
     | {

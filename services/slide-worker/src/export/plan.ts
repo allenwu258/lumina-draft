@@ -38,6 +38,7 @@ export type Element =
       opacity: number;
       nodeId: string;
       fragmentKey: string;
+      lineIndex: number;
       text: string;
       frame: Rect;
       baseline: number;
@@ -324,6 +325,7 @@ export function planPptxPage(
                 kind: "text",
                 nodeId: n.id,
                 fragmentKey,
+                lineIndex,
                 text: part.text,
                 frame: { ...fragment.frame, x, width: part.font.width },
                 baseline: fragment.baseline,
