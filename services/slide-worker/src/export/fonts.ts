@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { openSync, type Font } from "fontkit";
-import type { TextStyle } from "@lumina/scene-core";
+import type { Fragment, SceneIR, TextStyle } from "@lumina/scene-core";
+import type { Page } from "playwright-core";
 
 type Face = {
   path: string;
@@ -28,6 +29,8 @@ export type ResolvedFont = {
   faceWeight: number;
   italic: boolean;
 };
+type FontRun = { text: string; font: ResolvedFont };
+export type SemiboldRuns = ReadonlyMap<Fragment, FontRun[]>;
 const normalize = (s: string) =>
   s.trim().replace(/["']/g, "").replace(/\s+/g, " ").toLowerCase();
 type FontMap = {
@@ -198,6 +201,7 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
       ? 700
       : 400;
   const weight = requestedWeight >= 600 ? 700 : 400;
+  const targetWeight = requestedWeight === 600 ? weight : requestedWeight;
   const chars = [...text].filter((c) => !/[\s\u200b-\u200d\ufe0f]/u.test(c));
   for (const family of families) {
     const choices = installed()
@@ -208,16 +212,16 @@ export function resolveFont(style: TextStyle, text: string): ResolvedFont {
       )
       .sort(
         (a, b) =>
-          Math.abs(a.weight - requestedWeight) +
+          Math.abs(a.weight - targetWeight) +
           (a.italic !== (style.fontStyle === "italic") ? 1000 : 0) -
-          (Math.abs(b.weight - requestedWeight) +
+          (Math.abs(b.weight - targetWeight) +
             (b.italic !== (style.fontStyle === "italic") ? 1000 : 0)),
       );
     for (const face of choices) {
       let font = load(face);
       // OOXML exposes regular/bold. Measure the same face/weight that the writer requests.
       if (font.variationAxes?.wght)
-        font = font.getVariation({ wght: requestedWeight });
+        font = font.getVariation({ wght: targetWeight });
       if (!chars.every((c) => font.hasGlyphForCodePoint(c.codePointAt(0)!)))
         continue;
       const advance = font
@@ -252,7 +256,7 @@ export function splitFontRuns(
   text: string,
   resolver = resolveFont,
 ) {
-  const result: { text: string; font: ResolvedFont }[] = [];
+  const result: FontRun[] = [];
   const segments = new Intl.Segmenter(undefined, {
     granularity: "grapheme",
   }).segment(text);
@@ -268,4 +272,61 @@ export function splitFontRuns(
     } else result.push({ text: segment, font });
   }
   return result;
+}
+
+export async function measureSemiboldRuns(
+  scene: SceneIR,
+  page: Page,
+): Promise<SemiboldRuns> {
+  const fragments = new Map<Fragment, FontRun[]>();
+  const samples: { run: FontRun; font: string; letterSpacing: number }[] = [];
+  for (const node of scene.nodes) {
+    if (node.kind !== "text") continue;
+    const styles = new Map(
+      node.text.paragraphs
+        .flatMap((p) => p.runs)
+        .filter((run) => Number.parseFloat(run.style.fontWeight) === 600)
+        .map((run) => [run.id, run.style]),
+    );
+    if (!styles.size) continue;
+    for (const line of node.text.lines) {
+      for (const fragment of line.fragments) {
+        const style = styles.get(fragment.runId);
+        if (!style || !fragment.displayText) continue;
+        try {
+          const runs = splitFontRuns(style, fragment.displayText);
+          fragments.set(fragment, runs);
+          for (const run of runs) {
+            samples.push({
+              run,
+              font: `${style.fontStyle} ${run.font.weight} ${style.fontSize}px ${JSON.stringify(run.font.family)}`,
+              letterSpacing: style.letterSpacing,
+            });
+          }
+        } catch (error) {
+          if (!String(error).includes("FONT_UNAVAILABLE")) throw error;
+        }
+      }
+    }
+  }
+  if (!samples.length) return fragments;
+  const widths = await page.evaluate(
+    (requests) => {
+      const context = document.createElement("canvas").getContext("2d")!;
+      return requests.map(({ text, font, letterSpacing }) => {
+        context.font = font;
+        context.letterSpacing = `${letterSpacing}px`;
+        return context.measureText(text).width;
+      });
+    },
+    samples.map(({ run, font, letterSpacing }) => ({
+      text: run.text,
+      font,
+      letterSpacing,
+    })),
+  );
+  samples.forEach(({ run }, index) => {
+    run.font.width = widths[index];
+  });
+  return fragments;
 }

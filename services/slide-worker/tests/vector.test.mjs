@@ -8,7 +8,7 @@ import { PNG } from "pngjs";
 import { assertScene, textTarget } from "@lumina/scene-core";
 import { convert, hash } from "../dist/capture.js";
 import { planPptxPage } from "../dist/export/plan.js";
-import { resolveFont } from "../dist/export/fonts.js";
+import { measureSemiboldRuns, resolveFont } from "../dist/export/fonts.js";
 import { sceneToSvg } from "../dist/export/svg.js";
 import { writePptx } from "../dist/export/writer.js";
 
@@ -381,6 +381,51 @@ test("font failure only flattens its display fragment and shadows keep the body 
     0,
     "shadow-only bitmap must not count the foreground as flattened",
   );
+});
+
+test("SimSun 600 exports as editable bold when its measured width matches", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const scene = await capture(
+    html(
+      '<p style="position:absolute;left:20px;top:20px">战国纵横家</p>',
+      "p{font:600 30px SimSun,serif;letter-spacing:1px}",
+    ),
+    "semibold",
+  );
+  const output = join(temp, "semibold-export");
+  await mkdir(output);
+  const { pages: [report] } = await writePptx(
+    {
+      title: "Semibold validation",
+      inputHash: "a".repeat(64),
+      pages: [{ scene, sceneId: "semibold", assets: {} }],
+    },
+    output,
+    resolve,
+    browser,
+  );
+  assert.deepEqual(report.nativeTexts, ["战国纵横家"]);
+  assert.equal(report.rasterRegions, 0);
+  const [fragment] = report.nativeFragments;
+  assert.equal(fragment.fontFamily, "SimSun");
+  assert.equal(fragment.requestedWeight, 600);
+  assert.equal(fragment.bold, true);
+  assert.equal(fragment.letterSpacing, 1);
+
+  const text = scene.nodes.find((node) => node.kind === "text");
+  text.text.lines[0].fragments[0].measuredWidth += 10;
+  const page = await browser.newPage({ locale: "zh-CN" });
+  try {
+    const runs = await measureSemiboldRuns(scene, page);
+    const elements = planPptxPage(scene, undefined, runs).elements;
+    assert.ok(!elements.some((element) => element.kind === "text"));
+    const [fallback] = elements.filter((element) => element.kind === "raster");
+    assert.equal(fallback.region.reasonCode, "FONT_METRICS");
+    assert.deepEqual(fallback.region.fragmentKeys, [`${text.id}/0/0`]);
+  } finally {
+    await page.close();
+  }
 });
 
 test("PPTX-inexpressible font weights flatten only their source fragment", async () => {

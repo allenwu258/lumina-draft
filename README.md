@@ -91,9 +91,9 @@ HTML 校验成功后，HTML、转换意图和事件在同一个事务保存。�
 
 `pptx_exports` 一张表保存冻结页序、来源与最终 Scene 引用、状态、错误及文件结果。状态为 `PREPARING / QUEUED / RUNNING / SUCCEEDED / FAILED`。准备阶段复用 Scene 转换且不占执行槽；转换和整本导出共享一个 Node/Chromium 执行槽，不占 Provider 并发。准备期间缺 Scene 的页被重新生成会报告来源冲突；最终清单固定后，后续页面修改不会混入本次导出。重复点击复用等价任务，失败需显式重试，中断 RUNNING 在重启后重新排队并更换令牌。
 
-文字按保存的显示行/片段输出，关闭自动换行和缩放；字体测量包含可变字体 wght，并与 PowerPoint 的普通/粗体输出匹配。可证明位置的混合字体拆成小片段；不支持的片段才局部栅格化。整页矩形裁剪交给页面视口，完全越界内容报告不可见。纯几何圆角、边框、内部裁剪和透明组合通过小型 Scene→SVG 函数输出，阴影尽量单独转成 PNG、主体保留矢量；其余组合使用共享 SceneRenderer 局部合成。禁止静默整页截图。表格第一版是固定单元格图形与文字，不是原生 PowerPoint table。不提供选页、导出设置、字体嵌入或跨机器像素一致性保证。
+文字按保存的显示行/片段输出，关闭自动换行和缩放；字体测量包含可变字体 wght，并与 PowerPoint 的普通/粗体输出匹配。CSS `600` 可近似为粗体：按输出字体与字距用 Chromium 测宽，符合原有的宽度容差才写入原生文本；不匹配的片段仍局部栅格化。可证明位置的混合字体拆成小片段；不支持的片段才局部栅格化。整页矩形裁剪交给页面视口，完全越界内容报告不可见。纯几何圆角、边框、内部裁剪和透明组合通过小型 Scene→SVG 函数输出，阴影尽量单独转成 PNG、主体保留矢量；其余组合使用共享 SceneRenderer 局部合成。禁止静默整页截图。表格第一版是固定单元格图形与文字，不是原生 PowerPoint table。不提供选页、导出设置、字体嵌入或跨机器像素一致性保证。
 
-导出请求和 latest_export 缓存同时绑定当前转换目标与 scene-pptx-0.2.0；旧文件仍可按 ID 下载。候选文件先独立检查 ZIP/OPC、页序、文字片段覆盖、SVG 主资源哈希、PNG 兼容资源有效性、资源引用和几何，再原子保存并发布成功。report_json 保存每处 SVG / PNG 的原因、节点和边界以及文字编辑性统计。默认文件在 `data/exports/`，可用 `PPTX_EXPORT_DIR` 指定绝对目录，与数据库和 Scene 资产一同备份。下载接口只读取成功文件；文件丢失/损坏明确报错，不在 GET 中重转或重建。
+导出请求和 latest_export 缓存同时绑定当前转换目标与 scene-pptx-0.2.3；旧文件仍可按 ID 下载。候选文件先独立检查 ZIP/OPC、页序、文字片段覆盖、SVG 主资源哈希、PNG 兼容资源有效性、资源引用和几何，再原子保存并发布成功。report_json 保存每处 SVG / PNG 的原因、节点和边界以及文字编辑性统计。默认文件在 `data/exports/`，可用 `PPTX_EXPORT_DIR` 指定绝对目录，与数据库和 Scene 资产一同备份。下载接口只读取成功文件；文件丢失/损坏明确报错，不在 GET 中重转或重建。
 
 开发时可用 `powershell.exe -NoProfile -STA -File services/slide-worker/scripts/check-office.ps1 -Pptx <绝对文件路径> -OutputDirectory <已存在的空目录>` 在本机 PowerPoint 中检查文字与页面 PNG。脚本只管理自己创建的 Office 实例；已有 PowerPoint 进程时停止该项检查。Office 不是导出运行依赖。
 

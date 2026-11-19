@@ -40,7 +40,7 @@ from .scene_service import (
     validate_scene,
 )
 
-EXPORT_VERSION = "scene-pptx-0.2.2"
+EXPORT_VERSION = "scene-pptx-0.2.3"
 EXPORT_ROOT = Path(os.getenv("PPTX_EXPORT_DIR", ROOT / "data" / "exports")).resolve()
 MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 

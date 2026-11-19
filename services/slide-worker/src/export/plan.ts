@@ -5,7 +5,12 @@ import {
   type SceneNode,
   type TextStyle,
 } from "@lumina/scene-core";
-import { resolveFont, splitFontRuns, type ResolvedFont } from "./fonts.js";
+import {
+  resolveFont,
+  splitFontRuns,
+  type ResolvedFont,
+  type SemiboldRuns,
+} from "./fonts.js";
 
 export const inch = (px: number) => px / 60;
 export const point = (px: number) => px * 1.2;
@@ -103,6 +108,7 @@ function inside(
 export function planPptxPage(
   scene: SceneIR,
   fontResolver = resolveFont,
+  semiboldRuns?: SemiboldRuns,
 ): PagePlan {
   assertScene(scene);
   const nodes = new Map(scene.nodes.map((n) => [n.id, n]));
@@ -298,14 +304,14 @@ export function planPptxPage(
             const requestedWeight = Number.parseFloat(style.fontWeight);
             if (
               Number.isFinite(requestedWeight) &&
-              ![400, 700].includes(requestedWeight)
+              ![400, 600, 700].includes(requestedWeight)
             )
               throw new Error("FONT_STYLE_UNSUPPORTED: weight");
-            const parts = splitFontRuns(
-              style,
-              fragment.displayText,
-              fontResolver,
-            );
+            const parts =
+              requestedWeight === 600
+                ? semiboldRuns?.get(fragment)
+                : splitFontRuns(style, fragment.displayText, fontResolver);
+            if (!parts) throw new Error("FONT_UNAVAILABLE: semibold metrics");
             const width = parts.reduce((sum, part) => sum + part.font.width, 0);
             if (
               Math.abs(width - fragment.measuredWidth) >

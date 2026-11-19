@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { writeFile, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import type { Browser } from "playwright-core";
+import type { Browser, Page } from "playwright-core";
 import { textTarget, type SceneIR, type Rect } from "@lumina/scene-core";
 import { planPptxPage, inch, point, type PagePlan } from "./plan.js";
 import { sceneToSvg } from "./svg.js";
@@ -9,7 +9,7 @@ import { hash } from "../capture.js";
 import { serializePresentation, type SlidePacket } from "./serialize.js";
 import { color } from "./color.js";
 import { rasterRegions, readSceneAssets } from "./raster.js";
-import { FONT_MAP_VERSION } from "./fonts.js";
+import { FONT_MAP_VERSION, measureSemiboldRuns } from "./fonts.js";
 
 export type ExportInput = {
   warnings?: string[];
@@ -35,6 +35,34 @@ export async function writePptx(
   if (!input.pages.length || input.pages.length > 20)
     throw new Error("INVALID_EXPORT_PAGES");
   if (!browser) throw new Error("EXPORT_BROWSER_REQUIRED");
+  const context = await browser.newContext({
+    serviceWorkers: "block",
+    locale: "zh-CN",
+  });
+  const abort = () => void context.close();
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal?.aborted) throw new Error("EXPORT_ABORTED");
+    await context.route("**/*", (route) => route.abort());
+    const page = await context.newPage();
+    await page.setContent(
+      "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; img-src data: blob:; style-src 'unsafe-inline'\"></head><body></body></html>",
+    );
+    return await writePptxWithPage(input, output, within, browser, page, signal);
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    await context.close().catch(() => {});
+  }
+}
+
+async function writePptxWithPage(
+  input: ExportInput,
+  output: string,
+  within: (path: string) => string,
+  browser: Browser,
+  exportPage: Page,
+  signal?: AbortSignal,
+) {
   const slides: SlidePacket[] = [];
   const alpha = (value: ReturnType<typeof color>, opacity: number) => ({
     ...value,
@@ -106,7 +134,8 @@ export async function writePptx(
   for (const [index, page] of input.pages.entries()) {
     try {
       if (signal?.aborted) throw new Error("EXPORT_ABORTED");
-      const plan: PagePlan = planPptxPage(page.scene);
+      const semiboldRuns = await measureSemiboldRuns(page.scene, exportPage);
+      const plan: PagePlan = planPptxPage(page.scene, undefined, semiboldRuns);
       const assets = await readSceneAssets(page.scene, page.assets, within);
       const regions = plan.elements.flatMap((e) =>
         e.kind === "raster" ? [e.region] : [],
@@ -417,32 +446,19 @@ export async function writePptx(
       );
     }
   }
-  const context = await browser.newContext({ serviceWorkers: "block" });
-  const abort = () => void context.close();
-  signal?.addEventListener("abort", abort, { once: true });
-  try {
-    if (signal?.aborted) throw new Error("EXPORT_ABORTED");
-    await context.route("**/*", (route) => route.abort());
-    const page = await context.newPage();
-    await page.setContent(
-      "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; img-src data: blob:; style-src 'unsafe-inline'\"></head><body></body></html>",
-    );
-    const bundle = join(
-      dirname(createRequire(import.meta.url).resolve("pptxgenjs")),
-      "pptxgen.bundle.js",
-    );
-    await page.addScriptTag({ content: await readFile(bundle, "utf8") });
-    const encoded = await page.evaluate(serializePresentation, {
-      title: input.title,
-      slides,
-    });
-    const raw = Buffer.from(encoded, "base64");
-    if (raw.length > 128 * 1024 * 1024) throw new Error("PPTX_OUTPUT_LIMIT");
-    await writeFile(join(output, "presentation.pptx"), raw);
-  } finally {
-    signal?.removeEventListener("abort", abort);
-    await context.close().catch(() => {});
-  }
+  if (signal?.aborted) throw new Error("EXPORT_ABORTED");
+  const bundle = join(
+    dirname(createRequire(import.meta.url).resolve("pptxgenjs")),
+    "pptxgen.bundle.js",
+  );
+  await exportPage.addScriptTag({ content: await readFile(bundle, "utf8") });
+  const encoded = await exportPage.evaluate(serializePresentation, {
+    title: input.title,
+    slides,
+  });
+  const raw = Buffer.from(encoded, "base64");
+  if (raw.length > 128 * 1024 * 1024) throw new Error("PPTX_OUTPUT_LIMIT");
+  await writeFile(join(output, "presentation.pptx"), raw);
   if (signal?.aborted) throw new Error("EXPORT_ABORTED");
   const report = {
     inputHash: input.inputHash,
