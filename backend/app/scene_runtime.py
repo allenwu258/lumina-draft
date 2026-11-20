@@ -356,7 +356,8 @@ async def recover():
                             "EXPORT_VERSION_CHANGED", "导出引擎已升级，请重新发起导出"
                         ),
                     )
-                    presentations.add(record.presentation_id)
+                    if record.presentation_id:
+                        presentations.add(record.presentation_id)
                     continue
                 if record.status != "RUNNING":
                     continue
@@ -369,7 +370,8 @@ async def recover():
                     None,
                     utcnow(),
                 )
-                presentations.add(record.presentation_id)
+                if record.presentation_id:
+                    presentations.add(record.presentation_id)
                 export_service.event_tx(db, record, "queued")
             for job in db.scalars(
                 select(SceneConversionJob).where(
@@ -458,7 +460,8 @@ async def scene_scheduler(stop: asyncio.Event):
                         old = (pending.status, pending.input_manifest_json)
                         export_service.advance_tx(db, pending)
                         if old != (pending.status, pending.input_manifest_json):
-                            changed_presentations.add(pending.presentation_id)
+                            if pending.presentation_id:
+                                changed_presentations.add(pending.presentation_id)
                     db.flush()
                     current = db.scalar(
                         select(SceneConversionJob)
@@ -512,7 +515,8 @@ async def scene_scheduler(stop: asyncio.Event):
                 continue
             token = current.attempt_token
             HEALTH["active_job_id"] = current.id
-            await EVENT_BUS.notify(current.presentation_id)
+            if current.presentation_id:
+                await EVENT_BUS.notify(current.presentation_id)
             work = SCENE_ROOT / ".work" / current.id / token
             try:
                 work.mkdir(parents=True, exist_ok=True)
@@ -649,7 +653,8 @@ async def scene_scheduler(stop: asyncio.Event):
             finally:
                 await asyncio.to_thread(shutil.rmtree, work, True)
                 HEALTH["active_job_id"] = None
-                await EVENT_BUS.notify(current.presentation_id)
+                if current.presentation_id:
+                    await EVENT_BUS.notify(current.presentation_id)
                 current = None
     finally:
         await worker.close()

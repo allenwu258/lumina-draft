@@ -26,6 +26,7 @@ from .scene_api import router as scene_router
 from .scene_runtime import HEALTH as SCENE_HEALTH, scene_scheduler
 from .scene_service import summary as scene_summary, cancel_conversions, source_hash as page_source_hash
 from .export_api import router as export_router
+from .work_api import router as work_router
 from . import export_service
 from .director_commands import enqueue_director
 from .agent import leader, turns as agent_turns
@@ -57,6 +58,7 @@ app = FastAPI(title="Lumina Draft API", version="0.1.0", lifespan=lifespan)
 app.include_router(scene_router)
 app.include_router(agent_turns.router)
 app.include_router(export_router)
+app.include_router(work_router)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Idempotency-Key", "Last-Event-ID"])
 API = "/api/v1"
 TICKETS: dict[str, tuple[str, float, str | None]] = {}

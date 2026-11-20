@@ -7,8 +7,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, select, text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, MetaData, String, Table, Text, UniqueConstraint, create_engine, event, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.schema import CreateTable
 
 from .config import settings, _read_key_file
 from .secrets import save_secret
@@ -325,10 +326,34 @@ class PageScene(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Work(Base):
+    __tablename__ = "works"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(200))
+    type: Mapped[str] = mapped_column(String(30), default="presentation", index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    source_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class WorkPage(Base):
+    __tablename__ = "work_pages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    work_id: Mapped[str] = mapped_column(ForeignKey("works.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200))
+    scene_hash: Mapped[str] = mapped_column(String(64))
+    scene_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("work_id", "position", name="uq_work_page_position"),)
+
+
 class PptxExport(Base):
     __tablename__ = "pptx_exports"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    presentation_id: Mapped[str] = mapped_column(ForeignKey("presentations.id"), index=True)
+    presentation_id: Mapped[str | None] = mapped_column(ForeignKey("presentations.id"), nullable=True, index=True)
+    work_id: Mapped[str | None] = mapped_column(ForeignKey("works.id"), nullable=True, index=True)
     request_hash: Mapped[str] = mapped_column(String(64))
     source_hash: Mapped[str] = mapped_column(String(64))
     export_version: Mapped[str] = mapped_column(String(80))
@@ -349,7 +374,15 @@ class PptxExport(Base):
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    __table_args__ = (UniqueConstraint("presentation_id", "request_hash", name="uq_pptx_request"),)
+    __table_args__ = (
+        CheckConstraint(
+            "(presentation_id IS NOT NULL AND work_id IS NULL) OR "
+            "(presentation_id IS NULL AND work_id IS NOT NULL)",
+            name="ck_pptx_export_owner",
+        ),
+        UniqueConstraint("presentation_id", "request_hash", name="uq_pptx_request"),
+        UniqueConstraint("work_id", "request_hash", name="uq_work_pptx_request"),
+    )
 
 
 class Event(Base):
@@ -723,6 +756,31 @@ def _upgrade_existing_schema() -> bool:
         connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_run_batch ON runs (batch_id, created_at)")
         connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_page_batch_number ON page_tasks (batch_id, page_number)")
         connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_page_batch_slide ON page_tasks (batch_id, slide_id)")
+        export_columns = {
+            column["name"]: column
+            for column in inspect(connection).get_columns("pptx_exports")
+        }
+        if "work_id" not in export_columns or export_columns["presentation_id"]["nullable"] is False:
+            migration_metadata = MetaData()
+            Table("presentations", migration_metadata, Column("id", String(36), primary_key=True))
+            Table("works", migration_metadata, Column("id", String(36), primary_key=True))
+            replacement = PptxExport.__table__.to_metadata(migration_metadata, name="pptx_exports_new")
+            connection.execute(CreateTable(replacement))
+            shared = [
+                column.name
+                for column in PptxExport.__table__.columns
+                if column.name in export_columns
+            ]
+            names = ", ".join('"' + name + '"' for name in shared)
+            connection.exec_driver_sql(
+                f"INSERT INTO pptx_exports_new ({names}) SELECT {names} FROM pptx_exports"
+            )
+            connection.exec_driver_sql("DROP TABLE pptx_exports")
+            connection.exec_driver_sql(
+                "ALTER TABLE pptx_exports_new RENAME TO pptx_exports"
+            )
+            for index in PptxExport.__table__.indexes:
+                index.create(connection, checkfirst=True)
         connection.execute(
             text(
                 """UPDATE jobs

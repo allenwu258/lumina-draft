@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowLeft, ArrowRight, Bot, Check, ChevronDown, ChevronUp, CircleHelp, FileText, Image, Layers3, LayoutTemplate, LoaderCircle, PanelLeftClose, PanelRightClose, PanelRightOpen, Palette, Plus, RefreshCw, Send, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { Activity, ArrowLeft, ArrowRight, Bot, Check, ChevronDown, ChevronUp, CircleHelp, FileText, FolderOpen, Image, Layers3, LayoutTemplate, LoaderCircle, PanelLeftClose, PanelRightClose, PanelRightOpen, Palette, Plus, RefreshCw, Send, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import './styles.css';
 import './generation-settings.css';
 import './chat-ui.css';
@@ -14,6 +14,9 @@ import type { CanvasSize } from '@lumina/scene-core';
 import { canvasRatio, defaultDesignDraft, designOptions, DesignOptions } from './DesignOptions';
 import { SceneViewport } from './scene/SceneViewport';
 import { PresentationExport, type ExportSource, type ExportSummary } from './export/PresentationExport';
+import { CreateWorkButton } from './works/CreateWorkButton';
+import { WorkEditor } from './works/WorkEditor';
+import { WorkLibrary } from './works/WorkLibrary';
 
 type JobState = { id:string; status:string; queue_reason:string|null; queue_duration_ms:number|null; error_code:string|null; error:string|null };
 type DirectorStream = {reasoning:string;output:string};
@@ -95,7 +98,7 @@ function OutlineBulletsInput({ value, onChange, readOnly = false }: { value: str
   );
 }
 
-function App(){
+function WorkbenchApp(){
   const [presentations,setPresentations]=useState<any[]>([]); const [activeId,setActiveId]=useState<string|null>(()=>sessionStorage.getItem('lumina.activePresentation')); const [snapshot,setSnapshot]=useState<Snapshot|null>(null);
   const [prompt,setPrompt]=useState(''); const [loading,setLoading]=useState(false); const [error,setError]=useState('');
   const [entryMode,setEntryMode]=useState<EntryMode>(DEFAULT_ENTRY_MODE);
@@ -217,7 +220,7 @@ function App(){
     <aside className={`sidebar ${sidebarOpen?'':'collapsed'}`}>
       <div className="brand-row"><div className="brand-mark"><Layers3 size={17}/></div>{sidebarOpen&&<><span className="brand-name">lumina<span>draft</span></span><button className="icon-button sidebar-toggle" title="收起侧栏" onClick={()=>setSidebarOpen(false)}><PanelLeftClose size={16}/></button></>}</div>
       {sidebarOpen&&<><button className="new-button" onClick={()=>{navigateSettings(null);selectedWork.current=null;setActiveId(null);setSnapshot(null);setDoc(null);setEntryMode(DEFAULT_ENTRY_MODE);setWorkspaceView('outline');loadedPresentationRef.current=null;setRunUpdates({});setError('')}}><Plus size={16}/> 新建作品</button>
-        <div className="side-label">工作区</div><button className={"side-item "+(!settingsPage?"active":"")} onClick={()=>navigateSettings(null)}><Sparkles size={15}/>创作工作台</button><button className={"side-item "+(settingsPage?"active":"")} onClick={()=>navigateSettings('providers')}><Settings2 size={15}/>模型与 API</button>
+        <div className="side-label">工作区</div><button className={"side-item "+(!settingsPage?"active":"")} onClick={()=>navigateSettings(null)}><Sparkles size={15}/>创作工作台</button><button className="side-item" onClick={()=>window.location.assign('/works')}><FolderOpen size={15}/>我的作品</button><button className={"side-item "+(settingsPage?"active":"")} onClick={()=>navigateSettings('providers')}><Settings2 size={15}/>模型与 API</button>
         <div className="side-label history-label">最近创作 <span>{presentations.length}</span></div><div className="history-list">{presentations.map(p=><button key={p.id} className={`history-item ${activeId===p.id?'selected':''}`} onClick={()=>choose(p.id)}><span className="history-mode-icon"><ModeIcon mode={p.entry_mode} size={14}/></span><span>{p.user_request.slice(0,26)||'未命名演示文稿'}</span><i className={`status-dot ${p.status.toLowerCase()}`}/></button>)}</div>
         <div className="sidebar-footer"><div className="avatar">L</div><div><strong>本地工作区</strong><small>单用户 · SQLite</small></div><CircleHelp size={16}/></div>
       </>}{!sidebarOpen&&<button className="icon-button expand-button" title="展开侧栏" onClick={()=>setSidebarOpen(true)}><ArrowRight size={17}/></button>}
@@ -235,7 +238,7 @@ function App(){
           activeTurn={snapshot.conversation.active_leader_turn_id} allowed={snapshot.conversation.allowed_actions.send_message}
           refresh={()=>loadSnapshot(snapshot.presentation.id)} runUpdates={runUpdates} error={error}/>
         : <section className={`workbench ${isDesign ? 'design-workbench' : ''}`}>
-         <div className="work-heading"><div><div className="eyebrow">{waiting?(isDesign?'设计大纲':'内容说明书'):generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':'任务进度'}</div><h1>{doc?.brief.title||(status==='DRAFT'?snapshot.presentation.user_request.slice(0,36):'正在理解你的需求')}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p>{isDesign&&<span className="design-spec">{canvasLabel} px · {canvasRatio(canvas)}</span>}</div><div className="work-heading-actions">{!isDesign&&snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
+         <div className="work-heading"><div><div className="eyebrow">{waiting?(isDesign?'设计大纲':'内容说明书'):generating||status==='READY'||status==='PARTIAL_FAILED'?'页面创作':'任务进度'}</div><h1>{doc?.brief.title||(status==='DRAFT'?snapshot.presentation.user_request.slice(0,36):'正在理解你的需求')}</h1><p>{doc?.brief.purpose||snapshot.presentation.user_request}</p>{isDesign&&<span className="design-spec">{canvasLabel} px · {canvasRatio(canvas)}</span>}</div><div className="work-heading-actions">{!isDesign&&snapshot.latest_outline?.confirmed&&<PresentationExport key={snapshot.presentation.id+snapshot.export_source?.source_hash} presentationId={snapshot.presentation.id} source={snapshot.export_source} latest={snapshot.latest_export}/>}{!isDesign&&snapshot.export_source?.can_export&&<CreateWorkButton presentationId={snapshot.presentation.id} sourceHash={snapshot.export_source.source_hash!}/>}{(isPlanning||generating)&&snapshot.active_run&&<button className="secondary-button" onClick={()=>api(`/runs/${snapshot.active_run!.id}/cancel`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><X size={15}/>取消生成</button>}{doc&&waiting&&<><button className="secondary-button" onClick={saveOutline}><Check size={15}/>保存修改</button><button className="primary-button" onClick={confirm}><Sparkles size={15}/>确认并生成 {doc.slides.length} 页<ArrowRight size={15}/></button></>}{(status==='FAILED'||status==='PARTIAL_FAILED'||status==='CANCELLED')&&<button className="primary-button" onClick={()=>api(`/presentations/${snapshot.presentation.id}/retry`,{method:'POST'}).then(()=>loadSnapshot(snapshot.presentation.id)).catch(e=>setError(String(e)))}><RefreshCw size={15}/>重新生成</button>}</div></div>
          {doc&&<div className="ppt-view-switcher" role="tablist" aria-label="工作区视图"><button role="tab" aria-selected={workspaceView==='outline'} className={workspaceView==='outline'?'active':''} onClick={()=>setWorkspaceView('outline')}><LayoutTemplate size={14}/>{isDesign?'设计大纲':'大纲'}{snapshot.latest_outline?.confirmed&&<small>只读</small>}</button><button role="tab" aria-selected={workspaceView==='generation'} disabled={!generationAvailable} className={workspaceView==='generation'?'active':''} onClick={()=>generationAvailable&&setWorkspaceView('generation')}><Layers3 size={14}/>{isDesign?'设计预览':'页面生成'}{generationAvailable&&<small>{snapshot.pages.filter(page=>page.status==='SUCCEEDED').length}/{snapshot.pages.length}</small>}</button></div>}
         {usage?.presentation_id===snapshot.presentation.id&&<div className="usage-bar" aria-label="当前作品会话 token 用量"><Activity size={14}/><span>会话用量</span><span title={usage.input_unreported_calls?`${usage.input_unreported_calls} 次调用未返回输入用量`:undefined}>输入 <strong>{formatUsage(usage.input_tokens,usage.input_unreported_calls)}</strong></span><span title={usage.output_unreported_calls?`${usage.output_unreported_calls} 次调用未返回输出用量`:undefined}>输出 <strong>{formatUsage(usage.output_tokens,usage.output_unreported_calls)}</strong></span><span title={usage.total_unreported_calls?`${usage.total_unreported_calls} 次调用未返回总用量`:undefined}>合计 <strong>{formatUsage(usage.total_tokens,usage.total_unreported_calls)}</strong></span><span>{usage.call_count} 次调用</span></div>}
         {error&&<div className="inline-error"><X size={14}/>{error}<button onClick={()=>setError('')}>关闭</button></div>}
@@ -319,6 +322,19 @@ function App(){
     </main>
 
   </div>
+}
+
+function App() {
+  const [pathname, setPathname] = useState(window.location.pathname);
+  useEffect(() => {
+    const update = () => setPathname(window.location.pathname);
+    window.addEventListener('popstate', update);
+    return () => window.removeEventListener('popstate', update);
+  }, []);
+  const match = pathname.match(/^\/edit\/([^/]+)\/?$/);
+  if (match) return <WorkEditor key={match[1]} workId={decodeURIComponent(match[1])} />;
+  if (/^\/works\/?$/.test(pathname)) return <WorkLibrary />;
+  return <WorkbenchApp />;
 }
 
 function settingsTabFromPath(): SettingsTab|null {const segment=window.location.pathname.split('/')[2];return window.location.pathname.startsWith('/settings/') && ['providers','routing','calls'].includes(segment) ? segment as SettingsTab : null;}

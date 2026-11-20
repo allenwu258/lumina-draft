@@ -11,6 +11,7 @@ import shutil
 import zipfile
 import struct
 import zlib
+from types import SimpleNamespace
 from xml.etree import ElementTree as ET
 
 from sqlalchemy import select
@@ -23,6 +24,8 @@ from .db import (
     Presentation,
     Run,
     SceneConversionJob,
+    Work,
+    WorkPage,
     loads,
     utcnow,
 )
@@ -132,6 +135,8 @@ def export_dict(record: PptxExport) -> dict:
     return {
         "id": record.id,
         "presentation_id": record.presentation_id,
+        "work_id": record.work_id,
+        "work_revision": manifest.get("work_revision"),
         "source_hash": record.source_hash,
         "status": record.status,
         "ready_pages": sum(bool(p.get("scene")) for p in manifest["pages"]),
@@ -154,6 +159,8 @@ def export_dict(record: PptxExport) -> dict:
 def event_tx(db, record, state=None):
     from .runtime import append_event_tx
 
+    if not record.presentation_id:
+        return
     append_event_tx(
         db,
         record.presentation_id,
@@ -251,6 +258,87 @@ def create_tx(db, presentation_id, expected_hash, retry=False, batch_id=None):
     return record
 
 
+def create_work_tx(db, work_id: str, expected_revision: int, retry=False):
+    work = db.get(Work, work_id)
+    if not work:
+        raise ExportError("NOT_FOUND", "作品不存在")
+    if work.revision != expected_revision:
+        raise ExportError("WORK_REVISION_CHANGED", "作品已更新，请刷新后重新导出")
+    if work.type != "presentation":
+        raise ExportError("EXPORT_NOT_SUPPORTED", "此作品类型暂不支持 PPTX 导出")
+    pages = db.scalars(
+        select(WorkPage).where(WorkPage.work_id == work_id).order_by(WorkPage.position)
+    ).all()
+    if not 1 <= len(pages) <= 20:
+        raise ExportError("INVALID_EXPORT_PAGES", "PPT 页面数量必须为 1 到 20 页")
+    page_manifest = [
+        {
+            "page_number": page.position,
+            "work_page_id": page.id,
+            "scene_hash": page.scene_hash,
+            "scene": {"scene_hash": page.scene_hash},
+            "scene_json": page.scene_json,
+        }
+        for page in pages
+    ]
+    source = digest(
+        canonical(
+            {
+                "work_id": work.id,
+                "revision": work.revision,
+                "name": work.name,
+                "pages": [
+                    {"position": page.position, "id": page.id, "scene_hash": page.scene_hash}
+                    for page in pages
+                ],
+            }
+        )
+    )
+    request_hash = digest(
+        canonical(["work", work.id, work.revision, source, EXPORT_VERSION, SCENE_TARGET])
+    )
+    record = db.scalar(
+        select(PptxExport).where(
+            PptxExport.work_id == work_id,
+            PptxExport.request_hash == request_hash,
+        )
+    )
+    if record and (record.status != "FAILED" or not retry):
+        return record
+    if record:
+        record.status, record.attempt, record.attempt_token = "QUEUED", 0, None
+        record.error_code = record.error = record.failed_page = record.finished_at = None
+        record.queued_at = utcnow()
+        event_tx(db, record, "queued")
+        return record
+
+    manifest = {
+        "target": SCENE_TARGET,
+        "title": work.name,
+        "work_revision": work.revision,
+        "pages": page_manifest,
+    }
+    record = PptxExport(
+        work_id=work.id,
+        request_hash=request_hash,
+        source_hash=source,
+        export_version=EXPORT_VERSION,
+        input_manifest_json=canonical(manifest),
+        input_hash=digest(
+            canonical([manifest, EXPORT_VERSION, "installed-fonts-v2", FONT_MAP_VERSION])
+        ),
+        download_filename=(
+            re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", work.name).strip(" .")[:100]
+            or "演示文稿"
+        )
+        + ".pptx",
+        status="QUEUED",
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
 def advance_tx(db, record):
     """Resolve pinned dependencies without occupying the browser execution slot."""
     if record.status != "PREPARING":
@@ -324,6 +412,55 @@ def stage_input(record, work: Path) -> dict:
 
     manifest = loads(record.input_manifest_json)
     pages = []
+    if record.work_id:
+        from .works_service import OBJECT_ROOT, object_path
+
+        for item in manifest["pages"]:
+            try:
+                scene_json = item["scene_json"]
+                if digest(scene_json) != item["scene_hash"]:
+                    raise ValueError("SCENE_IDENTITY")
+                scene = json.loads(scene_json)
+                target = work / "assets" / item["work_page_id"]
+                target.mkdir(parents=True, exist_ok=True)
+                for asset in scene["assets"]:
+                    destination = (target / asset["file"]).resolve()
+                    if destination.parent != target.resolve():
+                        raise ValueError("SCENE_ASSET_PATH")
+                    source_path = object_path(asset).resolve()
+                    if (
+                        not source_path.is_relative_to(OBJECT_ROOT.resolve())
+                        or source_path.is_symlink()
+                        or not source_path.is_file()
+                        or source_path.stat().st_size != asset["byteLength"]
+                        or digest(source_path.read_bytes()) != asset["sha256"]
+                    ):
+                        raise ValueError("WORK_ASSET_UNAVAILABLE")
+                    shutil.copyfile(source_path, destination)
+                source = scene["source"]
+                job = SimpleNamespace(
+                    html_hash=source["htmlHash"],
+                    css_hash=source["cssHash"],
+                    converter_version=source["converterVersion"],
+                    canvas_width=scene["page"]["width"],
+                    canvas_height=scene["page"]["height"],
+                )
+                validate_scene(scene, job, target)
+                assets = {
+                    asset["id"]: (target / asset["file"]).relative_to(SCENE_ROOT).as_posix()
+                    for asset in scene["assets"]
+                }
+                pages.append(
+                    {"scene": scene, "assets": assets, "sceneId": item["work_page_id"]}
+                )
+            except Exception as exc:
+                raise ExportError(
+                    "SCENE_INPUT_INVALID",
+                    f'第 {item["page_number"]} 页场景或资产不可用：{exc}',
+                    item["page_number"],
+                ) from exc
+        return {"title": manifest["title"], "inputHash": record.input_hash, "pages": pages}
+
     with session_scope() as db:
         for item in manifest["pages"]:
             try:

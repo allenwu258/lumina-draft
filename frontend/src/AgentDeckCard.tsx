@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Layers3 } from 'lucide-react';
 import type { CanvasSize } from '@lumina/scene-core';
 import { PresentationExport, type ExportSource, type ExportSummary } from './export/PresentationExport';
+import { CreateWorkButton } from './works/CreateWorkButton';
 import { PageStatusIcon, pageStatusLabel } from './PageStatus';
 import { SlideFrame } from './SlideFrame';
 import { api, type ArtifactSelection, type CardAction, type Page } from './workbench-api';
@@ -118,6 +119,7 @@ export function AgentDeckCard({ presentationId, messageId, batchId, runId, label
     <footer className="agent-artifact-actions">
       {generating && effectiveRun && <button className="secondary-button" disabled={busy || state === 'CANCEL_REQUESTED'} onClick={() => void runAction(false)}>取消生成</button>}
       {failed && batchId && <button className="secondary-button" disabled={busy || !canSubmit} onClick={() => void runAction(true)}>重试失败页</button>}
+      {batchId && current?.export_source?.can_export && <CreateWorkButton presentationId={presentationId} batchId={batchId} sourceHash={current.export_source.source_hash!} />}
       {current?.export_source && <PresentationExport key={batchId + '/' + current.export_source.source_hash}
         presentationId={presentationId} batchId={batchId} source={current.export_source} latest={current.latest_export}/>}
     </footer>
