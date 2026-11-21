@@ -11,6 +11,7 @@ import {
   reflowTextNode,
   selectedTextStyle,
   textLayout,
+  translateScene,
   translateTextLayouts,
   type SelectionTarget,
   type TextAlign,
@@ -284,10 +285,13 @@ export function WorkEditor({ workId }: { workId: string }) {
     }
   }
 
-  function updateScene(nextScene: SceneIR) {
-    setPage((value) => value ? {
-      ...value, scene: nextScene, editor: translateTextLayouts(value.editor, value.scene, nextScene),
-    } : value);
+  function moveSelection(rootId: string, dx: number, dy: number) {
+    setPage((value) => {
+      if (!value) return value;
+      const scene = translateScene(value.scene, rootId, dx, dy);
+      const editor = translateTextLayouts(value.editor, value.scene, scene);
+      return { ...value, scene, editor };
+    });
   }
 
   function updateText(nodeId: string, change: { sourceText?: string; align?: TextAlign; style?: Partial<TextStyle> }) {
@@ -370,7 +374,22 @@ export function WorkEditor({ workId }: { workId: string }) {
         </aside>
         <section className="work-page-area" aria-label="页面预览">
           <div className="work-page-toolbar"><span>{page ? `第 ${page.position} 页 · ${page.title}` : '加载页面'}</span>{page && <span>{page.scene.page.width} × {page.scene.page.height} px</span>}</div>
-          {page ? <SceneCanvas workId={workId} pageId={page.id} scene={page.scene} editor={page.editor} selected={selected} editingNodeId={editingNodeId} onSelect={setSelected} onEditStart={setEditingNodeId} onEditEnd={() => setEditingNodeId(null)} onSceneChange={updateScene} onTextChange={(nodeId, sourceText) => updateText(nodeId, { sourceText })} /> : <div className="work-page-placeholder"><LoaderCircle className="spin" size={20} /></div>}
+          {page ? (
+            <SceneCanvas
+              key={page.id}
+              workId={workId}
+              pageId={page.id}
+              scene={page.scene}
+              editor={page.editor}
+              selected={selected}
+              editingNodeId={editingNodeId}
+              onSelect={setSelected}
+              onEditStart={setEditingNodeId}
+              onEditEnd={() => setEditingNodeId(null)}
+              onMove={moveSelection}
+              onTextChange={(nodeId, sourceText) => updateText(nodeId, { sourceText })}
+            />
+          ) : <div className="work-page-placeholder"><LoaderCircle className="spin" size={20} /></div>}
           {page?.scene.diagnostics.length ? <div className="work-page-diagnostics">{page.scene.diagnostics.length} 项渲染提示</div> : null}
         </section>
       </div>

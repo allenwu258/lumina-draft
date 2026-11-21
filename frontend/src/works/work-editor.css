@@ -30,11 +30,19 @@
 .work-page-toolbar{height:45px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid #e0e4e8;color:#586572;font-size:12px}
 .work-page-toolbar span:last-child{color:#89939e;font-size:11px;font-variant-numeric:tabular-nums}
 .work-canvas-stage{flex:1;min-height:0;display:grid;place-items:center;overflow:auto;padding:20px;background:#e7e9ec}
-.work-canvas-host{position:relative;width:min(100%,calc((100vh - 180px)*var(--page-ratio)));aspect-ratio:var(--page-ratio);max-height:100%;background:#fff;box-shadow:0 3px 14px #1a26351c;touch-action:none}
+.work-canvas-host{position:relative;width:min(100%,calc((100vh - 180px)*var(--page-ratio)));aspect-ratio:var(--page-ratio);max-height:100%;background:#fff;box-shadow:0 3px 14px #1a26351c;touch-action:none;user-select:none}
 .work-canvas-host canvas{display:block;width:100%;height:100%}
+.work-canvas-host:focus{outline:none}
+.work-canvas-host:focus-visible{outline:2px solid #2d8b63;outline-offset:3px}
+.scene-hover{position:absolute;z-index:1;box-sizing:border-box;border:1px dashed #2d8b63b3;pointer-events:none}
+.scene-hover.locked{border-color:#ba7a2d99}
 .scene-selection{position:absolute;z-index:2;box-sizing:border-box;border:1px solid #2d8b63;box-shadow:0 0 0 1px #ffffffaa;pointer-events:none}
+.work-canvas-host[data-gesture] .scene-selection{border-color:#176849}
+.work-canvas-host[data-gesture="dragging"] .scene-selection{box-shadow:0 0 0 1px #fff}
 .scene-selection.locked{border-color:#ba7a2d;border-style:dashed}
-.scene-text-editor{position:absolute;z-index:3;box-sizing:border-box;margin:0;padding:0;border:0;outline:1px solid #2d8b63;background:transparent;overflow:hidden;resize:none;transform-origin:top left}
+.scene-lock-label{position:absolute;top:5px;right:5px;padding:3px 6px;border-radius:4px;background:#fff6e7;color:#734a1b;font-size:11px;white-space:nowrap}
+.scene-selection-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;pointer-events:none}
+.scene-text-editor{position:absolute;z-index:3;box-sizing:border-box;margin:0;padding:0;border:0;outline:1px dashed #2d8b63;background:transparent;overflow:hidden;resize:none;transform-origin:top left;cursor:text;user-select:text;caret-color:currentColor}
 .work-canvas-error{position:absolute;inset:auto 10px 10px;padding:8px 10px;background:#fff3f0;color:#a23f33;border:1px solid #edc9c3;font-size:12px}
 .work-page-placeholder,.work-editor-loading{display:flex;align-items:center;justify-content:center;gap:9px;color:#74808d;font-size:13px}
 .work-page-placeholder{flex:1}

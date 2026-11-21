@@ -114,6 +114,14 @@ test('preserves padded text anchors while editing, aligning, dragging and reopen
   expect(bounds).not.toBeNull();
   const clickText = () => page.mouse.dblclick(bounds!.x + bounds!.width * 0.2, bounds!.y + bounds!.height * 0.25);
   const canvas = host.locator('canvas');
+  const selection = page.getByTestId('scene-selection');
+  const editor = page.getByLabel('文字内容');
+  const at = (x: number, y: number) => ({
+    x: bounds!.x + x * bounds!.width / 800,
+    y: bounds!.y + y * bounds!.height / 450,
+  });
+  const textPoint = at(160, 112.5);
+  const backgroundPoint = at(450, 190);
   const pixels = async () => {
     const image = await canvas.evaluate(element => (element as HTMLCanvasElement).toDataURL());
     return createHash('sha256').update(image).digest('hex');
@@ -121,11 +129,66 @@ test('preserves padded text anchors while editing, aligning, dragging and reopen
   await expect.poll(() => canvas.evaluate(element =>
     (element as HTMLCanvasElement).getContext('2d')!.getImageData(1, 1, 1, 1).data[3],
   )).toBe(255);
+  await page.mouse.move(bounds!.x + bounds!.width * 0.2, bounds!.y + bounds!.height * 0.25);
+  await expect(page.getByTestId('scene-hover')).toHaveCSS('border-top-style', 'dashed');
+  await expect(host).toHaveCSS('cursor', 'grab');
+  await page.mouse.move(bounds!.x + bounds!.width * 0.95, bounds!.y + bounds!.height * 0.95);
+  await expect(page.getByTestId('scene-hover')).toHaveCount(0);
   await page.mouse.click(bounds!.x + bounds!.width * 0.2, bounds!.y + bounds!.height * 0.25);
   await expect(page.getByTestId('scene-selection')).toBeVisible();
+  await expect(page.getByLabel('文字内容')).toBeHidden();
   const initial = await pixels();
+  const originalFrame = (await selection.boundingBox())!;
+  expect((originalFrame.x - bounds!.x) / (bounds!.width / 800)).toBeCloseTo(120, 0);
+  await page.mouse.click(backgroundPoint.x, backgroundPoint.y);
+  expect(await selection.boundingBox()).toEqual(originalFrame);
+  await page.mouse.click(textPoint.x, textPoint.y);
+  await expect(editor).toBeFocused();
+  const caret = await editor.evaluate((input: HTMLTextAreaElement) => input.selectionStart);
+  expect(caret).toBeGreaterThan(0);
+  expect(caret).toBeLessThan('纵横家思想'.length);
+  await page.keyboard.press('Escape');
+  await expect(host).toBeFocused();
+  await expect(selection).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(selection).toHaveCount(0);
+
+  await page.mouse.move(backgroundPoint.x, backgroundPoint.y);
+  await page.mouse.down();
+  await expect(host).toHaveAttribute('data-gesture', 'pressed');
+  await page.mouse.move(backgroundPoint.x + 3, backgroundPoint.y);
+  await page.mouse.up();
+  expect(await selection.boundingBox()).toEqual(originalFrame);
+  await expect(page.getByRole('button', { name: '保存' })).toBeDisabled();
+
+  await page.mouse.move(backgroundPoint.x, backgroundPoint.y);
+  await page.mouse.down();
+  await page.mouse.move(backgroundPoint.x + 20, backgroundPoint.y + 10);
+  await expect(host).toHaveAttribute('data-gesture', 'dragging');
+  await expect(host).toHaveCSS('cursor', 'grabbing');
+  expect((await selection.boundingBox())!.x).toBeCloseTo(originalFrame.x + 20, 0);
+  await expect(page.getByRole('button', { name: '保存' })).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  expect(await selection.boundingBox()).toEqual(originalFrame);
+  await expect.poll(pixels).toBe(initial);
+
+  await page.keyboard.press('Shift+ArrowRight');
+  expect((await selection.boundingBox())!.x).toBeCloseTo(originalFrame.x + 10 * bounds!.width / 800, 0);
+  await page.keyboard.press('Shift+ArrowLeft');
+  await page.keyboard.press('ArrowDown');
+  expect((await selection.boundingBox())!.y).toBeCloseTo(originalFrame.y + bounds!.height / 450, 0);
+  await page.keyboard.press('ArrowUp');
+  await expect(page.getByRole('button', { name: '保存' })).toBeDisabled();
+  await page.mouse.click(bounds!.x + bounds!.width * 0.95, bounds!.y + bounds!.height * 0.95);
+  await expect(page.getByTestId('scene-selection')).toHaveCount(0);
+  await page.mouse.click(bounds!.x + bounds!.width * 0.2, bounds!.y + bounds!.height * 0.25);
+  await expect(page.getByTestId('scene-selection')).toBeVisible();
+  await host.press('Enter');
+  await expect(page.getByLabel('文字内容')).toBeVisible();
+  await page.getByLabel('文字内容').press('Escape');
+  await expect(page.getByLabel('文字内容')).toBeHidden();
   await clickText();
-  const editor = page.getByLabel('文字内容');
   await expect(editor).toHaveValue('纵横家思想');
   const overlay = (await editor.boundingBox())!;
   expect((overlay.x - bounds!.x) / (bounds!.width / 800)).toBeCloseTo(136, 0);
@@ -133,6 +196,11 @@ test('preserves padded text anchors while editing, aligning, dragging and reopen
   await expect(editor).toBeHidden();
   await expect.poll(pixels).toBe(initial);
   await expect(page.getByRole('button', { name: '保存' })).toBeDisabled();
+  await clickText();
+  await expect(editor).toBeVisible();
+  await page.mouse.click(bounds!.x + bounds!.width * 0.95, bounds!.y + bounds!.height * 0.95);
+  await expect(editor).toBeHidden();
+  await expect(page.getByTestId('scene-selection')).toHaveCount(0);
   await clickText();
   const editedText = '纵横家思想体系及其在战国时期所面对的政治选择与历史影响';
   await editor.fill(editedText);

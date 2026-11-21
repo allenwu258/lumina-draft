@@ -1,12 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react';
 import { SceneRenderer, decodeAsset } from '@lumina/scene-renderer';
 import type { SceneIR, TextNode } from '@lumina/scene-core';
 import { fitCanvas } from '../scene/fitCanvas';
 import {
-  hitTest,
+  createHitTest,
+  hitsSelectionEdge,
   inputTop,
   inputTypography,
+  sameSelection,
+  selectionBounds,
+  textOffsetAtPoint,
   textLayout,
   translateScene,
   type SelectionTarget,
@@ -23,7 +31,7 @@ type Props = {
   onSelect: (target: SelectionTarget | null) => void;
   onEditStart: (nodeId: string) => void;
   onEditEnd: () => void;
-  onSceneChange: (scene: SceneIR) => void;
+  onMove: (rootId: string, dx: number, dy: number) => void;
   onTextChange: (nodeId: string, sourceText: string) => void;
 };
 
@@ -37,7 +45,7 @@ export function SceneCanvas({
   onSelect,
   onEditStart,
   onEditEnd,
-  onSceneChange,
+  onMove,
   onTextChange,
 }: Props) {
   const host = useRef<HTMLDivElement>(null);
@@ -45,10 +53,27 @@ export function SceneCanvas({
   const renderer = useRef<SceneRenderer | null>(null);
   const loadedPage = useRef<string | null>(null);
   const sceneRef = useRef(scene);
-  const drag = useRef<{ target: SelectionTarget; startX: number; startY: number; base: SceneIR; moved: boolean } | null>(null);
+  const press = useRef<{
+    pointerId: number;
+    target: SelectionTarget;
+    startClientX: number;
+    startClientY: number;
+    scale: number;
+    threshold: number;
+    moved: boolean;
+    editOnRelease: boolean;
+  } | null>(null);
+  const textInput = useRef<HTMLTextAreaElement>(null);
+  const caretOffset = useRef<number | null>(null);
   const [scale, setScale] = useState(1);
   const [error, setError] = useState('');
-  const [editingValue, setEditingValue] = useState('');
+  const [hovered, setHovered] = useState<SelectionTarget | null>(null);
+  const [pressed, setPressed] = useState(false);
+  const [preview, setPreview] = useState<{ rootId: string; dx: number; dy: number } | null>(null);
+  const hitTest = useMemo(() => createHitTest(scene), [scene]);
+  const renderedScene = useMemo(() => preview
+    ? translateScene(scene, preview.rootId, preview.dx, preview.dy)
+    : scene, [scene, preview]);
   const ratio = scene.page.width / scene.page.height;
   sceneRef.current = scene;
 
@@ -92,7 +117,7 @@ export function SceneCanvas({
     ).then(() => {
       if (renderer.current !== nextRenderer) return;
       loadedPage.current = pageId;
-      nextRenderer.setHiddenNodeIds(editingNodeId ? [editingNodeId] : []);
+      nextRenderer.updateScene(sceneRef.current);
       resize();
     }).catch((cause) => {
       if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
@@ -108,111 +133,252 @@ export function SceneCanvas({
     };
   }, [workId, pageId]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (loadedPage.current !== pageId || !renderer.current) return;
     try {
-      renderer.current.updateScene(scene);
+      renderer.current.updateScene(renderedScene);
       setError('');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
-  }, [pageId, scene]);
+  }, [pageId, renderedScene]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     renderer.current?.setHiddenNodeIds(editingNodeId ? [editingNodeId] : []);
-    if (editingNodeId) {
-      const node = scene.nodes.find((item): item is TextNode => item.id === editingNodeId && item.kind === 'text');
-      setEditingValue(node?.text.sourceText || '');
+    const input = textInput.current;
+    if (editingNodeId && input) {
+      input.focus({ preventScroll: true });
+      const offset = caretOffset.current ?? input.value.length;
+      input.setSelectionRange(offset, offset);
     }
+    caretOffset.current = null;
   }, [editingNodeId]);
 
+  const clearPress = useCallback(() => {
+    const active = press.current;
+    if (!active) return;
+    press.current = null;
+    const element = host.current;
+    if (element?.hasPointerCapture(active.pointerId)) element.releasePointerCapture(active.pointerId);
+    setPressed(false);
+    setPreview(null);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('blur', clearPress);
+    return () => window.removeEventListener('blur', clearPress);
+  }, [clearPress]);
+
   function point(event: ReactPointerEvent<HTMLDivElement>) {
-    const bounds = host.current!.getBoundingClientRect();
+    const bounds = canvas.current!.getBoundingClientRect();
     return { x: (event.clientX - bounds.left) / scale, y: (event.clientY - bounds.top) / scale };
   }
 
+  function targetAt(position: { x: number; y: number }) {
+    const { x, y } = position;
+    const target = hitTest(x, y, scale);
+    if (!editingNodeId && selected && selectionFrame &&
+      (!target || sameSelection(target, selected)) && hitsSelectionEdge(selectionFrame, x, y, 4 / scale)) {
+      return { target: selected, onEdge: true };
+    }
+    return { target, onEdge: false };
+  }
+
+  function updateHovered(target: SelectionTarget | null) {
+    setHovered((current) => current?.nodeId === target?.nodeId &&
+      current?.selectionRootId === target?.selectionRootId ? current : target);
+  }
+
   function pointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (editingNodeId) return;
-    const position = point(event);
-    const target = hitTest(sceneRef.current, position.x, position.y);
+    if (event.button !== 0 || !event.isPrimary || press.current || loadedPage.current !== pageId) return;
+    const { target, onEdge } = targetAt(point(event));
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    if (editingNodeId) onEditEnd();
+    updateHovered(event.pointerType === 'touch' ? null : target);
     onSelect(target);
     if (!target || target.locked) return;
-    drag.current = { target, startX: position.x, startY: position.y, base: sceneRef.current, moved: false };
+    press.current = {
+      pointerId: event.pointerId,
+      target,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      scale,
+      threshold: event.pointerType === 'touch' ? 8 : 5,
+      moved: false,
+      editOnRelease: !onEdge && !editingNodeId && target.textNodeId === target.nodeId &&
+        sameSelection(target, selected),
+    };
+    setPressed(true);
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function pointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!drag.current) return;
-    const position = point(event);
-    const dx = position.x - drag.current.startX;
-    const dy = position.y - drag.current.startY;
-    if (!drag.current.moved && Math.hypot(dx, dy) * scale < 3) return;
-    drag.current.moved = true;
-    onSceneChange(translateScene(drag.current.base, drag.current.target.moveRootId, dx, dy));
+    if (!press.current) {
+      if (event.pointerType !== 'touch' && !editingNodeId && loadedPage.current === pageId) {
+        updateHovered(targetAt(point(event)).target);
+      }
+      return;
+    }
+    const active = press.current;
+    if (active.pointerId !== event.pointerId) return;
+    const dx = event.clientX - active.startClientX;
+    const dy = event.clientY - active.startClientY;
+    if (!active.moved && Math.hypot(dx, dy) < active.threshold) return;
+    active.moved = true;
+    setPreview({ rootId: active.target.selectionRootId, dx: dx / active.scale, dy: dy / active.scale });
   }
 
   function pointerUp(event: ReactPointerEvent<HTMLDivElement>) {
-    if (drag.current && event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    drag.current = null;
-  }
-
-  function doubleClick(event: ReactPointerEvent<HTMLDivElement>) {
+    const active = press.current;
+    if (active?.pointerId !== event.pointerId) return;
+    clearPress();
+    const dx = event.clientX - active.startClientX;
+    const dy = event.clientY - active.startClientY;
     const position = point(event);
-    const target = hitTest(sceneRef.current, position.x, position.y);
-    if (target?.textNodeId && !target.locked) {
-      onSelect(target);
-      onEditStart(target.textNodeId);
+    if (active.moved || Math.hypot(dx, dy) >= active.threshold) {
+      if (dx || dy) onMove(active.target.selectionRootId, dx / active.scale, dy / active.scale);
+      const withinPage = position.x >= 0 && position.y >= 0 &&
+        position.x <= scene.page.width && position.y <= scene.page.height;
+      updateHovered(withinPage && event.pointerType !== 'touch' ? active.target : null);
+    } else if (active.editOnRelease && active.target.textNodeId &&
+      hitTest(position.x, position.y, scale)?.nodeId === active.target.nodeId) {
+      const node = scene.nodes.find((item): item is TextNode => item.id === active.target.textNodeId && item.kind === 'text');
+      caretOffset.current = node ? textOffsetAtPoint(node, position.x, position.y) : null;
+      onEditStart(active.target.textNodeId);
     }
   }
 
-  const selectionFrame = scene.nodes.find((item) => item.id === selected?.nodeId)?.frame;
+  function pointerCancel(event: ReactPointerEvent<HTMLDivElement>) {
+    if (press.current?.pointerId !== event.pointerId) return;
+    clearPress();
+    setHovered(null);
+  }
+
+  function pointerLeave() {
+    if (!press.current) setHovered(null);
+  }
+
+  function keyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (editingNodeId || event.target !== event.currentTarget) return;
+    if (event.key === 'Escape') {
+      if (press.current) {
+        event.preventDefault();
+        clearPress();
+        return;
+      }
+      if (selected) {
+        event.preventDefault();
+        onSelect(null);
+        setHovered(null);
+      }
+      return;
+    }
+    if (!selected || selected.locked || press.current || event.ctrlKey || event.metaKey || event.altKey) return;
+    if ((event.key === 'Enter' || event.key === 'F2') && selected.textNodeId) {
+      event.preventDefault();
+      onEditStart(selected.textNodeId);
+      return;
+    }
+    const distance = event.shiftKey ? 10 : 1;
+    const delta = event.key === 'ArrowLeft'
+      ? { x: -distance, y: 0 }
+      : event.key === 'ArrowRight'
+        ? { x: distance, y: 0 }
+        : event.key === 'ArrowUp'
+          ? { x: 0, y: -distance }
+          : event.key === 'ArrowDown'
+            ? { x: 0, y: distance }
+            : null;
+    if (!delta) return;
+    event.preventDefault();
+    onMove(selected.selectionRootId, delta.x, delta.y);
+  }
+
   const editingNode = editingNodeId
     ? scene.nodes.find((item): item is TextNode => item.id === editingNodeId && item.kind === 'text')
     : null;
   const layout = editingNode && textLayout(scene, editingNode, editor);
   const style = editingNode?.text.paragraphs[0]?.runs[0]?.style;
   const editingTop = layout && style ? inputTop(style, layout) : 0;
+  const selectionFrame = selected ? selectionBounds(scene, selected, editor) : null;
+  const hoverFrame = hovered && !pressed && !editingNode && !sameSelection(hovered, selected)
+    ? selectionBounds(scene, hovered, editor)
+    : null;
+  const cursor = editingNode
+    ? 'default'
+    : pressed
+      ? 'grabbing'
+      : hovered?.locked
+        ? 'not-allowed'
+        : hovered
+          ? 'grab'
+          : 'default';
 
   return (
-    <div className="work-canvas-stage">
+    <div className="work-canvas-stage" onPointerDown={(event) => {
+      if (event.target !== event.currentTarget || event.button !== 0 || !event.isPrimary) return;
+      if (editingNodeId) onEditEnd();
+      onSelect(null);
+      setHovered(null);
+      host.current?.focus({ preventScroll: true });
+    }}>
       <div
         className="work-canvas-host"
         ref={host}
-        style={{ '--page-ratio': ratio } as CSSProperties}
+        tabIndex={0}
+        aria-label="作品编辑画布"
+        role="group"
+        data-gesture={preview ? 'dragging' : pressed ? 'pressed' : undefined}
+        style={{ '--page-ratio': ratio, cursor } as CSSProperties}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
-        onPointerCancel={pointerUp}
-        onDoubleClick={doubleClick}
+        onPointerCancel={pointerCancel}
+        onLostPointerCapture={pointerCancel}
+        onPointerLeave={pointerLeave}
+        onKeyDown={keyDown}
       >
         <canvas ref={canvas} aria-label="作品页面预览" />
+        {hoverFrame && (
+          <div
+            className={`scene-hover ${hovered?.locked ? 'locked' : ''}`}
+            data-testid="scene-hover"
+            style={{ left: hoverFrame.x * scale, top: hoverFrame.y * scale, width: hoverFrame.width * scale, height: hoverFrame.height * scale }}
+          />
+        )}
         {selectionFrame && !editingNode && (
           <div
             className={`scene-selection ${selected?.locked ? 'locked' : ''}`}
             data-testid="scene-selection"
-            style={{ left: selectionFrame.x * scale, top: selectionFrame.y * scale, width: selectionFrame.width * scale, height: selectionFrame.height * scale }}
-          />
+            style={{
+              left: (selectionFrame.x + (preview?.dx ?? 0)) * scale,
+              top: (selectionFrame.y + (preview?.dy ?? 0)) * scale,
+              width: selectionFrame.width * scale,
+              height: selectionFrame.height * scale,
+            }}
+          >
+            {selected?.locked && <span className="scene-lock-label" aria-hidden="true">合成内容 · 无法编辑</span>}
+          </div>
         )}
+        <span className="scene-selection-status" role="status">
+          {editingNode ? '正在编辑文本' : selected?.locked ? '已选中合成内容，无法编辑' :
+            selected?.textNodeId ? '已选中文本框，按 Enter 编辑' : selected ? '已选中元素' : ''}
+        </span>
         {editingNode && layout && style && (
           <textarea
+            ref={textInput}
             className="scene-text-editor"
             aria-label="文字内容"
-            value={editingValue}
-            autoFocus
-            onChange={(event) => {
-              setEditingValue(event.target.value);
-              onTextChange(editingNode.id, event.target.value);
-            }}
+            value={editingNode.text.sourceText}
+            onChange={(event) => onTextChange(editingNode.id, event.target.value)}
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing) return;
-              if (event.key === 'Escape') {
+              if (event.key === 'Escape' || (event.key === 'Enter' && (event.ctrlKey || event.metaKey))) {
                 event.preventDefault();
+                event.stopPropagation();
                 onEditEnd();
-              }
-              if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-                event.preventDefault();
-                onEditEnd();
+                host.current?.focus({ preventScroll: true });
               }
             }}
             onPointerDown={(event) => event.stopPropagation()}

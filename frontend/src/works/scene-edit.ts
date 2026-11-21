@@ -1,5 +1,6 @@
 import type {
   Rect,
+  GroupNode,
   SceneIR,
   TextNode,
   TextStyle,
@@ -15,8 +16,8 @@ export type WorkEditorState = {
 };
 export type SelectionTarget = {
   nodeId: string;
+  selectionRootId: string;
   textNodeId: string | null;
-  moveRootId: string;
   locked: boolean;
 };
 
@@ -42,11 +43,11 @@ function rootId(scene: SceneIR): string | null {
 
 function drawEntries(scene: SceneIR) {
   const stack: string[] = [];
-  const entries: { nodeId: string; parentId: string | null; order: number }[] = [];
-  for (const [order, op] of scene.paintOps.entries()) {
+  const entries: { nodeId: string; ancestors: string[] }[] = [];
+  for (const op of scene.paintOps) {
     if (op.op === 'begin') stack.push(op.nodeId);
     else if (op.op === 'end') stack.pop();
-    else entries.push({ nodeId: op.nodeId, parentId: stack.at(-1) || null, order });
+    else entries.push({ nodeId: op.nodeId, ancestors: [...stack] });
   }
   return entries;
 }
@@ -56,37 +57,78 @@ function contains(frame: Rect, x: number, y: number, padding = 0) {
     x <= frame.x + frame.width + padding && y <= frame.y + frame.height + padding;
 }
 
-function textContains(node: TextNode, x: number, y: number) {
+function textContains(node: TextNode, x: number, y: number, padding: number) {
   return node.text.lines.some((line) =>
-    line.fragments.some((fragment) => contains(fragment.frame, x, y, 3)),
-  ) || contains(node.frame, x, y, 3);
+    line.fragments.some((fragment) => contains(fragment.frame, x, y, padding)),
+  ) || contains(node.frame, x, y, padding);
 }
 
-export function hitTest(scene: SceneIR, x: number, y: number): SelectionTarget | null {
+export function createHitTest(scene: SceneIR) {
   const nodes = nodeMap(scene);
   const root = rootId(scene);
-  for (const entry of drawEntries(scene).reverse()) {
-    const node = nodes.get(entry.nodeId);
-    if (!node) continue;
-    const hit = node.kind === 'text'
-      ? textContains(node, x, y)
-      : contains(node.frame, x, y, node.kind === 'image' ? 0 : 2);
-    if (!hit) continue;
-    const textNodeId = node.kind === 'text' ? node.id : null;
-    const owner = node.kind === 'text' ? nodes.get(node.text.ownerId) : null;
-    let moveRootId = node.id;
-    if (owner?.kind === 'group' && owner.id !== root) {
-      const children = descendants(scene, owner.id);
-      if (children.has(node.id) && !scene.nodes.some(
-        item => item.kind === 'text' && item.id !== node.id && children.has(item.id),
-      )) moveRootId = owner.id;
+  const entries = drawEntries(scene);
+  const groupContents = new Map<string, string[]>();
+  for (const { nodeId, ancestors } of entries) {
+    const kind = nodes.get(nodeId)?.kind;
+    if (kind !== 'text' && kind !== 'image') continue;
+    for (const id of ancestors) {
+      const contents = groupContents.get(id);
+      if (contents) contents.push(nodeId);
+      else groupContents.set(id, [nodeId]);
     }
-    const locked = node.kind === 'image' && scene.assets
-      .find((asset) => asset.id === node.assetId)
-      ?.bakedEffects.includes('full-page-composite') === true;
-    return { nodeId: node.id, textNodeId, moveRootId, locked };
   }
-  return null;
+  const lockedAssets = new Set(scene.assets.filter(
+    (asset) => asset.bakedEffects.includes('full-page-composite'),
+  ).map((asset) => asset.id));
+  const targets = entries.reverse().flatMap(({ nodeId, ancestors }) => {
+    const node = nodes.get(nodeId);
+    if (!node || node.kind === 'group' || node.kind === 'table') return [];
+    const groups = ancestors.map((id) => nodes.get(id)).filter(
+      (item): item is GroupNode => item?.kind === 'group' || item?.kind === 'table',
+    );
+    if (groups.some((group) => group.opacity === 0)) return [];
+    const parentId = ancestors.at(-1);
+    const owner = nodes.get(node.kind === 'text' ? node.text.ownerId : parentId || '');
+    const contents = owner && groupContents.get(owner.id);
+    const textId = contents?.length === 1 ? contents[0] : undefined;
+    const grouped = owner?.kind === 'group' && owner.id !== root &&
+      ancestors.includes(owner.id) && textId !== undefined && nodes.get(textId)?.kind === 'text' &&
+      (node.kind === 'text' || (node.kind === 'shape' && owner.sourcePath === node.sourcePath));
+    const target: SelectionTarget = {
+      nodeId,
+      selectionRootId: grouped ? owner.id : nodeId,
+      textNodeId: grouped ? textId : node.kind === 'text' ? nodeId : null,
+      locked: node.kind === 'image' && lockedAssets.has(node.assetId),
+    };
+    return [{ node, target, groups }];
+  });
+
+  return (x: number, y: number, scale: number): SelectionTarget | null => {
+    if (x < 0 || y < 0 || x > scene.page.width || y > scene.page.height) return null;
+    for (const { node, target, groups } of targets) {
+      const hit = node.kind === 'text'
+        ? textContains(node, x, y, 3 / scale)
+        : contains(node.frame, x, y, node.kind === 'image' ? 0 : 2 / scale);
+      if (hit && groups.every((group) => !group.clip || contains(group.clip.frame, x, y))) return target;
+    }
+    return null;
+  };
+}
+
+export function sameSelection(left: SelectionTarget | null, right: SelectionTarget | null) {
+  return !!left && !!right && left.selectionRootId === right.selectionRootId;
+}
+
+export function hitsSelectionEdge(frame: Rect, x: number, y: number, tolerance: number) {
+  return contains(frame, x, y, tolerance) && !contains(frame, x, y, -tolerance);
+}
+
+export function selectionBounds(scene: SceneIR, target: SelectionTarget, editor: WorkEditorState): Rect | null {
+  const node = scene.nodes.find((item) => item.id === target.selectionRootId) ||
+    scene.nodes.find((item) => item.id === target.nodeId);
+  if (!node) return null;
+  if (node.kind === 'text') return textLayout(scene, node, editor).box;
+  return node.frame;
 }
 
 function descendants(scene: SceneIR, root: string) {
@@ -114,29 +156,33 @@ function moveRect(rect: Rect, dx: number, dy: number): Rect {
 }
 
 export function translateScene(scene: SceneIR, root: string, dx: number, dy: number): SceneIR {
-  const result = clone(scene);
-  const ids = descendants(result, root);
-  for (const node of result.nodes) {
-    if (!ids.has(node.id)) continue;
-    node.frame = moveRect(node.frame, dx, dy);
+  if (!dx && !dy) return scene;
+  const ids = descendants(scene, root);
+  const nodes = scene.nodes.map((node) => {
+    if (!ids.has(node.id)) return node;
+    const frame = moveRect(node.frame, dx, dy);
     if (node.kind === 'group' || node.kind === 'table') {
-      if (node.clip) node.clip = { ...node.clip, frame: moveRect(node.clip.frame, dx, dy) };
-      node.cells = node.cells?.map((cell) => ({ ...cell, frame: moveRect(cell.frame, dx, dy) }));
+      return {
+        ...node,
+        frame,
+        clip: node.clip && { ...node.clip, frame: moveRect(node.clip.frame, dx, dy) },
+        ...(node.cells && { cells: node.cells.map((cell) => ({ ...cell, frame: moveRect(cell.frame, dx, dy) })) }),
+      };
     }
-    if (node.kind === 'text') {
-      node.text.lines = node.text.lines.map((line) => ({
-        ...line,
-        frame: moveRect(line.frame, dx, dy),
-        baseline: line.baseline + dy,
-        fragments: line.fragments.map((fragment) => ({
-          ...fragment,
-          frame: moveRect(fragment.frame, dx, dy),
-          baseline: fragment.baseline + dy,
-        })),
-      }));
-    }
-  }
-  return result;
+    if (node.kind !== 'text') return { ...node, frame };
+    const lines = node.text.lines.map((line) => ({
+      ...line,
+      frame: moveRect(line.frame, dx, dy),
+      baseline: line.baseline + dy,
+      fragments: line.fragments.map((fragment) => ({
+        ...fragment,
+        frame: moveRect(fragment.frame, dx, dy),
+        baseline: fragment.baseline + dy,
+      })),
+    }));
+    return { ...node, frame, text: { ...node.text, lines } };
+  });
+  return { ...scene, nodes };
 }
 
 function fontString(style: TextStyle) {
@@ -148,6 +194,42 @@ function firstStyle(node: TextNode): TextStyle {
     fontFamily: 'Arial', fontSize: 24, fontWeight: '400', fontStyle: 'normal',
     color: '#000000', letterSpacing: 0, decoration: 'none',
   };
+}
+
+export function textOffsetAtPoint(node: TextNode, x: number, y: number): number {
+  const distance = (position: number, start: number, size: number) =>
+    Math.max(start - position, position - start - size, 0);
+  let nearest: TextNode['text']['lines'][number]['fragments'][number] | undefined;
+  let smallestY = Infinity;
+  let smallestX = Infinity;
+  for (const line of node.text.lines) {
+    const dy = distance(y, line.frame.y, line.frame.height);
+    if (dy > smallestY) continue;
+    for (const fragment of line.fragments) {
+      const dx = distance(x, fragment.frame.x, fragment.frame.width);
+      if (dy === smallestY && dx >= smallestX) continue;
+      nearest = fragment;
+      smallestX = dx;
+      smallestY = dy;
+    }
+  }
+  if (!nearest) return node.text.sourceText.length;
+  if (x <= nearest.frame.x) return nearest.sourceStart;
+  if (x >= nearest.frame.x + nearest.frame.width) return nearest.sourceEnd;
+  const style = firstStyle(node);
+  const measure = document.createElement('canvas').getContext('2d')!;
+  measure.font = fontString(style);
+  measure.letterSpacing = `${style.letterSpacing}px`;
+  const text = node.text.sourceText.slice(nearest.sourceStart, nearest.sourceEnd);
+  const position = (x - nearest.frame.x) / nearest.frame.width * measure.measureText(text).width;
+  const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  let previousWidth = 0;
+  for (const { index, segment } of segments.segment(text)) {
+    const width = measure.measureText(text.slice(0, index + segment.length)).width;
+    if (position < (previousWidth + width) / 2) return nearest.sourceStart + index;
+    previousWidth = width;
+  }
+  return nearest.sourceEnd;
 }
 
 export function textLayout(scene: SceneIR, node: TextNode, editor: WorkEditorState): WorkTextLayout {
