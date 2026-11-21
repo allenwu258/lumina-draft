@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from . import export_service, runtime, works_service
-from .db import PptxExport, Work, WorkPage, dumps, session_scope
+from .db import PptxExport, Work, WorkPage, dumps, loads, session_scope
 from .export_service import ExportError
 from .scene_service import WAKE, digest
 
@@ -32,6 +32,13 @@ class WorkExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=1)
     retry: bool = False
+
+
+class SaveWorkPageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_revision: int = Field(ge=1)
+    scene: dict
+    editor: dict = Field(default_factory=lambda: {"version": 1, "text": {}})
 
 
 def raise_work_error(error: ExportError):
@@ -109,7 +116,12 @@ def get_work(work_id: str):
         )
         return {
             **works_service.work_summary(work, pages),
-            "latest_export": export_service.export_dict(latest) if latest else None,
+            "latest_export": (
+                export_service.export_dict(latest)
+                if latest and loads(latest.input_manifest_json).get("work_layout_version")
+                == export_service.WORK_LAYOUT_VERSION
+                else None
+            ),
         }
 
 
@@ -130,31 +142,43 @@ def get_work_page(work_id: str, page_id: str, request: Request):
         )
         if not page:
             raise HTTPException(404, detail={"code": "PAGE_NOT_FOUND", "message": "页面不存在"})
-        etag = '"' + page.scene_hash + '"'
+        try:
+            scene, _, scene_hash, editor = works_service.work_page_snapshot(page)
+        except ExportError as exc:
+            raise_work_error(exc)
+        etag = '"' + digest(scene_hash + page.editor_json) + '"'
         headers = {
             "ETag": etag,
-            "Cache-Control": "private, max-age=31536000, immutable",
+            "Cache-Control": "private, no-cache",
             "X-Content-Type-Options": "nosniff",
         }
         if request.headers.get("if-none-match") == etag:
             return Response(status_code=304, headers=headers)
-        try:
-            scene = works_service.stored_scene(page.scene_json, page.scene_hash)
-        except ExportError as exc:
-            raise_work_error(exc)
         return Response(
             content=dumps(
                 {
                     "id": page.id,
                     "position": page.position,
                     "title": page.title,
-                    "scene_hash": page.scene_hash,
+                    "scene_hash": scene_hash,
                     "scene": scene,
+                    "editor": editor,
                 }
             ),
             media_type="application/json",
             headers=headers,
         )
+
+
+@router.put("/works/{work_id}/pages/{page_id}")
+def save_work_page(work_id: str, page_id: str, body: SaveWorkPageRequest):
+    with session_scope() as db:
+        try:
+            return works_service.save_page_tx(
+                db, work_id, page_id, body.scene, body.editor, body.base_revision
+            )
+        except ExportError as exc:
+            raise_work_error(exc)
 
 
 @router.get("/works/{work_id}/pages/{page_id}/assets/{asset_id}")

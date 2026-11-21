@@ -345,6 +345,7 @@ class WorkPage(Base):
     title: Mapped[str] = mapped_column(String(200))
     scene_hash: Mapped[str] = mapped_column(String(64))
     scene_json: Mapped[str] = mapped_column(Text)
+    editor_json: Mapped[str] = mapped_column(Text, default='{"version":1,"text":{}}')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (UniqueConstraint("work_id", "position", name="uq_work_page_position"),)
 
@@ -723,6 +724,9 @@ def _upgrade_existing_schema() -> bool:
             "conversation_id": "VARCHAR(36) NULL",
             "entry_mode": "VARCHAR(20) NOT NULL DEFAULT 'ppt'",
             "workflow_code": "VARCHAR(40) NOT NULL DEFAULT 'ppt_create'",
+        },
+        "work_pages": {
+            "editor_json": "TEXT NOT NULL DEFAULT '{\"version\":1,\"text\":{}}'",
         },
         "llm_calls": {
             "turn_id": "VARCHAR(36)",

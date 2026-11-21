@@ -210,6 +210,7 @@ function draw(
 export class SceneRenderer {
   private scene?: SceneIR;
   private images = new Map<string, DrawableAsset>();
+  private hidden = new Set<string>();
   private generation = 0;
   private disposed = false;
   private width = 800;
@@ -325,6 +326,16 @@ export class SceneRenderer {
       true,
     );
   }
+  updateScene(scene: SceneIR) {
+    assertScene(scene);
+    if (this.disposed) return;
+    this.scene = scene;
+    this.render();
+  }
+  setHiddenNodeIds(nodeIds: string[]) {
+    this.hidden = new Set(nodeIds);
+    this.render();
+  }
   /** Transparent Scene-only composition. Ancestor clip/opacity is applied exactly once. */
   renderRegion(
     bounds: Rect,
@@ -363,6 +374,7 @@ export class SceneRenderer {
     const scene = this.scene,
       nodes = new Map(scene.nodes.map((n) => [n.id, n]));
     const main = target.getContext("2d")!;
+    main.save();
     main.resetTransform();
     main.clearRect(0, 0, target.width, target.height);
     main.setTransform(scale, 0, 0, scale, -bounds.x * scale, -bounds.y * scale);
@@ -418,9 +430,10 @@ export class SceneRenderer {
         }
         ctx = entry.parent;
         ctx.restore();
-      } else if (!selected || selected.has(n.id))
+      } else if (!this.hidden.has(n.id) && (!selected || selected.has(n.id)))
         draw(ctx, n, this.images, shadowOnly, fragments);
     }
+    main.restore();
   }
   dispose() {
     this.disposed = true;

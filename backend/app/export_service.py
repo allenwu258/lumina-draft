@@ -258,7 +258,12 @@ def create_tx(db, presentation_id, expected_hash, retry=False, batch_id=None):
     return record
 
 
+WORK_LAYOUT_VERSION = 2
+
+
 def create_work_tx(db, work_id: str, expected_revision: int, retry=False):
+    from .works_service import work_page_snapshot
+
     work = db.get(Work, work_id)
     if not work:
         raise ExportError("NOT_FOUND", "作品不存在")
@@ -271,16 +276,17 @@ def create_work_tx(db, work_id: str, expected_revision: int, retry=False):
     ).all()
     if not 1 <= len(pages) <= 20:
         raise ExportError("INVALID_EXPORT_PAGES", "PPT 页面数量必须为 1 到 20 页")
-    page_manifest = [
-        {
+    page_manifest = []
+    for page in pages:
+        _, scene_json, scene_hash, editor = work_page_snapshot(page)
+        page_manifest.append({
             "page_number": page.position,
             "work_page_id": page.id,
-            "scene_hash": page.scene_hash,
-            "scene": {"scene_hash": page.scene_hash},
-            "scene_json": page.scene_json,
-        }
-        for page in pages
-    ]
+            "scene_hash": scene_hash,
+            "editor": editor,
+            "scene": {"scene_hash": scene_hash},
+            "scene_json": scene_json,
+        })
     source = digest(
         canonical(
             {
@@ -288,14 +294,19 @@ def create_work_tx(db, work_id: str, expected_revision: int, retry=False):
                 "revision": work.revision,
                 "name": work.name,
                 "pages": [
-                    {"position": page.position, "id": page.id, "scene_hash": page.scene_hash}
-                    for page in pages
+                    {
+                        "position": page["page_number"],
+                        "id": page["work_page_id"],
+                        "scene_hash": page["scene_hash"],
+                        "editor": page["editor"],
+                    }
+                    for page in page_manifest
                 ],
             }
         )
     )
     request_hash = digest(
-        canonical(["work", work.id, work.revision, source, EXPORT_VERSION, SCENE_TARGET])
+        canonical(["work", work.id, work.revision, source, EXPORT_VERSION, WORK_LAYOUT_VERSION, SCENE_TARGET])
     )
     record = db.scalar(
         select(PptxExport).where(
@@ -316,6 +327,7 @@ def create_work_tx(db, work_id: str, expected_revision: int, retry=False):
         "target": SCENE_TARGET,
         "title": work.name,
         "work_revision": work.revision,
+        "work_layout_version": WORK_LAYOUT_VERSION,
         "pages": page_manifest,
     }
     record = PptxExport(
@@ -451,7 +463,12 @@ def stage_input(record, work: Path) -> dict:
                     for asset in scene["assets"]
                 }
                 pages.append(
-                    {"scene": scene, "assets": assets, "sceneId": item["work_page_id"]}
+                    {
+                        "scene": scene,
+                        "editor": item.get("editor", {"version": 1, "text": {}}),
+                        "assets": assets,
+                        "sceneId": item["work_page_id"],
+                    }
                 )
             except Exception as exc:
                 raise ExportError(

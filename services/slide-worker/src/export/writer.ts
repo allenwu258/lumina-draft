@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { writeFile, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import type { Browser, Page } from "playwright-core";
-import { textTarget, type SceneIR, type Rect } from "@lumina/scene-core";
+import { textTarget, type SceneIR, type Rect, type TextAlign, type WorkTextLayout } from "@lumina/scene-core";
 import {
   planPptxPage,
   inch,
@@ -21,7 +21,12 @@ export type ExportInput = {
   warnings?: string[];
   title: string;
   inputHash: string;
-  pages: { scene: SceneIR; assets: Record<string, string>; sceneId: string }[];
+  pages: {
+    scene: SceneIR;
+    editor?: { text?: Record<string, Partial<WorkTextLayout>> };
+    assets: Record<string, string>;
+    sceneId: string;
+  }[];
 };
 const geometry = (r: Rect) => ({
   x: inch(r.x),
@@ -36,6 +41,8 @@ function mergeableTextGroup(
   start: number,
   nodeHasOneParagraph: boolean,
   nodeHasRasterText: boolean,
+  alignment: TextAlign,
+  wholeBox: boolean,
 ): NativeTextElement[] | undefined {
   const first = elements[start];
   if (first?.kind !== "text" || !nodeHasOneParagraph || nodeHasRasterText)
@@ -54,7 +61,7 @@ function mergeableTextGroup(
     lines.set(element.lineIndex, line);
   }
   const lineIndices = [...lines.keys()];
-  if (lineIndices.length < 2) return;
+  if (lineIndices.length < 2 && (!wholeBox || group.length < 2)) return;
 
   const firstFont = group[0];
   const firstAscent =
@@ -75,14 +82,16 @@ function mergeableTextGroup(
 
   const lineGroups = lineIndices.map((index) => lines.get(index)!);
   const startX = lineGroups[0][0].frame.x;
-  const baselineStep = lineGroups[1][0].baseline - lineGroups[0][0].baseline;
-  if (baselineStep <= 0) return;
+  const baselineStep = lineGroups.length > 1
+    ? lineGroups[1][0].baseline - lineGroups[0][0].baseline
+    : 0;
+  if (lineGroups.length > 1 && baselineStep <= 0) return;
 
   for (let lineIndex = 0; lineIndex < lineGroups.length; lineIndex++) {
     const line = lineGroups[lineIndex];
     if (
       lineIndices[lineIndex] !== lineIndices[0] + lineIndex ||
-      Math.abs(line[0].frame.x - startX) > 0.75 ||
+      (alignment === "left" && Math.abs(line[0].frame.x - startX) > 0.75) ||
       Math.abs(
         line[0].baseline - lineGroups[0][0].baseline - baselineStep * lineIndex,
       ) > 0.75
@@ -318,8 +327,11 @@ async function writePptxWithPage(
             uses: 1,
           });
       };
-      const writeNativeText = (elements: NativeTextElement[]) => {
+      const writeNativeText = (elements: NativeTextElement[], wholeBox: boolean) => {
         const first = elements[0];
+        const node = textNodes.get(first.nodeId);
+        const layout = wholeBox ? page.editor?.text?.[first.nodeId] : undefined;
+        const alignment = layout?.align || "left";
         const lines = [...new Set(elements.map((element) => element.lineIndex))];
         const merged = lines.length > 1;
         const boxes = elements.map((element) => {
@@ -336,16 +348,15 @@ async function writePptxWithPage(
             ),
           };
         });
-        const frame = merged
-          ? {
-              x: boxes[0].x,
-              y: boxes[0].y,
-              width:
-                Math.max(...boxes.map((box) => box.x + box.width)) - boxes[0].x,
-              height:
-                Math.max(...boxes.map((box) => box.y + box.height)) - boxes[0].y,
-            }
-          : boxes[0];
+        const left = Math.min(...boxes.map((box) => box.x));
+        const right = Math.max(...boxes.map((box) => box.x + box.width));
+        const legacyWidth = right - left - 0.5;
+        const frame = {
+          x: layout?.box?.x ?? left,
+          y: boxes[0].y,
+          width: layout?.box?.width ?? (alignment === "left" ? right - left : legacyWidth),
+          height: Math.max(...boxes.map((box) => box.y + box.height)) - boxes[0].y,
+        };
         const lineStep = merged
           ? elements.find((element) => element.lineIndex !== first.lineIndex)!
               .baseline - first.baseline
@@ -356,7 +367,7 @@ async function writePptxWithPage(
           margin: 0,
           fit: "none" as const,
           wrap: false,
-          align: "left" as const,
+          align: alignment,
           valign: "top" as const,
           paraSpaceAfter: 0,
           paraSpaceBefore: 0,
@@ -365,7 +376,7 @@ async function writePptxWithPage(
             : { lineSpacing: point(lineStep) }),
           objectName: `text:${first.nodeId}`,
         };
-        if (merged) {
+        if (elements.length > 1) {
           let previousLine = first.lineIndex;
           slide.addText(
             elements.map((element) => {
@@ -440,14 +451,20 @@ async function writePptxWithPage(
         }
         if (e.kind === "text") {
           const node = textNodes.get(e.nodeId);
+          const layout = page.editor?.text?.[e.nodeId];
           const group = mergeableTextGroup(
             plan.elements,
             elementIndex,
             node?.text.paragraphs.length === 1,
             nodesWithRasterText.has(e.nodeId),
+            layout?.align || "left",
+            !!layout?.box,
           );
           const textGroup = group || [e];
-          writeNativeText(textGroup);
+          const nativeWidth = textGroup.reduce((amount, run) => amount + run.text.length, 0);
+          const sourceWidth = node?.text.lines.reduce((amount, line) => amount +
+            line.fragments.reduce((sum, fragment) => sum + fragment.displayText.length, 0), 0);
+          writeNativeText(textGroup, nativeWidth === sourceWidth && !nodesWithRasterText.has(e.nodeId));
           elementIndex += textGroup.length - 1;
           continue;
         }

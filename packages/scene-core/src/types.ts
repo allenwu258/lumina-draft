@@ -1,5 +1,12 @@
 /** Scene coordinates are CSS px. This contract contains everything needed to draw a page. */
 export type Rect = { x: number; y: number; width: number; height: number };
+export type TextAlign = "left" | "center" | "right";
+export type WorkTextLayout = {
+  align: TextAlign;
+  box: Rect;
+  baseline: number;
+  lineHeight: number;
+};
 export type Clip = { frame: Rect; radii: number[] };
 export type Border = { width: number; color: string; style: string };
 export type TextStyle = {

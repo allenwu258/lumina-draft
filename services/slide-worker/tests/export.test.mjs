@@ -26,11 +26,31 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
     );
     const output = join(temp, "out");
     await mkdir(output);
+    const edited = structuredClone(scene);
+    const paragraph = scene.nodes.find(
+      (node) => node.kind === "text" && node.text.sourceText.includes("第一行正文"),
+    );
+    const editedParagraph = edited.nodes.find((node) => node.id === paragraph.id);
+    const contentBox = { x: 53, y: 120, width: 140, height: 90 };
+    for (const line of editedParagraph.text.lines) {
+      const shift = contentBox.x + contentBox.width - line.frame.width - line.frame.x;
+      line.frame.x += shift;
+      for (const fragment of line.fragments) fragment.frame.x += shift;
+    }
     const report = await writePptx(
       {
         title: "中文测试",
         inputHash: "a".repeat(64),
-        pages: [{ scene, sceneId: "native", assets: {} }],
+        pages: [
+          { scene, sceneId: "native", assets: {} },
+          {
+            scene: edited, sceneId: "edited", assets: {},
+            editor: { text: { [paragraph.id]: {
+              align: "right", box: contentBox,
+              baseline: editedParagraph.text.lines[0].baseline, lineHeight: 24,
+            } } },
+          },
+        ],
       },
       output,
       resolve,
@@ -39,11 +59,6 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
     assert.equal(report.pages[0].rasterRegions, 0);
     assert.equal(report.pages[0].fontMapVersion, "font-map-win32-v2");
     assert.ok(report.pages[0].nativeTextCharacterCount > 0);
-    const paragraph = scene.nodes.find(
-      (node) =>
-        node.kind === "text" &&
-        node.text.sourceText.includes("第一行正文"),
-    );
     const textBoxes = report.pages[0].nativeTextBoxes.filter(
       (box) => box.nodeId === paragraph.id,
     );
@@ -57,6 +72,15 @@ test("saved Scene exports native text, tables and assets without HTML", async ()
       await readFile(join(output, "presentation.pptx")),
     );
     const slideXml = await pptx.file("ppt/slides/slide1.xml").async("string");
+    const editedXml = await pptx.file("ppt/slides/slide2.xml").async("string");
+    const editedShapes = [...editedXml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)]
+      .map((match) => match[0])
+      .filter((shape) => shape.includes(`name="text:${paragraph.id}"`));
+    assert.equal(editedShapes.length, 1);
+    assert.match(editedShapes[0], /<a:pPr[^>]*algn="r"/);
+    assert.match(editedShapes[0], /<a:off x="807720"/);
+    assert.match(editedShapes[0], /<a:ext cx="2133600"/);
+    assert.equal((editedShapes[0].match(/<a:br\b/g) || []).length, paragraph.text.lines.length - 1);
     const textShape = [...slideXml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)]
       .map((match) => match[0])
       .find((shape) => shape.includes(`name="text:${paragraph.id}"`));

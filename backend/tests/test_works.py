@@ -85,6 +85,7 @@ def test_create_work_is_idempotent_revisioned_and_asset_independent(
         f"/api/v1/works/{first_id}", json={"name": "旧标签页", "base_revision": 1}
     )
     assert conflict.status_code == 409
+
     assert client.get("/api/v1/works").status_code == 200
 
 
@@ -110,6 +111,49 @@ def test_agent_batch_work_creation_uses_the_selected_batch(export_queue, monkeyp
         assert source["batch_id"] == batch_id
         stored_pages = db.scalars(select(WorkPage).where(WorkPage.work_id == work.id)).all()
         assert len(stored_pages) == 1
+
+
+def test_work_page_save_persists_scene_editor_state_and_checks_revision(
+    export_queue, monkeypatch, tmp_path
+):
+    client, _, _ = export_queue
+    monkeypatch.setattr(works_service, "OBJECT_ROOT", tmp_path / "objects")
+    monkeypatch.setattr(works_service, "SCENE_ROOT", scene_service.SCENE_ROOT)
+    presentation_id, _, pages = seed_pages(1)
+    add_outline(presentation_id, pages)
+    save_scene(pages[0])
+    work_id = prepare_work(client, presentation_id)
+    page = client.get(f"/api/v1/works/{work_id}").json()["pages"][0]
+    document = client.get(f"/api/v1/works/{work_id}/pages/{page['id']}").json()
+    editor = {"version": 1, "text": {"text-node": {"align": "center"}}}
+
+    saved = client.put(
+        f"/api/v1/works/{work_id}/pages/{page['id']}",
+        json={
+            "base_revision": 1,
+            "scene": document["scene"],
+            "editor": editor,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["work_revision"] == 2
+    assert saved.json()["editor"] == editor
+    refreshed = client.get(f"/api/v1/works/{work_id}/pages/{page['id']}").json()
+    assert refreshed["editor"] == editor
+
+    conflict = client.put(
+        f"/api/v1/works/{work_id}/pages/{page['id']}",
+        json={"base_revision": 1, "scene": document["scene"], "editor": editor},
+    )
+    assert conflict.status_code == 409
+
+    invalid = dict(document["scene"])
+    invalid["assets"] = [{"id": "invalid"}]
+    rejected = client.put(
+        f"/api/v1/works/{work_id}/pages/{page['id']}",
+        json={"base_revision": 2, "scene": invalid, "editor": editor},
+    )
+    assert rejected.status_code == 409
 
 
 def test_work_export_freezes_the_requested_revision(export_queue, monkeypatch, tmp_path):
@@ -164,6 +208,60 @@ def test_work_export_freezes_the_requested_revision(export_queue, monkeypatch, t
     assert finished == ["SUCCEEDED", "SUCCEEDED"]
     assert client.get(f"/api/v1/exports/{first_record['id']}/file").status_code == 200
     assert client.get(f"/api/v1/exports/{second.json()['id']}/file").status_code == 200
+
+
+def test_legacy_text_position_is_repaired_in_page_and_export_snapshots(
+    export_queue, monkeypatch, tmp_path
+):
+    client, _, _ = export_queue
+    monkeypatch.setattr(works_service, "OBJECT_ROOT", tmp_path / "objects")
+    monkeypatch.setattr(works_service, "SCENE_ROOT", scene_service.SCENE_ROOT)
+    presentation_id, _, pages = seed_pages()
+    add_outline(presentation_id, pages)
+    save_scene(pages[0])
+    work_id = prepare_work(client, presentation_id)
+    page_id = client.get(f"/api/v1/works/{work_id}").json()["pages"][0]["id"]
+    url = f"/api/v1/works/{work_id}/pages/{page_id}"
+    line = {
+        "frame": {"x": 453, "y": 59, "width": 315, "height": 19},
+        "baseline": 72,
+        "fragments": [
+            {"runId": "subtitle_editor_run", "frame": {"x": 0, "y": 59, "width": 315, "height": 19}}
+        ],
+    }
+    with session_scope() as db:
+        page = db.get(WorkPage, page_id)
+        scene = json.loads(page.scene_json)
+        scene["nodes"].append({
+            "id": "subtitle",
+            "kind": "text",
+            "frame": {"x": 32, "y": 59, "width": 736, "height": 20},
+            "text": {
+                "paragraphs": [{"runs": [{"id": "subtitle_editor_run"}]}],
+                "lines": [line],
+            },
+        })
+        page.scene_json = scene_service.canonical(scene)
+        page.scene_hash = scene_service.digest(page.scene_json)
+        page.editor_json = '{"version":1,"text":{"subtitle":{"align":"right"}}}'
+        original_hash = page.scene_hash
+
+    response = client.get(url)
+    assert response.headers["cache-control"] == "private, no-cache"
+    assert client.get(url, headers={"If-None-Match": response.headers["etag"]}).status_code == 304
+    document = response.json()
+    assert document["scene"]["nodes"][-1]["text"]["lines"][0]["fragments"][0]["frame"]["x"] == 453
+    assert document["scene"]["nodes"][-1]["frame"] == line["frame"]
+    assert document["editor"]["text"]["subtitle"]["align"] == "right"
+    assert document["scene_hash"] != original_hash
+
+    export = client.post(f"/api/v1/works/{work_id}/exports", json={"expected_revision": 1})
+    assert export.status_code == 202
+    with session_scope() as db:
+        assert db.get(WorkPage, page_id).scene_hash == original_hash
+        manifest = json.loads(db.get(PptxExport, export.json()["id"]).input_manifest_json)
+        assert manifest["pages"][0]["scene_hash"] == document["scene_hash"]
+        assert json.loads(manifest["pages"][0]["scene_json"]) == document["scene"]
 
 
 def test_existing_export_table_migrates_without_losing_files(tmp_path, monkeypatch):
