@@ -196,10 +196,57 @@ function firstStyle(node: TextNode): TextStyle {
   };
 }
 
+type TextFragment = TextNode['text']['lines'][number]['fragments'][number];
+type EditableFragment = { fragment: TextFragment; offset: number };
+
+function lineBreakCount(value: string) {
+  return value.match(/\r\n|\r|\n/g)?.length || 0;
+}
+
+function editableFragments(node: TextNode): EditableFragment[] {
+  const fragments: EditableFragment[] = [];
+  let offset = 0;
+  let previousEnd: number | null = null;
+  for (const line of node.text.lines) {
+    for (const fragment of line.fragments) {
+      if (previousEnd !== null) {
+        offset += lineBreakCount(node.text.sourceText.slice(previousEnd, fragment.sourceStart));
+      }
+      fragments.push({ fragment, offset });
+      offset += fragment.displayText.length;
+      previousEnd = fragment.sourceEnd;
+    }
+  }
+  return fragments;
+}
+
+function firstLineIndent(node: TextNode, box: Rect, align: TextAlign) {
+  if (align !== 'left') return 0;
+  const line = node.text.lines.find((item) => item.frame.width > 0);
+  return line ? Math.max(0, line.frame.x - box.x) : 0;
+}
+
+export function editableText(node: TextNode): string {
+  const fragments = editableFragments(node);
+  if (!fragments.length) return node.text.sourceText;
+  let text = '';
+  for (const [index, { fragment }] of fragments.entries()) {
+    if (index) {
+      const previous = fragments[index - 1].fragment;
+      const gap = node.text.sourceText.slice(previous.sourceEnd, fragment.sourceStart);
+      text += '\n'.repeat(lineBreakCount(gap));
+    }
+    text += fragment.displayText;
+  }
+  return text;
+}
+
 export function textOffsetAtPoint(node: TextNode, x: number, y: number): number {
   const distance = (position: number, start: number, size: number) =>
     Math.max(start - position, position - start - size, 0);
-  let nearest: TextNode['text']['lines'][number]['fragments'][number] | undefined;
+  const fragments = editableFragments(node);
+  const fragmentEntries = new Map(fragments.map((entry) => [entry.fragment, entry]));
+  let nearest: EditableFragment | undefined;
   let smallestY = Infinity;
   let smallestX = Infinity;
   for (const line of node.text.lines) {
@@ -208,34 +255,45 @@ export function textOffsetAtPoint(node: TextNode, x: number, y: number): number 
     for (const fragment of line.fragments) {
       const dx = distance(x, fragment.frame.x, fragment.frame.width);
       if (dy === smallestY && dx >= smallestX) continue;
-      nearest = fragment;
+      const entry = fragmentEntries.get(fragment);
+      if (!entry) continue;
+      nearest = entry;
       smallestX = dx;
       smallestY = dy;
     }
   }
-  if (!nearest) return node.text.sourceText.length;
-  if (x <= nearest.frame.x) return nearest.sourceStart;
-  if (x >= nearest.frame.x + nearest.frame.width) return nearest.sourceEnd;
-  const style = firstStyle(node);
+  if (!nearest) return editableText(node).length;
+  const fragment = nearest.fragment;
+  if (x <= fragment.frame.x) return nearest.offset;
+  if (x >= fragment.frame.x + fragment.frame.width) return nearest.offset + fragment.displayText.length;
+  const runs = new Map(node.text.paragraphs.flatMap((paragraph) => paragraph.runs).map((run) => [run.id, run]));
+  const style = runs.get(fragment.runId)?.style || firstStyle(node);
   const measure = document.createElement('canvas').getContext('2d')!;
   measure.font = fontString(style);
   measure.letterSpacing = `${style.letterSpacing}px`;
-  const text = node.text.sourceText.slice(nearest.sourceStart, nearest.sourceEnd);
-  const position = (x - nearest.frame.x) / nearest.frame.width * measure.measureText(text).width;
+  const text = fragment.displayText;
+  const position = (x - fragment.frame.x) / fragment.frame.width * measure.measureText(text).width;
   const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
   let previousWidth = 0;
   for (const { index, segment } of segments.segment(text)) {
     const width = measure.measureText(text.slice(0, index + segment.length)).width;
-    if (position < (previousWidth + width) / 2) return nearest.sourceStart + index;
+    if (position < (previousWidth + width) / 2) return nearest.offset + index;
     previousWidth = width;
   }
-  return nearest.sourceEnd;
+  return nearest.offset + text.length;
 }
 
 export function textLayout(scene: SceneIR, node: TextNode, editor: WorkEditorState): WorkTextLayout {
   const saved = editor.text[node.id];
-  if (saved?.box && saved.baseline !== undefined && saved.lineHeight)
-    return { align: saved.align, box: saved.box, baseline: saved.baseline, lineHeight: saved.lineHeight };
+  if (saved?.box && saved.baseline !== undefined && saved.lineHeight) {
+    return {
+      align: saved.align,
+      box: saved.box,
+      baseline: saved.baseline,
+      lineHeight: saved.lineHeight,
+      firstLineIndent: saved.firstLineIndent ?? firstLineIndent(node, saved.box, saved.align),
+    };
+  }
 
   const owner = scene.nodes.find((item) => item.id === node.text.ownerId);
   const sharesOwner = scene.nodes.some(item => item.kind === 'text' &&
@@ -263,6 +321,7 @@ export function textLayout(scene: SceneIR, node: TextNode, editor: WorkEditorSta
     box: { x: boxX, y: container.y, width: Math.max(1, right - boxX, node.frame.width), height: container.height },
     baseline: line?.baseline ?? node.frame.y + style.fontSize,
     lineHeight: lineHeight > 0 ? lineHeight : style.fontSize * 1.25,
+    firstLineIndent: firstLineIndent(node, { x: boxX, y: container.y, width: Math.max(1, right - boxX, node.frame.width), height: container.height }, align),
   };
 }
 
@@ -289,6 +348,7 @@ export function inputTypography(style: TextStyle, layout: WorkTextLayout) {
     letterSpacing: `${style.letterSpacing}px`,
     lineHeight: `${layout.lineHeight}px`,
     textAlign: layout.align,
+    textIndent: `${layout.align === 'left' ? layout.firstLineIndent : 0}px`,
     whiteSpace: 'pre-wrap',
     overflowWrap: 'break-word',
   } as const;

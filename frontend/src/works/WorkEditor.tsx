@@ -9,6 +9,7 @@ import { SceneCanvas } from './SceneCanvas';
 import {
   normalizeEditor,
   reflowTextNode,
+  editableText,
   selectedTextStyle,
   textLayout,
   translateScene,
@@ -300,14 +301,18 @@ export function WorkEditor({ workId }: { workId: string }) {
     const node = current.scene.nodes.find((item): item is TextNode => item.id === nodeId && item.kind === 'text');
     if (!node) return;
     const layout = textLayout(current.scene, node, current.editor);
-    if (change.align === layout.align || change.sourceText === node.text.sourceText ||
-        (change.style && Object.entries(change.style).every(([key, value]) =>
-          node.text.paragraphs[0]?.runs[0]?.style[key as keyof TextStyle] === value))) return;
+    const currentText = editableText(node);
+    const nextText = change.sourceText ?? currentText;
+    const alignmentChanged = change.align !== undefined && change.align !== layout.align;
+    const textChanged = change.sourceText !== undefined && change.sourceText !== currentText;
+    const styleChanged = !!change.style && Object.entries(change.style).some(([key, value]) =>
+      node.text.paragraphs[0]?.runs[0]?.style[key as keyof TextStyle] !== value);
+    if (!alignmentChanged && !textChanged && !styleChanged) return;
     if (change.align) layout.align = change.align;
     setPage({
       ...current,
       editor: { ...current.editor, text: { ...current.editor.text, [nodeId]: layout } },
-      scene: reflowTextNode(current.scene, nodeId, change.sourceText ?? node.text.sourceText, layout, change.style),
+      scene: reflowTextNode(current.scene, nodeId, nextText, layout, change.style),
     });
   }
 

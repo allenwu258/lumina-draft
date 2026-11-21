@@ -6,6 +6,7 @@ export type WorkTextLayout = {
   box: Rect;
   baseline: number;
   lineHeight: number;
+  firstLineIndent: number;
 };
 export type Clip = { frame: Rect; radii: number[] };
 export type Border = { width: number; color: string; style: string };

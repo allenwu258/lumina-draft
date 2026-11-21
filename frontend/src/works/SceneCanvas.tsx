@@ -9,6 +9,7 @@ import type { SceneIR, TextNode } from '@lumina/scene-core';
 import { fitCanvas } from '../scene/fitCanvas';
 import {
   createHitTest,
+  editableText,
   hitsSelectionEdge,
   inputTop,
   inputTypography,
@@ -298,6 +299,7 @@ export function SceneCanvas({
   const editingNode = editingNodeId
     ? scene.nodes.find((item): item is TextNode => item.id === editingNodeId && item.kind === 'text')
     : null;
+  const editingText = editingNode ? editableText(editingNode) : '';
   const layout = editingNode && textLayout(scene, editingNode, editor);
   const style = editingNode?.text.paragraphs[0]?.runs[0]?.style;
   const editingTop = layout && style ? inputTop(style, layout) : 0;
@@ -370,7 +372,7 @@ export function SceneCanvas({
             ref={textInput}
             className="scene-text-editor"
             aria-label="文字内容"
-            value={editingNode.text.sourceText}
+            value={editingText}
             onChange={(event) => onTextChange(editingNode.id, event.target.value)}
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing) return;
@@ -387,7 +389,7 @@ export function SceneCanvas({
               left: layout.box.x * scale,
               top: editingTop * scale,
               width: layout.box.width,
-              height: Math.max(layout.lineHeight, layout.box.y + layout.box.height - editingTop,
+              height: Math.max(layout.lineHeight * Math.max(1, editingNode.text.lines.length), layout.box.y + layout.box.height - editingTop,
                 editingNode.frame.y + editingNode.frame.height - editingTop),
               transform: `scale(${scale})`,
               color: style.color,

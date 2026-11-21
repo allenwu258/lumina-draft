@@ -37,6 +37,96 @@ function imageScene() {
   return { scene, bytes };
 }
 
+function whitespaceScene() {
+  const sourceText = '\n        两种结盟策略\n      ';
+  const visibleText = '两种结盟策略';
+  const scene = editableScene(sourceText);
+  const box = scene.nodes.find((node) => node.id === 'box');
+  const text = scene.nodes.find((node): node is Extract<typeof scene.nodes[number], { kind: 'text' }> => node.id === 'text' && node.kind === 'text');
+  if (!box || box.kind !== 'group' || !text) throw new Error('Whitespace fixture is incomplete');
+  box.frame = { x: 120, y: 100, width: 360, height: 24 };
+  text.frame = { x: 136, y: 104, width: visibleText.length * 16, height: 16 };
+  text.text.sourceText = sourceText;
+  text.text.paragraphs[0].runs[0].style = { ...text.text.paragraphs[0].runs[0].style, fontSize: 16 };
+  text.text.lines = [{
+    frame: text.frame,
+    baseline: 118,
+    fragments: [{
+      runId: 'text_run', sourceStart: 9, sourceEnd: 9 + visibleText.length,
+      displayText: visibleText, frame: text.frame, baseline: 118, measuredWidth: text.frame.width,
+    }],
+  }];
+  scene.textInventory[0].sourceText = sourceText;
+  return { scene, visibleText };
+}
+
+function siblingConstrainedTextScene() {
+  const bodyText = '服务既有权力目标时，未必能保护弱势者';
+  const scene = editableScene(bodyText);
+  const owner = scene.nodes.find((node) => node.id === 'box');
+  const body = scene.nodes.find((node) => node.id === 'text');
+  if (!owner || owner.kind !== 'group' || !body || body.kind !== 'text')
+    throw new Error('Sibling-constrained text fixture is incomplete');
+
+  owner.frame = { x: 425, y: 160, width: 320, height: 64 };
+  const style = { ...body.text.paragraphs[0].runs[0].style, fontSize: 20 };
+  const firstLineText = bodyText.slice(0, 12);
+  const secondLineText = bodyText.slice(12);
+  const firstLine = {
+    x: 505, y: 184, width: 240, height: 20,
+  };
+  const secondLine = {
+    x: 425, y: 206, width: 48, height: 20,
+  };
+  body.frame = { x: 425, y: 184, width: 320, height: 42 };
+  body.text = {
+    ownerId: 'box',
+    sourceText: bodyText,
+    paragraphs: [{ runs: [{ id: 'text_run', sourceStart: 0, sourceEnd: bodyText.length, style }] }],
+    lines: [
+      {
+        frame: firstLine,
+        baseline: 200,
+        fragments: [{ runId: 'text_run', sourceStart: 0, sourceEnd: firstLineText.length, displayText: firstLineText, frame: firstLine, baseline: 200, measuredWidth: 240 }],
+      },
+      {
+        frame: secondLine,
+        baseline: 222,
+        fragments: [{ runId: 'text_run', sourceStart: firstLineText.length, sourceEnd: bodyText.length, displayText: secondLineText, frame: secondLine, baseline: 222, measuredWidth: 120 }],
+      },
+    ],
+  };
+  body.text.ownerId = 'box';
+
+  const labelStyle = { ...style, color: '#b28b42' };
+  const labelText = '权力导向';
+  const dividerText = '｜';
+  const makeSibling = (id: string, sourcePath: string, text: string, frame: { x: number; y: number; width: number; height: number }) => ({
+    id,
+    sourcePath,
+    kind: 'text' as const,
+    frame,
+    text: {
+      ownerId: 'box',
+      sourceText: text,
+      paragraphs: [{ runs: [{ id: `${id}_run`, sourceStart: 0, sourceEnd: text.length, style: labelStyle }] }],
+      lines: [{ frame, baseline: frame.y + 20, fragments: [{ runId: `${id}_run`, sourceStart: 0, sourceEnd: text.length, displayText: text, frame, baseline: frame.y + 20, measuredWidth: text === labelText ? 80 : 20 }] }],
+    },
+  });
+  scene.nodes.push(
+    makeSibling('label', 'main/box/label', labelText, { x: 425, y: 164, width: 64, height: 20 }),
+    makeSibling('divider', 'main/box/divider', dividerText, { x: 489, y: 164, width: 16, height: 20 }),
+  );
+  const bodyDraw = scene.paintOps.findIndex((op) => op.op === 'draw' && op.nodeId === 'text');
+  scene.paintOps.splice(bodyDraw, 0, { op: 'draw', nodeId: 'label' }, { op: 'draw', nodeId: 'divider' });
+  scene.textInventory = [
+    { sourcePath: 'main/box/label', sourceText: labelText, nodeId: 'label', reason: null, target: { kind: 'text', nodeId: 'label' } },
+    { sourcePath: 'main/box/divider', sourceText: dividerText, nodeId: 'divider', reason: null, target: { kind: 'text', nodeId: 'divider' } },
+    { sourcePath: 'main/box/text', sourceText: bodyText, nodeId: 'text', reason: null, target: { kind: 'text', nodeId: 'text' } },
+  ];
+  return { scene, bodyText };
+}
+
 test('preserves padded text anchors while editing, aligning, dragging and reopening', async ({ page }) => {
   const savedNames: string[] = [];
   const exportRevisions: number[] = [];
@@ -315,4 +405,98 @@ test('keeps the editor mounted while loading an asset page', async ({ page }) =>
   await expect(page.getByText('第 2 页 · 图片页面')).toBeVisible();
   await expect(page.locator('.work-canvas-host canvas')).toBeVisible();
   expect(pageErrors).toEqual([]);
+});
+
+test('opens imported text with template whitespace as visible editable text', async ({ page }) => {
+  const fixture = whitespaceScene();
+  const work = {
+    id: 'whitespace-work',
+    name: '模板空白测试',
+    type: 'presentation',
+    revision: 1,
+    page_count: 1,
+    pages: [{ id: 'whitespace-page-1', position: 1, title: '模板空白' }],
+    latest_export: null,
+  };
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === 'GET' && path === '/api/v1/works/whitespace-work')
+      return route.fulfill({ json: work });
+    if (request.method() === 'GET' && path === '/api/v1/works/whitespace-work/pages/whitespace-page-1')
+      return route.fulfill({ json: { ...work.pages[0], scene_hash: 'w'.repeat(64), scene: fixture.scene, editor: { version: 1, text: {} } } });
+    throw new Error(`Unexpected request: ${request.method()} ${path}`);
+  });
+
+  await page.goto('/edit/whitespace-work');
+  await expect(page.locator('.work-canvas-host canvas')).toBeVisible();
+  const host = page.locator('.work-canvas-host');
+  const bounds = await host.boundingBox();
+  expect(bounds).not.toBeNull();
+  const point = {
+    x: bounds!.x + 160 * bounds!.width / 800,
+    y: bounds!.y + 112 * bounds!.height / 450,
+  };
+  await page.mouse.click(point.x, point.y);
+  await page.waitForTimeout(50);
+  await page.mouse.click(point.x, point.y);
+
+  const editor = page.getByLabel('文字内容');
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveValue(fixture.visibleText);
+  const metrics = await editor.evaluate((input) => ({
+    clientHeight: input.clientHeight,
+    scrollHeight: input.scrollHeight,
+  }));
+  expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1);
+});
+
+test('preserves a sibling-constrained first-line indent while editing', async ({ page }) => {
+  const fixture = siblingConstrainedTextScene();
+  const work = {
+    id: 'sibling-work',
+    name: '同行文本约束测试',
+    type: 'presentation',
+    revision: 1,
+    page_count: 1,
+    pages: [{ id: 'sibling-page-1', position: 1, title: '同行文本约束' }],
+    latest_export: null,
+  };
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === 'GET' && path === '/api/v1/works/sibling-work')
+      return route.fulfill({ json: work });
+    if (request.method() === 'GET' && path === '/api/v1/works/sibling-work/pages/sibling-page-1')
+      return route.fulfill({ json: { ...work.pages[0], scene_hash: 's'.repeat(64), scene: fixture.scene, editor: { version: 1, text: {} } } });
+    throw new Error(`Unexpected request: ${request.method()} ${path}`);
+  });
+
+  await page.goto('/edit/sibling-work');
+  const host = page.locator('.work-canvas-host');
+  await expect(host.locator('canvas')).toBeVisible();
+  await expect.poll(() => host.locator('canvas').evaluate((element) =>
+    (element as HTMLCanvasElement).getContext('2d')!.getImageData(130, 110, 1, 1).data[3],
+  )).toBe(255);
+  const bounds = await host.boundingBox();
+  expect(bounds).not.toBeNull();
+  const point = {
+    x: bounds!.x + 550 * bounds!.width / 800,
+    y: bounds!.y + 194 * bounds!.height / 450,
+  };
+  await page.mouse.click(point.x, point.y);
+  await page.waitForTimeout(50);
+  await page.mouse.click(point.x, point.y);
+
+  const editor = page.getByLabel('文字内容');
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveValue(fixture.bodyText);
+  await expect(editor).toHaveCSS('text-indent', '80px');
+  const metrics = await editor.evaluate((input: HTMLTextAreaElement) => ({
+    clientHeight: input.clientHeight,
+    scrollHeight: input.scrollHeight,
+    lineHeight: Number.parseFloat(getComputedStyle(input).lineHeight),
+  }));
+  expect(metrics.scrollHeight).toBeGreaterThan(metrics.lineHeight * 1.5);
+  expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1);
 });
